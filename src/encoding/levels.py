@@ -58,6 +58,15 @@ FEATURE_DIMENSIONS = {
 }
 
 
+CONTENT_FEATURE_DIMENSIONS = {
+    AnnotationLevel.L0: 1,      # genotype dosage
+    AnnotationLevel.L1: 1,      # genotype dosage, with position separated
+    AnnotationLevel.L2: 5,      # genotype + one-hot consequence severity
+    AnnotationLevel.L3: 7,      # L2 + SIFT + PolyPhen
+    AnnotationLevel.L4: 7,      # L3 + additional (currently same as L3)
+}
+
+
 def get_feature_dimension(level: AnnotationLevel) -> int:
     """
     Get the feature dimension for a given annotation level.
@@ -80,6 +89,27 @@ def get_feature_dimension(level: AnnotationLevel) -> int:
     71
     """
     return FEATURE_DIMENSIONS[level]
+
+
+def get_content_feature_dimension(level: AnnotationLevel) -> int:
+    """
+    Get the non-positional content feature dimension for an annotation level.
+
+    This does not alter the historical feature dimensions returned by
+    get_feature_dimension(). It is used by the pure position-encoding
+    configuration resolver to describe the future content/position split.
+
+    Parameters
+    ----------
+    level : AnnotationLevel
+        The annotation level
+
+    Returns
+    -------
+    int
+        Non-positional content feature dimension for this level
+    """
+    return CONTENT_FEATURE_DIMENSIONS[level]
 
 
 def encode_genotype(variant: VariantRecord) -> np.ndarray:
