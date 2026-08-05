@@ -11,8 +11,9 @@ This module implements the training infrastructure including:
 Author: Francesco Lescai
 """
 
+import copy
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -67,7 +68,11 @@ class Trainer:
         early_stopping_patience: int = 10,
         gradient_clip_value: Optional[float] = None,
         gradient_accumulation_steps: int = 1,
+        checkpoint_metadata: dict[str, Any] | None = None,
     ):
+        if checkpoint_metadata is not None and not isinstance(checkpoint_metadata, dict):
+            raise ValueError("checkpoint_metadata must be a dict when provided")
+
         self.model = model.to(device)
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -77,6 +82,11 @@ class Trainer:
         self.early_stopping_patience = early_stopping_patience
         self.gradient_clip_value = gradient_clip_value
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.checkpoint_metadata = (
+            copy.deepcopy(checkpoint_metadata)
+            if checkpoint_metadata is not None
+            else None
+        )
 
         # Create checkpoint directory
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -491,6 +501,8 @@ class Trainer:
 
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        if self.checkpoint_metadata is not None:
+            checkpoint['metadata'] = copy.deepcopy(self.checkpoint_metadata)
 
         checkpoint_path = self.checkpoint_dir / filename
         torch.save(checkpoint, checkpoint_path)

@@ -13,11 +13,15 @@ Author: Francesco Lescai
 """
 
 import argparse
+import copy
 from datetime import datetime, timezone
+import hashlib
+import json
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
 import torch
@@ -322,6 +326,195 @@ def prepare_training_position_encoding(
     )
 
 
+def _canonical_index_items(
+    mapping: Mapping[str, int],
+    *,
+    mapping_name: str,
+) -> list[tuple[str, int]]:
+    """Validate an index mapping and return deterministic name-sorted items."""
+    if not isinstance(mapping, Mapping):
+        raise ValueError(f"{mapping_name} must implement Mapping")
+
+    ids = []
+    items = []
+    for name, idx in mapping.items():
+        if not isinstance(name, str):
+            raise ValueError(f"{mapping_name} contains a non-string name: {name!r}")
+        if isinstance(idx, bool):
+            raise ValueError(f"{mapping_name}[{name!r}] must be an integer ID, not bool")
+        if not isinstance(idx, int):
+            raise ValueError(f"{mapping_name}[{name!r}] must be an integer ID")
+        if idx < 0:
+            raise ValueError(f"{mapping_name}[{name!r}] must be non-negative")
+        ids.append(idx)
+        items.append((name, idx))
+
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{mapping_name} must have unique integer IDs")
+    expected_ids = set(range(len(items)))
+    if set(ids) != expected_ids:
+        raise ValueError(
+            f"{mapping_name} IDs must be contiguous and exactly range(len(mapping))"
+        )
+
+    return sorted(items, key=lambda item: item[0])
+
+
+def mapping_sha256(
+    mapping: Mapping[str, int],
+    *,
+    mapping_name: str = "mapping",
+) -> str:
+    """Return a stable SHA-256 checksum for a validated index mapping."""
+    canonical_items = _canonical_index_items(mapping, mapping_name=mapping_name)
+    payload = [{"name": name, "id": idx} for name, idx in canonical_items]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_chromosome_id_to_name(
+    chrom_index: Mapping[str, int],
+) -> dict[str, str]:
+    """Invert chromosome name-to-ID mapping for serialized model-row metadata."""
+    canonical_items = _canonical_index_items(
+        chrom_index,
+        mapping_name="chrom_index",
+    )
+    return {
+        str(idx): name
+        for name, idx in sorted(canonical_items, key=lambda item: item[1])
+    }
+
+
+def build_dataset_mappings_payload(
+    gene_index: Mapping[str, int],
+    chrom_index: Mapping[str, int],
+) -> dict[str, object]:
+    """Build the complete deterministic dataset mapping sidecar payload."""
+    gene_items = _canonical_index_items(gene_index, mapping_name="gene_index")
+    chrom_items = _canonical_index_items(chrom_index, mapping_name="chrom_index")
+    return {
+        "schema_version": 1,
+        "gene_index": {name: idx for name, idx in gene_items},
+        "chrom_index": {
+            name: idx for name, idx in sorted(chrom_items, key=lambda item: item[1])
+        },
+        "chromosome_id_to_name": {
+            str(idx): name
+            for name, idx in sorted(chrom_items, key=lambda item: item[1])
+        },
+        "gene_mapping_sha256": mapping_sha256(
+            gene_index,
+            mapping_name="gene_index",
+        ),
+        "chromosome_mapping_sha256": mapping_sha256(
+            chrom_index,
+            mapping_name="chrom_index",
+        ),
+    }
+
+
+def write_dataset_mappings_artifact(
+    output_dir: Path,
+    gene_index: Mapping[str, int],
+    chrom_index: Mapping[str, int],
+) -> dict[str, object]:
+    """Write dataset_mappings.json and return lightweight identity metadata."""
+    payload = build_dataset_mappings_payload(gene_index, chrom_index)
+    artifact_path = output_dir / "dataset_mappings.json"
+    with open(artifact_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+    return {
+        "gene_mapping_sha256": payload["gene_mapping_sha256"],
+        "chromosome_mapping_sha256": payload["chromosome_mapping_sha256"],
+        "mappings_artifact": "dataset_mappings.json",
+        "mappings_artifact_base": "experiment_root",
+    }
+
+
+def serialize_position_encoding_for_training(
+    resolved_position_encoding: ResolvedPositionEncodingConfig,
+    chrom_index: Mapping[str, int],
+) -> dict[str, object]:
+    """Serialize resolved position config with chromosome row mapping attached."""
+    position_encoding = copy.deepcopy(resolved_position_encoding.to_dict())
+    chromosome_config = position_encoding.setdefault("chromosome", {})
+    chromosome_config["mapping"] = build_chromosome_id_to_name(chrom_index)
+    return position_encoding
+
+
+def build_position_encoding_execution_metadata(
+    *,
+    training_mode: Literal["cv", "single_split"],
+    dataset_num_chromosomes: int,
+) -> dict[str, object]:
+    """Describe the legacy position-encoding path that is actually executed."""
+    if training_mode == "cv":
+        return {
+            "schema_version": 1,
+            "source": "legacy_existing_model_paths",
+            "resolved_config_applied_to_model": False,
+            "model_num_chromosomes": dataset_num_chromosomes,
+            "chrom_ids_passed_to_attention": True,
+            "chromosome_embedding_executed": True,
+            "chromosome_aware_relative_bias_executed": True,
+        }
+    if training_mode == "single_split":
+        return {
+            "schema_version": 1,
+            "source": "legacy_existing_model_paths",
+            "resolved_config_applied_to_model": False,
+            "model_num_chromosomes": 0,
+            "chrom_ids_passed_to_attention": True,
+            "chromosome_embedding_executed": False,
+            "chromosome_aware_relative_bias_executed": True,
+        }
+    raise ValueError(f"unsupported training_mode: {training_mode!r}")
+
+
+def build_training_run_metadata(
+    *,
+    input_dim: int,
+    num_genes: int,
+    num_chromosomes: int,
+    genome_build: str,
+    resolved_position_encoding: ResolvedPositionEncodingConfig,
+    chrom_index: Mapping[str, int],
+    gene_mapping_sha256: str,
+    chromosome_mapping_sha256: str,
+    training_mode: Literal["cv", "single_split"],
+) -> dict[str, object]:
+    """Build lightweight run metadata for configs and checkpoints."""
+    return {
+        "metadata_schema_version": 1,
+        "input_dim": input_dim,
+        "content_dim": resolved_position_encoding.content_dim,
+        "num_genes": num_genes,
+        "num_chromosomes": num_chromosomes,
+        "position_encoding": serialize_position_encoding_for_training(
+            resolved_position_encoding,
+            chrom_index,
+        ),
+        "dataset_identity": {
+            "genome_build": genome_build,
+            "gene_mapping_sha256": gene_mapping_sha256,
+            "chromosome_mapping_sha256": chromosome_mapping_sha256,
+            "mappings_artifact": "dataset_mappings.json",
+            "mappings_artifact_base": "experiment_root",
+        },
+        "position_encoding_execution": build_position_encoding_execution_metadata(
+            training_mode=training_mode,
+            dataset_num_chromosomes=num_chromosomes,
+        ),
+    }
+
+
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
@@ -376,6 +569,7 @@ def save_fold_config(
     fold_dir: Path,
     fold_idx: int,
     args,
+    run_metadata: dict[str, object] | None = None,
 ) -> None:
     """
     Save fold-specific config.yaml with architecture and training parameters.
@@ -433,6 +627,8 @@ def save_fold_config(
         # Reference to parent config
         'parent_config': '../config.yaml',
     }
+    if run_metadata is not None:
+        fold_config.update(copy.deepcopy(run_metadata))
 
     with open(fold_dir / 'config.yaml', 'w') as f:
         yaml.dump(fold_config, f, default_flow_style=False, sort_keys=False)
@@ -561,6 +757,7 @@ def train_single_fold(
     args,
     checkpoint_dir: Path,
     pos_weight: Optional[torch.Tensor] = None,
+    checkpoint_metadata: dict[str, object] | None = None,
 ) -> Dict[str, float]:
     """Train model on a single fold."""
     # Create optimizer
@@ -590,6 +787,7 @@ def train_single_fold(
         early_stopping_patience=args.early_stopping,
         gradient_clip_value=args.gradient_clip,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        checkpoint_metadata=checkpoint_metadata,
     )
 
     # Train
@@ -741,6 +939,24 @@ def main():
         annotation_level,
         num_chromosomes=dataset.num_chromosomes,
     )
+    dataset_identity = write_dataset_mappings_artifact(
+        output_dir,
+        dataset.gene_index,
+        dataset.chrom_index,
+    )
+    training_mode = "cv" if args.cv is not None else "single_split"
+    run_metadata = build_training_run_metadata(
+        input_dim=input_dim,
+        num_genes=num_genes,
+        num_chromosomes=dataset.num_chromosomes,
+        genome_build=args.genome_build,
+        resolved_position_encoding=resolved_position_encoding,
+        chrom_index=dataset.chrom_index,
+        gene_mapping_sha256=str(dataset_identity["gene_mapping_sha256"]),
+        chromosome_mapping_sha256=str(dataset_identity["chromosome_mapping_sha256"]),
+        training_mode=training_mode,
+    )
+    _update_saved_config(config_path, **run_metadata)
     print(f"Input dimension: {input_dim}")
     print(f"Number of genes: {num_genes}")
     print(f"Position encoding preset: {resolved_position_encoding.preset.value}")
@@ -859,13 +1075,14 @@ def main():
                 args=args,
                 checkpoint_dir=fold_dir,
                 pos_weight=fold_pos_weight,
+                checkpoint_metadata=run_metadata,
             )
             training_completed = datetime.now(timezone.utc)
 
             cv_results.append(fold_metrics)
 
             # Save fold-specific config and metadata
-            save_fold_config(fold_dir, fold_idx, args)
+            save_fold_config(fold_dir, fold_idx, args, run_metadata=run_metadata)
             save_fold_info(
                 fold_dir=fold_dir,
                 fold_idx=fold_idx,
@@ -994,6 +1211,7 @@ def main():
             args=args,
             checkpoint_dir=output_dir,
             pos_weight=pos_weight,
+            checkpoint_metadata=run_metadata,
         )
 
         print(f"\nFinal Results:")

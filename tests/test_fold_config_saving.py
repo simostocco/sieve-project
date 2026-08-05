@@ -65,6 +65,43 @@ def sample_labels():
 
 
 @pytest.fixture
+def sample_run_metadata():
+    """Create lightweight run metadata as saved by Phase 4C."""
+    return {
+        "metadata_schema_version": 1,
+        "input_dim": 71,
+        "content_dim": 7,
+        "num_genes": 2,
+        "num_chromosomes": 2,
+        "position_encoding": {
+            "preset": "legacy",
+            "chromosome": {
+                "mapping": {
+                    "0": "1",
+                    "1": "2",
+                }
+            },
+        },
+        "dataset_identity": {
+            "genome_build": "GRCh37",
+            "gene_mapping_sha256": "genehash",
+            "chromosome_mapping_sha256": "chromhash",
+            "mappings_artifact": "dataset_mappings.json",
+            "mappings_artifact_base": "experiment_root",
+        },
+        "position_encoding_execution": {
+            "schema_version": 1,
+            "source": "legacy_existing_model_paths",
+            "resolved_config_applied_to_model": False,
+            "model_num_chromosomes": 2,
+            "chrom_ids_passed_to_attention": True,
+            "chromosome_embedding_executed": True,
+            "chromosome_aware_relative_bias_executed": True,
+        },
+    }
+
+
+@pytest.fixture
 def sample_fold_metrics():
     """Create sample fold metrics as returned by train_single_fold."""
     return {
@@ -177,6 +214,103 @@ class TestSaveFoldConfig:
         required_for_explain = ["level", "aggregation_method"]
         for field in required_for_explain:
             assert field in config, f"Missing field required by explain.py: {field}"
+
+    def test_call_without_run_metadata_preserves_old_output(
+        self, tmp_fold_dir, sample_args
+    ):
+        """Test that metadata is absent when not supplied."""
+        save_fold_config(tmp_fold_dir, fold_idx=0, args=sample_args)
+        with open(tmp_fold_dir / "config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        assert "metadata_schema_version" not in config
+        assert "position_encoding" not in config
+        assert "dataset_identity" not in config
+        assert "position_encoding_execution" not in config
+
+    def test_supplied_run_metadata_is_copied_into_fold_config(
+        self, tmp_fold_dir, sample_args, sample_run_metadata
+    ):
+        """Test that lightweight run metadata is saved additively."""
+        save_fold_config(
+            tmp_fold_dir,
+            fold_idx=0,
+            args=sample_args,
+            run_metadata=sample_run_metadata,
+        )
+        with open(tmp_fold_dir / "config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        for key, value in sample_run_metadata.items():
+            assert config[key] == value
+
+    def test_run_metadata_input_is_not_mutated(
+        self, tmp_fold_dir, sample_args, sample_run_metadata
+    ):
+        """Test that save_fold_config defensively copies supplied metadata."""
+        before = yaml.safe_load(yaml.safe_dump(sample_run_metadata))
+
+        save_fold_config(
+            tmp_fold_dir,
+            fold_idx=0,
+            args=sample_args,
+            run_metadata=sample_run_metadata,
+        )
+
+        assert sample_run_metadata == before
+
+    def test_original_flat_fields_remain_with_run_metadata(
+        self, tmp_fold_dir, sample_args, sample_run_metadata
+    ):
+        """Test that old fold fields are preserved when metadata is added."""
+        save_fold_config(
+            tmp_fold_dir,
+            fold_idx=0,
+            args=sample_args,
+            run_metadata=sample_run_metadata,
+        )
+        with open(tmp_fold_dir / "config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        assert config["level"] == "L3"
+        assert config["latent_dim"] == 32
+        assert config["lr"] == 1e-5
+        assert config["parent_config"] == "../config.yaml"
+
+    def test_full_dataset_mappings_are_not_duplicated(
+        self, tmp_fold_dir, sample_args, sample_run_metadata
+    ):
+        """Test that fold config refers to the mapping artifact only."""
+        save_fold_config(
+            tmp_fold_dir,
+            fold_idx=0,
+            args=sample_args,
+            run_metadata=sample_run_metadata,
+        )
+        with open(tmp_fold_dir / "config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        assert "gene_index" not in config
+        assert "chrom_index" not in config
+        assert config["dataset_identity"]["mappings_artifact"] == "dataset_mappings.json"
+        assert config["dataset_identity"]["mappings_artifact_base"] == "experiment_root"
+
+    def test_parent_and_fold_lightweight_metadata_can_match(
+        self, tmp_fold_dir, sample_args, sample_run_metadata
+    ):
+        """Test that fold metadata can equal parent run metadata."""
+        parent_metadata = yaml.safe_load(yaml.safe_dump(sample_run_metadata))
+        save_fold_config(
+            tmp_fold_dir,
+            fold_idx=0,
+            args=sample_args,
+            run_metadata=sample_run_metadata,
+        )
+        with open(tmp_fold_dir / "config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        fold_metadata = {key: config[key] for key in parent_metadata}
+        assert fold_metadata == parent_metadata
 
 
 class TestSaveFoldInfo:
