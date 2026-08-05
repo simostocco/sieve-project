@@ -40,6 +40,17 @@ from src.encoding import (
     collate_chunks,
     get_feature_dimension
 )
+from src.encoding.position_config import (
+    AbsolutePositionEncoding,
+    AlibiDistanceFunction,
+    ChromosomeEncoding,
+    CrossChromosomePolicy,
+    PositionEncodingRequest,
+    PositionPreset,
+    RelativePositionEncoding,
+    ResolvedPositionEncodingConfig,
+    resolve_position_encoding_config,
+)
 from src.models import SIEVE, ChunkedSIEVEModel
 from src.training import (
     SIEVELoss,
@@ -50,8 +61,13 @@ from src.training import (
 from src.training.loss import compute_class_weights
 
 
-def parse_args():
-    """Parse command-line arguments."""
+def _enum_choices(enum_cls) -> list[str]:
+    """Return argparse choices from a string-valued Enum."""
+    return [member.value for member in enum_cls]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the training command-line parser."""
     parser = argparse.ArgumentParser(
         description='Train SIEVE model on VCF data',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -100,6 +116,44 @@ def parse_args():
                         help='Number of attention layers')
     parser.add_argument('--hidden-dim', type=int, default=128,
                         help='Hidden dimension in encoder')
+
+    # Position encoding arguments
+    parser.add_argument('--position-preset', type=str, default=PositionPreset.LEGACY.value,
+                        choices=_enum_choices(PositionPreset),
+                        help='Position encoding preset')
+    parser.add_argument('--absolute-position-encoding', type=str, default=None,
+                        choices=_enum_choices(AbsolutePositionEncoding),
+                        help='Absolute position encoding strategy')
+    parser.add_argument('--relative-position-encoding', type=str, default=None,
+                        choices=_enum_choices(RelativePositionEncoding),
+                        help='Relative position encoding strategy')
+    parser.add_argument('--chromosome-encoding', type=str, default=None,
+                        choices=_enum_choices(ChromosomeEncoding),
+                        help='Chromosome encoding strategy')
+    parser.add_argument('--cross-chromosome-policy', type=str, default=None,
+                        choices=_enum_choices(CrossChromosomePolicy),
+                        help='Cross-chromosome attention policy')
+    parser.add_argument('--position-dim', type=int, default=None,
+                        help='Absolute position embedding dimension')
+    parser.add_argument('--sinusoidal-coordinate-scale', type=float, default=None,
+                        help='Coordinate scale for sinusoidal absolute position encoding')
+    parser.add_argument('--sinusoidal-max-wavelength', type=float, default=None,
+                        help='Maximum wavelength for sinusoidal absolute position encoding')
+    parser.add_argument('--position-bin-size', type=int, default=None,
+                        help='Bin size in base pairs for learned binned absolute position encoding')
+    parser.add_argument('--num-position-buckets', type=int, default=None,
+                        help='Number of ordinary T5-style relative position buckets')
+    parser.add_argument('--max-position-distance', type=int, default=None,
+                        help='Maximum distance for T5-style relative position bucketing')
+    parser.add_argument('--rope-coordinate-scale', type=float, default=None,
+                        help='Coordinate scale for RoPE relative position encoding')
+    parser.add_argument('--rope-base', type=float, default=None,
+                        help='Base wavelength for RoPE relative position encoding')
+    parser.add_argument('--alibi-distance-function', type=str, default=None,
+                        choices=_enum_choices(AlibiDistanceFunction),
+                        help='Distance transform for ALiBi relative position encoding')
+    parser.add_argument('--alibi-distance-scale', type=float, default=None,
+                        help='Distance scale for ALiBi relative position encoding')
 
     # Cross-validation arguments
     parser.add_argument('--cv', '--cv-folds', dest='cv', type=int, default=None,
@@ -181,7 +235,91 @@ def parse_args():
         ),
     )
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    return build_arg_parser().parse_args(argv)
+
+
+def build_position_encoding_request(
+    args: argparse.Namespace,
+) -> PositionEncodingRequest:
+    """Convert parsed CLI strings into a pure position-encoding request."""
+    return PositionEncodingRequest(
+        preset=PositionPreset(args.position_preset),
+        absolute_position_encoding=(
+            None
+            if args.absolute_position_encoding is None
+            else AbsolutePositionEncoding(args.absolute_position_encoding)
+        ),
+        relative_position_encoding=(
+            None
+            if args.relative_position_encoding is None
+            else RelativePositionEncoding(args.relative_position_encoding)
+        ),
+        chromosome_encoding=(
+            None
+            if args.chromosome_encoding is None
+            else ChromosomeEncoding(args.chromosome_encoding)
+        ),
+        cross_chromosome_policy=(
+            None
+            if args.cross_chromosome_policy is None
+            else CrossChromosomePolicy(args.cross_chromosome_policy)
+        ),
+        position_dim=args.position_dim,
+        sinusoidal_coordinate_scale=args.sinusoidal_coordinate_scale,
+        sinusoidal_max_wavelength=args.sinusoidal_max_wavelength,
+        position_bin_size=args.position_bin_size,
+        num_position_buckets=args.num_position_buckets,
+        max_position_distance=args.max_position_distance,
+        rope_coordinate_scale=args.rope_coordinate_scale,
+        rope_base=args.rope_base,
+        alibi_distance_function=(
+            None
+            if args.alibi_distance_function is None
+            else AlibiDistanceFunction(args.alibi_distance_function)
+        ),
+        alibi_distance_scale=args.alibi_distance_scale,
+    )
+
+
+def prepare_training_position_encoding(
+    args: argparse.Namespace,
+    annotation_level: AnnotationLevel,
+    *,
+    num_chromosomes: int,
+) -> ResolvedPositionEncodingConfig:
+    """
+    Resolve training position encoding without changing model computation.
+
+    Custom positional execution is intentionally deferred until model
+    integration phases wire these resolved settings into preprocessing,
+    attention, and model construction.
+    """
+    request = build_position_encoding_request(args)
+    resolved = resolve_position_encoding_config(
+        request,
+        annotation_level,
+        latent_dim=args.latent_dim,
+        num_heads=args.num_heads,
+        num_chromosomes=num_chromosomes,
+    )
+
+    if request.preset is PositionPreset.LEGACY:
+        historical_input_dim = get_feature_dimension(annotation_level)
+        if resolved.input_dim != historical_input_dim:
+            raise ValueError(
+                "legacy position configuration resolved input_dim "
+                f"{resolved.input_dim}, expected historical input_dim {historical_input_dim}"
+            )
+        return resolved
+
+    raise NotImplementedError(
+        "Custom positional execution will be enabled in a later model-integration phase."
+    )
 
 
 def set_seed(seed: int):
@@ -598,8 +736,14 @@ def main():
     # Get dimensions
     input_dim = get_feature_dimension(annotation_level)
     num_genes = dataset.num_genes
+    resolved_position_encoding = prepare_training_position_encoding(
+        args,
+        annotation_level,
+        num_chromosomes=dataset.num_chromosomes,
+    )
     print(f"Input dimension: {input_dim}")
     print(f"Number of genes: {num_genes}")
+    print(f"Position encoding preset: {resolved_position_encoding.preset.value}")
     print(f"CRITICAL: Using chunked processing for FULL GENOME coverage (not just chr1/chr2)!")
 
     # Get labels
