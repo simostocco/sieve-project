@@ -7,6 +7,8 @@ This repository is being extended to benchmark multiple positional-encoding stra
 Read this file before every task. Also read:
 
 - `documentation/appendices/position-encoding-audit.md`
+- `documentation/appendices/position-encoding-cli-contract.md`
+- `documentation/appendices/position-encoding-implementation-log.md`
 - the task-specific prompt supplied by the user
 
 The task prompt may narrow scope further, but it must not silently override the compatibility rules below.
@@ -25,6 +27,41 @@ For every task:
 8. Do not commit or push unless explicitly requested.
 
 Never combine planning and implementation in the first response to a new task.
+
+## Position-Encoding Benchmark Documentation Rules
+
+For position-encoding benchmark work, future agents must treat the audit,
+contract, and implementation log as separate documents with separate jobs:
+
+- audit = original baseline behavior;
+- contract = intended public interface and architectural contract;
+- implementation log = chronological development history.
+
+Do not modify the audit or contract merely because implementation progressed.
+Update the implementation log during every approved position-encoding
+implementation phase, after implementation and testing, so it records what
+actually occurred.
+
+Implementation-log updates must record:
+
+- the goal;
+- exact files changed;
+- decisions and reasoning;
+- runtime behavior effects;
+- compatibility effects;
+- tests and checks actually run;
+- known limitations.
+
+Do not claim tests passed when they were skipped, blocked, or not executed.
+
+Write code so a developer unfamiliar with this project can understand it. Add
+docstrings to public helpers and to non-obvious internal helpers. Add comments
+that explain historical constraints, compatibility behavior, temporary legacy
+paths, and non-obvious biological or architectural reasoning. Avoid comments
+that merely repeat Python syntax.
+
+For major architectural decisions, propose an ADR, but create one only when it
+is explicitly included in the approved scope.
 
 ## Project invariants
 
