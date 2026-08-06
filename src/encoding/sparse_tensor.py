@@ -23,8 +23,77 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from src.data import SampleVariants
-from .levels import AnnotationLevel, encode_variants, get_feature_dimension
+from .levels import (
+    AnnotationLevel,
+    encode_variants,
+    get_content_feature_dimension,
+    get_feature_dimension,
+    get_legacy_absolute_position_dimension,
+    split_legacy_variant_features,
+)
 from .positional import sinusoidal_position_encoding
+
+
+_SPLIT_FEATURE_KEYS = ('content_features', 'absolute_position_features')
+
+
+def _validate_split_feature_schema(batch: list[dict[str, Any]]) -> bool:
+    """Validate whether a batch consistently carries split feature tensors."""
+    split_presence = [
+        tuple(key in sample for key in _SPLIT_FEATURE_KEYS)
+        for sample in batch
+    ]
+
+    if all(presence == (False, False) for presence in split_presence):
+        return False
+    if not all(presence == (True, True) for presence in split_presence):
+        raise ValueError(
+            "Batches must either omit both split feature keys or include both "
+            "'content_features' and 'absolute_position_features' for every sample."
+        )
+
+    # Validate rank and row alignment before collation. Otherwise padding or
+    # truncation could silently hide a malformed split tensor that no longer
+    # corresponds row-for-row to the historical ``features`` authority.
+    for sample_idx, sample in enumerate(batch):
+        for key in ('features', 'content_features', 'absolute_position_features'):
+            tensor = sample[key]
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(
+                    f"Sample {sample_idx} tensor '{key}' must be a torch.Tensor; "
+                    f"got {type(tensor).__name__}"
+                )
+            if tensor.ndim != 2:
+                raise ValueError(
+                    f"Sample {sample_idx} tensor '{key}' must be two-dimensional; "
+                    f"got shape {tuple(tensor.shape)}"
+                )
+
+        feature_rows = sample['features'].shape[0]
+        for key in ('content_features', 'absolute_position_features'):
+            split_rows = sample[key].shape[0]
+            if split_rows != feature_rows:
+                raise ValueError(
+                    f"Sample {sample_idx} tensor '{key}' row count must match "
+                    f"'features': got {split_rows}, expected {feature_rows}"
+                )
+
+    content_dim = batch[0]['content_features'].shape[1]
+    position_dim = batch[0]['absolute_position_features'].shape[1]
+    for sample_idx, sample in enumerate(batch):
+        if sample['content_features'].shape[1] != content_dim:
+            raise ValueError(
+                f"Inconsistent content feature width for sample {sample_idx}: "
+                f"got {sample['content_features'].shape[1]}, expected {content_dim}"
+            )
+        if sample['absolute_position_features'].shape[1] != position_dim:
+            raise ValueError(
+                f"Inconsistent absolute-position feature width for sample {sample_idx}: got "
+                f"{sample['absolute_position_features'].shape[1]}, expected "
+                f"{position_dim}"
+            )
+
+    return True
 
 
 def build_gene_index(all_samples: List[SampleVariants]) -> Dict[str, int]:
@@ -156,7 +225,14 @@ def build_variant_tensor(
     -------
     Dict[str, Tensor]
         Dictionary containing:
-        - 'features': Variant features [num_variants, feature_dim]
+        - 'features': Historical execution features
+          [num_variants, feature_dim]. This remains the tensor consumed by the
+          current model path.
+        - 'content_features': Non-positional content features
+          [num_variants, content_dim]
+        - 'absolute_position_features': Historical absolute-position features
+          [num_variants, absolute_position_dim]. For L0 this is a zero-width
+          tensor with shape [num_variants, 0].
         - 'positions': Genomic positions [num_variants]
         - 'gene_ids': Gene indices [num_variants]
         - 'mask': Valid variant mask [num_variants] (all 1s, no padding yet)
@@ -183,11 +259,22 @@ def build_variant_tensor(
 
     n_variants = len(variants)
     feature_dim = get_feature_dimension(annotation_level)
+    content_dim = get_content_feature_dimension(annotation_level)
+    absolute_position_dim = get_legacy_absolute_position_dimension(annotation_level)
 
     # Handle empty variant case
     if n_variants == 0:
+        # ``features`` remains the runtime tensor consumed by the model. The
+        # split tensors are derived alongside it so later phases can separate
+        # content from absolute position without changing empty-sample padding
+        # semantics.
         empty = {
             'features': torch.zeros((0, feature_dim), dtype=torch.float32),
+            'content_features': torch.zeros((0, content_dim), dtype=torch.float32),
+            'absolute_position_features': torch.zeros(
+                (0, absolute_position_dim),
+                dtype=torch.float32,
+            ),
             'positions': torch.zeros(0, dtype=torch.long),
             'gene_ids': torch.zeros(0, dtype=torch.long),
             'mask': torch.zeros(0, dtype=torch.bool),
@@ -214,6 +301,10 @@ def build_variant_tensor(
         position_encodings,
         impute_value
     )
+    content_features_np, absolute_position_features_np = split_legacy_variant_features(
+        features_np,
+        annotation_level,
+    )
 
     # Map gene symbols to indices
     gene_ids_np = np.array([gene_index[gene] for gene in gene_symbols], dtype=np.int64)
@@ -223,7 +314,13 @@ def build_variant_tensor(
 
     # Convert to tensors
     out = {
-        'features': torch.from_numpy(features_np),
+        # Historical features remain the execution authority. The split is
+        # derived from this matrix rather than independently re-encoding
+        # annotations, preserving legacy ordering, dtype, and checkpoint input
+        # compatibility exactly.
+        'features': torch.from_numpy(np.ascontiguousarray(features_np)),
+        'content_features': torch.from_numpy(content_features_np),
+        'absolute_position_features': torch.from_numpy(absolute_position_features_np),
         'positions': torch.from_numpy(positions_np),
         'gene_ids': torch.from_numpy(gene_ids_np),
         'mask': torch.from_numpy(mask_np),
@@ -258,6 +355,11 @@ def collate_samples(
     Dict[str, Tensor]
         Batched tensors:
         - 'features': [batch_size, max_variants, feature_dim]
+        - 'content_features': [batch_size, max_variants, content_dim] when
+          every input item contains both split feature keys
+        - 'absolute_position_features':
+          [batch_size, max_variants, absolute_position_dim] when every input
+          item contains both split feature keys
         - 'positions': [batch_size, max_variants]
         - 'gene_ids': [batch_size, max_variants]
         - 'mask': [batch_size, max_variants] (1=real, 0=padding)
@@ -268,6 +370,9 @@ def collate_samples(
     -----
     Padding is done with zeros, and the mask indicates which positions are real.
     The model should use the mask to ignore padding positions.
+    Split-aware batches include the two split feature tensors only when every
+    input item contains both split keys. Legacy manually constructed
+    dictionaries that omit both keys retain the historical output schema.
 
     Examples
     --------
@@ -295,6 +400,7 @@ def collate_samples(
     tensor([3, 5])
     """
     batch_size = len(batch)
+    has_split_features = _validate_split_feature_schema(batch)
 
     # Get max number of variants in this batch
     max_variants = max(sample['features'].shape[0] for sample in batch)
@@ -329,15 +435,45 @@ def collate_samples(
         }
         if has_chrom_ids:
             empty['chrom_ids'] = torch.zeros((batch_size, 0), dtype=torch.long)
+        if has_split_features:
+            content_dim = batch[0]['content_features'].shape[1]
+            absolute_position_dim = batch[0]['absolute_position_features'].shape[1]
+            empty['content_features'] = torch.zeros(
+                (batch_size, 0, content_dim),
+                dtype=torch.float32,
+            )
+            empty['absolute_position_features'] = torch.zeros(
+                (batch_size, 0, absolute_position_dim),
+                dtype=torch.float32,
+            )
         return empty
 
     # Get feature dimension from first sample (safe now since max_variants > 0)
     feature_dim = batch[0]['features'].shape[1]
+    content_dim = batch[0]['content_features'].shape[1] if has_split_features else 0
+    absolute_position_dim = (
+        batch[0]['absolute_position_features'].shape[1]
+        if has_split_features else 0
+    )
 
     # Initialize padded tensors
     features_padded = torch.zeros(
         (batch_size, max_variants, feature_dim),
         dtype=torch.float32
+    )
+    # Padded rows intentionally remain zeros for both split tensors, matching
+    # historical ``features`` padding and avoiding positional values for masked
+    # slots.
+    content_features_padded = (
+        torch.zeros((batch_size, max_variants, content_dim), dtype=torch.float32)
+        if has_split_features else None
+    )
+    absolute_position_features_padded = (
+        torch.zeros(
+            (batch_size, max_variants, absolute_position_dim),
+            dtype=torch.float32,
+        )
+        if has_split_features else None
     )
     positions_padded = torch.zeros(
         (batch_size, max_variants),
@@ -369,6 +505,13 @@ def collate_samples(
             # Truncate to max_variants if necessary
             n_to_copy = min(n_variants, max_variants)
             features_padded[i, :n_to_copy] = sample['features'][:n_to_copy]
+            if has_split_features:
+                content_features_padded[i, :n_to_copy] = (
+                    sample['content_features'][:n_to_copy]
+                )
+                absolute_position_features_padded[i, :n_to_copy] = (
+                    sample['absolute_position_features'][:n_to_copy]
+                )
             positions_padded[i, :n_to_copy] = sample['positions'][:n_to_copy]
             gene_ids_padded[i, :n_to_copy] = sample['gene_ids'][:n_to_copy]
             mask_padded[i, :n_to_copy] = sample['mask'][:n_to_copy]
@@ -388,6 +531,9 @@ def collate_samples(
     }
     if has_chrom_ids:
         out['chrom_ids'] = chrom_ids_padded
+    if has_split_features:
+        out['content_features'] = content_features_padded
+        out['absolute_position_features'] = absolute_position_features_padded
     return out
 
 

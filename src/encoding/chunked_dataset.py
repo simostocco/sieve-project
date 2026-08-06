@@ -19,9 +19,10 @@ from torch.utils.data import Dataset
 from src.data import SampleVariants
 from src.encoding.levels import AnnotationLevel
 from src.encoding.sparse_tensor import (
-    build_variant_tensor,
-    build_gene_index,
+    _validate_split_feature_schema,
     build_chrom_index,
+    build_gene_index,
+    build_variant_tensor,
 )
 from src.data.covariates import encode_sex_for_covariate
 
@@ -245,7 +246,11 @@ def collate_chunks(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     Returns
     -------
     Dict[str, Any]
-        Batched tensors with chunk metadata
+        Batched tensors with chunk metadata. Split-aware batches include
+        ``content_features`` and ``absolute_position_features`` only when every
+        input item contains both split feature keys. Legacy manually constructed
+        chunk dictionaries that omit both keys retain the historical output
+        schema.
     """
     batch_size = len(batch)
     has_covariates = any('covariates' in sample for sample in batch)
@@ -254,6 +259,7 @@ def collate_chunks(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise ValueError(
             "Mixed chunk batches with and without 'chrom_ids' are not supported."
         )
+    has_split_features = _validate_split_feature_schema(batch)
 
     # Get max variants in this batch of chunks
     max_variants = max(sample['features'].shape[0] for sample in batch)
@@ -278,12 +284,41 @@ def collate_chunks(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             collated['covariates'] = torch.zeros((batch_size, cov_dim), dtype=torch.float32)
         if has_chrom_ids:
             collated['chrom_ids'] = torch.zeros((batch_size, 0), dtype=torch.long)
+        if has_split_features:
+            content_dim = batch[0]['content_features'].shape[1]
+            absolute_position_dim = batch[0]['absolute_position_features'].shape[1]
+            collated['content_features'] = torch.zeros(
+                (batch_size, 0, content_dim),
+                dtype=torch.float32,
+            )
+            collated['absolute_position_features'] = torch.zeros(
+                (batch_size, 0, absolute_position_dim),
+                dtype=torch.float32,
+            )
         return collated
 
     feature_dim = batch[0]['features'].shape[1]
+    content_dim = batch[0]['content_features'].shape[1] if has_split_features else 0
+    absolute_position_dim = (
+        batch[0]['absolute_position_features'].shape[1]
+        if has_split_features else 0
+    )
 
     # Initialize padded tensors
     features_padded = torch.zeros((batch_size, max_variants, feature_dim), dtype=torch.float32)
+    # Split-aware chunks keep the same zero-padding contract as historical
+    # ``features``: real rows are copied, padding rows stay all-zero and masked.
+    content_features_padded = (
+        torch.zeros((batch_size, max_variants, content_dim), dtype=torch.float32)
+        if has_split_features else None
+    )
+    absolute_position_features_padded = (
+        torch.zeros(
+            (batch_size, max_variants, absolute_position_dim),
+            dtype=torch.float32,
+        )
+        if has_split_features else None
+    )
     positions_padded = torch.zeros((batch_size, max_variants), dtype=torch.long)
     gene_ids_padded = torch.zeros((batch_size, max_variants), dtype=torch.long)
     mask_padded = torch.zeros((batch_size, max_variants), dtype=torch.bool)
@@ -309,6 +344,11 @@ def collate_chunks(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         if n_variants > 0:
             features_padded[i, :n_variants] = sample['features']
+            if has_split_features:
+                content_features_padded[i, :n_variants] = sample['content_features']
+                absolute_position_features_padded[i, :n_variants] = (
+                    sample['absolute_position_features']
+                )
             positions_padded[i, :n_variants] = sample['positions']
             gene_ids_padded[i, :n_variants] = sample['gene_ids']
             mask_padded[i, :n_variants] = sample['mask']
@@ -344,4 +384,7 @@ def collate_chunks(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         collated['covariates'] = covariates
     if has_chrom_ids:
         collated['chrom_ids'] = chrom_ids_padded
+    if has_split_features:
+        collated['content_features'] = content_features_padded
+        collated['absolute_position_features'] = absolute_position_features_padded
     return collated

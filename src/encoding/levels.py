@@ -112,6 +112,192 @@ def get_content_feature_dimension(level: AnnotationLevel) -> int:
     return CONTENT_FEATURE_DIMENSIONS[level]
 
 
+def get_legacy_absolute_position_dimension(level: AnnotationLevel) -> int:
+    """
+    Get the historical absolute-position feature width for an annotation level.
+
+    L0 never carried sinusoidal input features, so it uses a zero-width block.
+    L1-L4 currently carry the fixed 64-dimensional sinusoidal block inside the
+    historical ``features`` tensor.
+
+    Parameters
+    ----------
+    level : AnnotationLevel
+        The annotation level.
+
+    Returns
+    -------
+    int
+        Width of the historical absolute-position block.
+    """
+    if level == AnnotationLevel.L0:
+        return 0
+    return get_feature_dimension(level) - get_content_feature_dimension(level)
+
+
+def _validate_feature_matrix(name: str, features: np.ndarray) -> None:
+    if features.ndim != 2:
+        raise ValueError(
+            f"{name} must be a two-dimensional feature matrix; "
+            f"got shape {features.shape}"
+        )
+
+
+def split_legacy_variant_features(
+    features: np.ndarray,
+    annotation_level: AnnotationLevel,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Split historical variant features into content and absolute position.
+
+    This helper treats the historical ``features`` matrix as the runtime
+    authority. It does not independently re-encode biological annotations, which
+    avoids drifting from the exact dosage, consequence, SIFT, PolyPhen,
+    imputation, dtype, and ordering semantics that existing checkpoints learned.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Historical variant feature matrix with shape
+        ``[num_variants, get_feature_dimension(annotation_level)]``.
+    annotation_level : AnnotationLevel
+        Annotation level used to create ``features``.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(content_features, absolute_position_features)``. For L0, the
+        absolute-position matrix has shape ``[num_variants, 0]`` so downstream
+        code can handle all levels uniformly.
+    """
+    if not isinstance(annotation_level, AnnotationLevel):
+        raise ValueError(f"Unknown annotation level: {annotation_level!r}")
+
+    _validate_feature_matrix("features", features)
+    expected_width = get_feature_dimension(annotation_level)
+    if features.shape[1] != expected_width:
+        raise ValueError(
+            "features width does not match historical input dimension for "
+            f"{annotation_level.value}: got {features.shape[1]}, "
+            f"expected {expected_width}"
+        )
+
+    if annotation_level == AnnotationLevel.L0:
+        content_features = features.copy()
+        # A zero-width block records that L0 has no historical absolute
+        # positional input while keeping the split representation rectangular.
+        absolute_position_features = np.empty(
+            (features.shape[0], 0),
+            dtype=features.dtype,
+        )
+    else:
+        # Derive the boundary from the dimension authorities instead of
+        # duplicating the historical 64-column constant here. The legacy order
+        # is [dosage, absolute position, annotations], so content is the dosage
+        # prefix plus any annotation suffix.
+        position_start = 1
+        position_width = get_legacy_absolute_position_dimension(annotation_level)
+        position_end = position_start + position_width
+        absolute_position_features = features[:, position_start:position_end].copy()
+        content_features = np.concatenate(
+            [
+                features[:, :position_start],
+                features[:, position_end:],
+            ],
+            axis=1,
+        )
+
+    return (
+        np.ascontiguousarray(content_features),
+        np.ascontiguousarray(absolute_position_features),
+    )
+
+
+def compose_legacy_variant_features(
+    content_features: np.ndarray,
+    absolute_position_features: np.ndarray,
+    annotation_level: AnnotationLevel,
+) -> np.ndarray:
+    """
+    Recompose historical variant features from the split representation.
+
+    The composed matrix preserves the exact legacy input width and ordering used
+    by ``VariantEncoder``. This compatibility layer keeps historical
+    ``features`` as the execution authority until model-side positional
+    integration is implemented in a later phase.
+
+    Parameters
+    ----------
+    content_features : np.ndarray
+        Non-positional content feature matrix.
+    absolute_position_features : np.ndarray
+        Historical absolute-position feature matrix. For L0 this must have zero
+        columns.
+    annotation_level : AnnotationLevel
+        Annotation level to compose.
+
+    Returns
+    -------
+    np.ndarray
+        Historical feature matrix with shape
+        ``[num_variants, get_feature_dimension(annotation_level)]``.
+    """
+    if not isinstance(annotation_level, AnnotationLevel):
+        raise ValueError(f"Unknown annotation level: {annotation_level!r}")
+
+    _validate_feature_matrix("content_features", content_features)
+    _validate_feature_matrix(
+        "absolute_position_features", absolute_position_features
+    )
+
+    if content_features.dtype != absolute_position_features.dtype:
+        raise ValueError(
+            "content_features and absolute_position_features must have the "
+            f"same dtype; got {content_features.dtype} and "
+            f"{absolute_position_features.dtype}"
+        )
+
+    if content_features.shape[0] != absolute_position_features.shape[0]:
+        raise ValueError(
+            "content_features and absolute_position_features must have the "
+            "same number of rows; got "
+            f"{content_features.shape[0]} and {absolute_position_features.shape[0]}"
+        )
+
+    expected_content_width = get_content_feature_dimension(annotation_level)
+    if content_features.shape[1] != expected_content_width:
+        raise ValueError(
+            "content_features width does not match content dimension for "
+            f"{annotation_level.value}: got {content_features.shape[1]}, "
+            f"expected {expected_content_width}"
+        )
+
+    expected_position_width = get_legacy_absolute_position_dimension(annotation_level)
+    if absolute_position_features.shape[1] != expected_position_width:
+        raise ValueError(
+            "absolute_position_features width does not match historical "
+            f"absolute-position dimension for {annotation_level.value}: got "
+            f"{absolute_position_features.shape[1]}, expected "
+            f"{expected_position_width}"
+        )
+
+    if annotation_level == AnnotationLevel.L0:
+        features = content_features.copy()
+    else:
+        # The position block is inserted after dosage, not appended, because old
+        # L2-L4 checkpoints learned [dosage, position, annotations].
+        features = np.concatenate(
+            [
+                content_features[:, :1],
+                absolute_position_features,
+                content_features[:, 1:],
+            ],
+            axis=1,
+        )
+
+    return np.ascontiguousarray(features)
+
+
 def encode_genotype(variant: VariantRecord) -> np.ndarray:
     """
     Encode genotype dosage as single feature.

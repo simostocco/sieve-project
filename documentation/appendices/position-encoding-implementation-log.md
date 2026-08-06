@@ -364,9 +364,114 @@ Known limitations:
 - Metadata schema is transitional.
 - Content and positional channels are not yet separated.
 
+## Phase 5B1 - Additive Content and Absolute-Position Data Representation
+
+Goal:
+
+Expose content features and historical absolute-position features as explicit
+dataset tensors while preserving the existing `features` tensor as the runtime
+authority.
+
+Exact files changed:
+
+- `src/encoding/__init__.py`
+- `src/encoding/chunked_dataset.py`
+- `src/encoding/levels.py`
+- `src/encoding/sparse_tensor.py`
+- `tests/test_content_position_split.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Authoritative historical ordering:
+
+- L0: `[dosage]`
+- L1: `[dosage, sinusoidal_64]`
+- L2: `[dosage, sinusoidal_64, consequence_4]`
+- L3: `[dosage, sinusoidal_64, consequence_4, SIFT, PolyPhen]`
+- L4: current L3-compatible representation
+
+Implementation:
+
+- Added pure NumPy helpers to split and recompose historical variant feature
+  matrices.
+- Derived `content_features` and `absolute_position_features` from the already
+  encoded historical `features` matrix instead of independently re-encoding
+  biological annotations. This avoids drifting from the exact dosage,
+  consequence, SIFT, PolyPhen, imputation, dtype, and ordering semantics used by
+  old checkpoints.
+- Added a uniform L0 zero-width absolute-position representation with shape
+  `[num_variants, 0]`.
+- Extended `build_variant_tensor()` so dataset-generated samples return
+  `features`, `content_features`, and `absolute_position_features`.
+- Extended `collate_samples()` and `collate_chunks()` to pad the split tensors
+  only when every input item carries the split pair.
+- Preserved compatibility with old manually constructed dictionaries that omit
+  both split keys.
+- Rejected mixed legacy/split-aware batches, partial split pairs, and
+  malformed split tensors, including wrong ranks, row-count mismatches, and
+  inconsistent split widths.
+- Exported the split, compose, and legacy absolute-position dimension helpers as
+  public encoding APIs.
+
+Runtime behavior:
+
+- Historical `features` remains the tensor consumed by training, explanation,
+  validation, and model forward paths.
+- Model construction, attention, chromosome handling, Integrated Gradients,
+  checkpoint tensor shapes, CLI behavior, chunk boundaries, gene IDs,
+  chromosome IDs, masks, labels, covariates, and sample IDs are unchanged.
+- No positional strategy beyond the existing legacy sinusoidal input features is
+  executable yet.
+
+Compatibility:
+
+- Existing code that reads `batch["features"]` continues to receive the same
+  values and shapes.
+- Legacy collator inputs without split keys retain the old output schema.
+- Split-aware collator inputs receive padded split tensors with zero-filled
+  padding rows, matching the historical `features` padding contract.
+
+Validation:
+
+- `tests/test_content_position_split.py`: 49 passed.
+- The focused positional/data/model metadata test command passed 183 tests.
+- Additional relevant dataset, chunking, covariate, explanation, and validation
+  tests passed 94 tests with 1 existing non-failing warning.
+- The full test suite passed 634 tests with 6 existing non-failing warnings.
+- `compileall` passed for the changed encoding and new test files.
+- `git diff --check` passed.
+- The new test file passed Ruff, Black check, and isort check.
+- Modified legacy encoding files retained the same Ruff finding count as the
+  committed baseline comparison: 53 current findings versus 53 baseline
+  findings.
+- Modified legacy encoding files retained the same isort finding set as the
+  committed baseline comparison.
+
+Baseline static debt:
+
+- The modified legacy encoding files still carry pre-existing Ruff and isort
+  debt, including import-order, old typing-style, and unrelated unused-import
+  findings.
+- Black check reported that each modified legacy encoding file would be
+  reformatted. A baseline Black comparison process for the same files hung in
+  this environment and was interrupted, so Black equivalence for legacy files
+  could not be conclusively compared.
+
+Known limitations:
+
+- The model does not consume `content_features` or
+  `absolute_position_features`.
+- The split representation is legacy-only and recomposes to the historical
+  `VariantEncoder` input ordering.
+- The additive migration temporarily carries historical `features` plus the two
+  split tensors, increasing CPU and potentially pinned-memory use until
+  model-side composition removes the duplicate representation.
+- Learned binned absolute position, model-side composition, RoPE, ALiBi, and
+  content-only Integrated Gradients remain deferred.
+
 ## Next planned phase
 
-The next objective is to separate content features from positional features.
-That phase should first prove exact legacy equivalence, including feature
-shapes, logits, attention behavior, checkpoint compatibility, and attribution
-setup. New strategies should not be enabled until equivalence tests pass.
+The next objective is to add a parameter-free Torch legacy composer before
+`VariantEncoder`, switch the executed legacy path to `content_features` plus
+`absolute_position_features`, and prove feature, logits, attention, gradient,
+state-dict, and historical checkpoint equivalence. Custom strategies should not
+be enabled yet.

@@ -13,8 +13,10 @@ from .levels import (
     AnnotationLevel,
     CONTENT_FEATURE_DIMENSIONS,
     FEATURE_DIMENSIONS,
+    compose_legacy_variant_features,
     get_content_feature_dimension,
     get_feature_dimension,
+    get_legacy_absolute_position_dimension,
     encode_genotype,
     encode_consequence_severity,
     encode_functional_scores,
@@ -25,6 +27,7 @@ from .levels import (
     encode_variant_L4,
     encode_variants,
     get_level_description,
+    split_legacy_variant_features,
     summarize_level_features,
 )
 
@@ -74,8 +77,10 @@ __all__ = [
     'AnnotationLevel',
     'CONTENT_FEATURE_DIMENSIONS',
     'FEATURE_DIMENSIONS',
+    'compose_legacy_variant_features',
     'get_content_feature_dimension',
     'get_feature_dimension',
+    'get_legacy_absolute_position_dimension',
     'encode_genotype',
     'encode_consequence_severity',
     'encode_functional_scores',
@@ -86,6 +91,7 @@ __all__ = [
     'encode_variant_L4',
     'encode_variants',
     'get_level_description',
+    'split_legacy_variant_features',
     'summarize_level_features',
 
     # Position encoding configuration
