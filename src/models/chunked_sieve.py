@@ -19,6 +19,19 @@ import torch
 import torch.nn as nn
 
 
+def _build_split_feature_kwargs(
+    content_features: torch.Tensor | None,
+    absolute_position_features: torch.Tensor | None,
+) -> dict[str, torch.Tensor | None]:
+    """Return split-feature kwargs only when a caller supplied a split tensor."""
+    if content_features is None and absolute_position_features is None:
+        return {}
+    return {
+        'content_features': content_features,
+        'absolute_position_features': absolute_position_features,
+    }
+
+
 def build_sample_covariates(
     batch_sex: Optional[torch.Tensor],
     num_covariates: int,
@@ -140,7 +153,7 @@ class ChunkedSIEVEModel(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor | None,
         positions: torch.Tensor,
         gene_ids: torch.Tensor,
         mask: torch.Tensor,
@@ -151,6 +164,9 @@ class ChunkedSIEVEModel(nn.Module):
         return_attention: bool = False,
         return_intermediate: bool = False,
         chrom_ids: Optional[torch.Tensor] = None,
+        *,
+        content_features: torch.Tensor | None = None,
+        absolute_position_features: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
         Forward pass with automatic chunk aggregation.
@@ -160,8 +176,9 @@ class ChunkedSIEVEModel(nn.Module):
 
         Parameters
         ----------
-        features : torch.Tensor
-            [batch_size, max_variants, feature_dim]
+        features : Optional[torch.Tensor]
+            Historical features [batch_size, max_variants, feature_dim]. Used
+            as a compatibility fallback when split tensors are absent.
         positions : torch.Tensor
             [batch_size, max_variants]
         gene_ids : torch.Tensor
@@ -181,6 +198,11 @@ class ChunkedSIEVEModel(nn.Module):
             If True, collect attention weights from chunks
         return_intermediate : bool
             If True, return intermediate embeddings
+        content_features, absolute_position_features : Optional[torch.Tensor]
+            Complete split feature pair. When both are supplied, the base model
+            composes them into the unchanged historical VariantEncoder input
+            width. Supplying only one split tensor raises ``ValueError`` in the
+            base model.
 
         Returns
         -------
@@ -192,8 +214,6 @@ class ChunkedSIEVEModel(nn.Module):
             - 'attention_weights': List of attention weights per chunk (if return_attention=True)
             - 'chunk_metadata': Mapping from chunks to samples
         """
-        device = features.device
-
         # If no chunk metadata, process as regular batch
         # NOTE: Delegates directly to base_model. The base model should be on the
         # same device as ChunkedSIEVEModel to ensure output tensors match input device.
@@ -207,6 +227,12 @@ class ChunkedSIEVEModel(nn.Module):
                 kwargs['covariates'] = covariates
             if chrom_ids is not None:
                 kwargs['chrom_ids'] = chrom_ids
+            kwargs.update(
+                _build_split_feature_kwargs(
+                    content_features,
+                    absolute_position_features,
+                )
+            )
             return self.base_model(
                 features, positions, gene_ids, mask,
                 **kwargs,
@@ -220,11 +246,18 @@ class ChunkedSIEVEModel(nn.Module):
         )
         if chrom_ids is not None:
             base_kwargs['chrom_ids'] = chrom_ids
+        base_kwargs.update(
+            _build_split_feature_kwargs(
+                content_features,
+                absolute_position_features,
+            )
+        )
         chunk_gene_embeddings, chunk_intermediates = self.base_model(
             features, positions, gene_ids, mask,
             **base_kwargs,
         )
         # chunk_gene_embeddings: [num_chunks, num_genes, latent_dim]
+        device = chunk_gene_embeddings.device
 
         # Get unique samples and map chunks to samples
         unique_samples = original_sample_indices.unique(sorted=True)
@@ -379,7 +412,15 @@ class ChunkedSIEVEModel(nn.Module):
         This encourages the model to rely on fewer genes rather than fewer variants.
         """
         # Move to device
-        features = batch['features'].to(device)
+        features = batch.get('features')
+        if features is not None:
+            features = features.to(device)
+        content_features = batch.get('content_features')
+        absolute_position_features = batch.get('absolute_position_features')
+        if content_features is not None:
+            content_features = content_features.to(device)
+        if absolute_position_features is not None:
+            absolute_position_features = absolute_position_features.to(device)
         positions = batch['positions'].to(device)
         gene_ids = batch['gene_ids'].to(device)
         mask = batch['mask'].to(device)
@@ -451,6 +492,10 @@ class ChunkedSIEVEModel(nn.Module):
             covariates=sample_covariates,
             return_intermediate=need_embeddings,
             chrom_ids=chrom_ids,
+            **_build_split_feature_kwargs(
+                content_features,
+                absolute_position_features,
+            ),
         )
         # Ensure 1D tensor for loss computation
         if predictions.dim() > 1:
@@ -475,7 +520,7 @@ class ChunkedSIEVEModel(nn.Module):
 
     def get_gene_embeddings(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor | None,
         positions: torch.Tensor,
         gene_ids: torch.Tensor,
         mask: torch.Tensor,
@@ -483,6 +528,9 @@ class ChunkedSIEVEModel(nn.Module):
         total_chunks: Optional[torch.Tensor] = None,
         original_sample_indices: Optional[torch.Tensor] = None,
         chrom_ids: Optional[torch.Tensor] = None,
+        *,
+        content_features: torch.Tensor | None = None,
+        absolute_position_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Get aggregated gene embeddings for explainability.
@@ -490,11 +538,14 @@ class ChunkedSIEVEModel(nn.Module):
         Parameters
         ----------
         features, positions, gene_ids, mask : torch.Tensor
-            Variant data
+            Variant data. ``features`` is the historical fallback and may be
+            ``None`` when the complete split pair is supplied.
         chunk_indices, total_chunks, original_sample_indices : Optional[torch.Tensor]
             Chunking metadata
         chrom_ids : Optional[torch.Tensor]
             Chromosome indices, shape (batch, num_variants).
+        content_features, absolute_position_features : Optional[torch.Tensor]
+            Complete split feature pair for split-primary legacy execution.
 
         Returns
         -------
@@ -506,6 +557,10 @@ class ChunkedSIEVEModel(nn.Module):
             chunk_indices, total_chunks, original_sample_indices,
             return_intermediate=True,
             chrom_ids=chrom_ids,
+            **_build_split_feature_kwargs(
+                content_features,
+                absolute_position_features,
+            ),
         )
 
         if intermediates is None:
@@ -525,7 +580,7 @@ class ChunkedSIEVEModel(nn.Module):
 
     def get_attention_patterns(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor | None,
         positions: torch.Tensor,
         gene_ids: torch.Tensor,
         mask: torch.Tensor,
@@ -533,6 +588,9 @@ class ChunkedSIEVEModel(nn.Module):
         total_chunks: Optional[torch.Tensor] = None,
         original_sample_indices: Optional[torch.Tensor] = None,
         chrom_ids: Optional[torch.Tensor] = None,
+        *,
+        content_features: torch.Tensor | None = None,
+        absolute_position_features: torch.Tensor | None = None,
     ) -> List[torch.Tensor]:
         """
         Get attention patterns for explainability.
@@ -543,11 +601,14 @@ class ChunkedSIEVEModel(nn.Module):
         Parameters
         ----------
         features, positions, gene_ids, mask : torch.Tensor
-            Variant data
+            Variant data. ``features`` is the historical fallback and may be
+            ``None`` when the complete split pair is supplied.
         chunk_indices, total_chunks, original_sample_indices : Optional[torch.Tensor]
             Chunking metadata
         chrom_ids : Optional[torch.Tensor]
             Chromosome indices, shape (batch, num_variants).
+        content_features, absolute_position_features : Optional[torch.Tensor]
+            Complete split feature pair for split-primary legacy execution.
 
         Returns
         -------
@@ -562,6 +623,10 @@ class ChunkedSIEVEModel(nn.Module):
             chunk_indices, total_chunks, original_sample_indices,
             return_attention=True,
             chrom_ids=chrom_ids,
+            **_build_split_feature_kwargs(
+                content_features,
+                absolute_position_features,
+            ),
         )
 
         if intermediates is None or 'attention_weights' not in intermediates:

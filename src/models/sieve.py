@@ -20,6 +20,7 @@ from .encoder import VariantEncoder
 from .attention import MultiLayerAttention
 from .aggregation import EfficientGeneAggregator
 from .classifier import AttentionPoolingClassifier, PhenotypeClassifier
+from .feature_composition import compose_legacy_variant_features_torch
 
 
 class SIEVE(nn.Module):
@@ -157,7 +158,7 @@ class SIEVE(nn.Module):
 
     def forward(
         self,
-        variant_features: Tensor,
+        variant_features: Tensor | None,
         positions: Tensor,
         gene_ids: Tensor,
         mask: Optional[Tensor] = None,
@@ -166,14 +167,18 @@ class SIEVE(nn.Module):
         return_intermediate: bool = False,
         return_embeddings: bool = False,
         chrom_ids: Optional[Tensor] = None,
+        *,
+        content_features: Tensor | None = None,
+        absolute_position_features: Tensor | None = None,
     ) -> Tuple[Tensor, Optional[Dict]]:
         """
         Forward pass through SIEVE model.
 
         Parameters
         ----------
-        variant_features : Tensor
-            Variant features, shape (batch, num_variants, input_dim)
+        variant_features : Optional[Tensor]
+            Historical variant features, shape (batch, num_variants, input_dim).
+            Used unchanged when the split tensors are not supplied.
         positions : Tensor
             Genomic positions, shape (batch, num_variants)
         gene_ids : Tensor
@@ -195,6 +200,15 @@ class SIEVE(nn.Module):
             (and the model was constructed with ``num_chromosomes > 0``),
             enables chromosome-aware position bias and chromosome embedding
             in attention. Cross-chromosome attention itself is **not** masked.
+        content_features : Optional[Tensor]
+            Split content features. When supplied together with
+            ``absolute_position_features``, these are the primary legacy
+            execution input and are composed into the unchanged historical
+            VariantEncoder width.
+        absolute_position_features : Optional[Tensor]
+            Split historical absolute-position features. Must be supplied
+            together with ``content_features``. For L0 this tensor has zero
+            final-dimension width.
 
         Returns
         -------
@@ -211,7 +225,16 @@ class SIEVE(nn.Module):
         intermediates = {} if (return_attention or return_intermediate or return_embeddings) else None
 
         # 1. Encode variants
-        variant_embeddings = self.variant_encoder(variant_features)
+        # Dataset batches now provide split tensors. Compose them immediately
+        # before VariantEncoder so the split path is primary while old callers
+        # and explanation paths can still use historical variant_features.
+        # Historical checkpoints remain compatible because model state is unchanged.
+        encoder_input = self._resolve_variant_encoder_input(
+            variant_features,
+            content_features=content_features,
+            absolute_position_features=absolute_position_features,
+        )
+        variant_embeddings = self.variant_encoder(encoder_input)
         if return_intermediate or return_embeddings:
             intermediates['variant_embeddings'] = variant_embeddings
 
@@ -271,19 +294,23 @@ class SIEVE(nn.Module):
 
     def get_attention_patterns(
         self,
-        variant_features: Tensor,
+        variant_features: Tensor | None,
         positions: Tensor,
         gene_ids: Tensor,
         mask: Optional[Tensor] = None,
         chrom_ids: Optional[Tensor] = None,
+        *,
+        content_features: Tensor | None = None,
+        absolute_position_features: Tensor | None = None,
     ) -> List[Tensor]:
         """
         Extract attention patterns for explainability.
 
         Parameters
         ----------
-        variant_features : Tensor
-            Variant features, shape (batch, num_variants, input_dim)
+        variant_features : Optional[Tensor]
+            Historical variant features, shape (batch, num_variants, input_dim).
+            Used as the fallback when split tensors are absent.
         positions : Tensor
             Genomic positions, shape (batch, num_variants)
         gene_ids : Tensor
@@ -294,6 +321,10 @@ class SIEVE(nn.Module):
             Chromosome indices, shape (batch, num_variants). Enables
             chromosome-aware attention bias when the model was constructed
             with ``num_chromosomes > 0``.
+        content_features, absolute_position_features : Optional[Tensor]
+            Complete split feature pair. When both are supplied, attention is
+            extracted after composing the unchanged historical VariantEncoder
+            input width. Supplying only one split tensor raises ``ValueError``.
 
         Returns
         -------
@@ -309,8 +340,48 @@ class SIEVE(nn.Module):
                 mask,
                 return_attention=True,
                 chrom_ids=chrom_ids,
+                content_features=content_features,
+                absolute_position_features=absolute_position_features,
             )
             return intermediates['attention_weights']
+
+    def _resolve_variant_encoder_input(
+        self,
+        variant_features: Tensor | None,
+        *,
+        content_features: Tensor | None,
+        absolute_position_features: Tensor | None,
+    ) -> Tensor:
+        """Resolve the tensor that is fed to VariantEncoder."""
+        has_content = content_features is not None
+        has_position = absolute_position_features is not None
+
+        if has_content != has_position:
+            raise ValueError(
+                "content_features and absolute_position_features must be supplied "
+                "together."
+            )
+
+        if has_content and has_position:
+            composed = compose_legacy_variant_features_torch(
+                content_features,
+                absolute_position_features,
+            )
+            if composed.shape[-1] != self.input_dim:
+                raise ValueError(
+                    "Composed legacy VariantEncoder input width does not match "
+                    f"model input_dim: got {composed.shape[-1]}, expected "
+                    f"{self.input_dim}"
+                )
+            return composed
+
+        if variant_features is None:
+            raise ValueError(
+                "variant_features is required when content_features and "
+                "absolute_position_features are not supplied."
+            )
+
+        return variant_features
 
 
 def create_sieve_model(

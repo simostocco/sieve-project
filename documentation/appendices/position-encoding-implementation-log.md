@@ -468,10 +468,123 @@ Known limitations:
 - Learned binned absolute position, model-side composition, RoPE, ALiBi, and
   content-only Integrated Gradients remain deferred.
 
+## Phase 5B2 - Model-Side Legacy Feature Composition
+
+Goal:
+
+Execute the legacy model path through a parameter-free Torch composition of
+`content_features` and `absolute_position_features` while preserving historical
+`variant_features` as a compatibility fallback.
+
+Exact files changed:
+
+- `src/models/feature_composition.py`
+- `src/models/sieve.py`
+- `src/models/chunked_sieve.py`
+- `src/training/trainer.py`
+- `tests/test_legacy_feature_composition.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `compose_legacy_variant_features_torch()`, a pure Torch function with
+  no parameters, registered buffers, module state, NumPy conversion, casts,
+  device moves, detaches, or input mutation.
+- Rejected an `nn.Module` composer for this phase because a module would alter
+  `named_modules()` and architecture-rendering surface even without adding
+  state-dict keys. The pure function keeps the model state surface unchanged.
+- Added validation that the split tensors are Torch tensors with matching rank,
+  leading dimensions, dtype, and device, and that content has at least one
+  column.
+- Preserved the L0 zero-width position path by returning `content_features`
+  directly when `absolute_position_features.shape[-1] == 0`. The empty
+  absolute-position tensor is therefore not required to receive a gradient.
+- Added split-primary input resolution inside `SIEVE.forward()` immediately
+  before `VariantEncoder`. When both split tensors are present, the model
+  composes and executes the historical input ordering from them. When neither
+  split tensor is present, historical `variant_features` is passed through
+  unchanged. Partial split pairs and composed-width mismatches raise clear
+  `ValueError`s.
+- Threaded optional split tensors through `SIEVE.get_attention_patterns()`,
+  `ChunkedSIEVEModel.forward()`, `ChunkedSIEVEModel.train_step()`,
+  `ChunkedSIEVEModel.get_gene_embeddings()`,
+  `ChunkedSIEVEModel.get_attention_patterns()`, and the standard
+  `Trainer.train_epoch()` / `Trainer.validate()` paths.
+- Passed split kwargs to base models only when at least one split tensor was
+  supplied, preserving compatibility with legacy model doubles that accept only
+  the historical feature signature.
+- Left explanation modules and scripts unchanged. Integrated Gradients still
+  differentiates historical `variant_features`.
+
+Runtime behavior:
+
+- Dataset-backed training now executes composed split tensors whenever batches
+  contain both `content_features` and `absolute_position_features`.
+- Historical `variant_features` remains a fully compatible fallback for old
+  callers, explanation paths, attention-analysis scripts, and counterfactual
+  callers.
+- Custom positional strategies remain non-executable.
+- The additive dataset representation still carries all three tensors:
+  historical `features`, `content_features`, and
+  `absolute_position_features`.
+
+Compatibility:
+
+- `VariantEncoder` construction and first-layer input width are unchanged.
+- Model state-dict keys and tensor shapes are unchanged across historical and
+  split-primary forwards.
+- No composer-related state-dict keys exist.
+- `load_state_dict_with_legacy_upgrade()` still accepts state dicts without any
+  composer state.
+- State-dict compatibility is what preserves historical checkpoints; checkpoint
+  serialization and migration logic were not changed.
+- CV versus single-split chromosome behavior is unchanged.
+- Checkpoint serialization, CLI/configuration, attention implementation,
+  encoding/preprocessing, explanation code, architecture rendering, and
+  validation scripts were not modified.
+
+Validation:
+
+- `tests/test_legacy_feature_composition.py`: 32 passed, 1 skipped. The skipped
+  test is the optional CUDA device-mismatch check on a CPU-only run.
+- Focused regression command passed 253 tests, 1 skipped, with 1 existing
+  non-failing deprecation warning from `tests/test_phase3_explain.py`.
+- Full test suite passed 666 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for the changed model, trainer, and new test files.
+- `git diff --check` passed.
+- The new test file passed Ruff, Black check with Python 3.10 target, and isort
+  check.
+- The new pure helper passed Ruff, Black check with Python 3.10 target, and
+  isort check.
+
+Baseline static debt:
+
+- Modified legacy Python files still carry pre-existing Ruff and isort debt.
+- Ruff comparison for `src/models/sieve.py`, `src/models/chunked_sieve.py`, and
+  `src/training/trainer.py` reported 61 baseline findings and 61 current
+  findings.
+- isort comparison failed for the same three legacy files in both baseline and
+  current code, reflecting pre-existing import-order debt rather than new debt.
+- Black baseline/current comparison for the three modified legacy files did not
+  complete reliably in this environment and was interrupted. The new helper and
+  new test file passed Black check.
+
+Known limitations:
+
+- Integrated Gradients remains historical-feature attribution; content-only
+  attribution is still deferred.
+- The model only composes the legacy sinusoidal input representation. Learned
+  binned absolute position, RoPE, ALiBi, and other custom strategies remain
+  deferred and are not executable.
+- Training batches still carry historical `features` plus the two split tensors,
+  so the temporary additive CPU and pinned-memory overhead remains.
+- Explanation and attention-analysis scripts still pass historical
+  `variant_features` and rely on the fallback path.
+
 ## Next planned phase
 
-The next objective is to add a parameter-free Torch legacy composer before
-`VariantEncoder`, switch the executed legacy path to `content_features` plus
-`absolute_position_features`, and prove feature, logits, attention, gradient,
-state-dict, and historical checkpoint equivalence. Custom strategies should not
-be enabled yet.
+The next objective is to decide and implement the explanation-side transition
+from historical feature attribution to an explicit content/position attribution
+contract. Custom positional strategies should remain disabled until the legacy
+execution and attribution contracts are both stable.
