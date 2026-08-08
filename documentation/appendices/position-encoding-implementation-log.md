@@ -582,9 +582,115 @@ Known limitations:
 - Explanation and attention-analysis scripts still pass historical
   `variant_features` and rely on the fallback path.
 
+## Phase 5B3B - Core Content-Only Integrated Gradients Boundary
+
+Goal:
+
+Add the core Python API boundary for choosing legacy full-feature Integrated
+Gradients or content-only Integrated Gradients, without changing the explanation
+CLI, model state, checkpoint metadata, or output schemas.
+
+Exact files changed:
+
+- `src/explain/ig_mode.py`
+- `src/explain/gradients.py`
+- `tests/test_ig_content_mode.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added a pure `resolve_ig_mode()` helper plus `RequestedIGMode` and
+  `IGModeCompatibilityWarning`. The resolver imports no Torch, Captum, model,
+  dataset, or filesystem code.
+- Required new-schema configs containing `position_encoding` to include valid
+  nested `position_encoding.attribution.default_ig_mode` metadata, even when
+  callers explicitly request `content` or `legacy`.
+- Preserved old-config compatibility: `auto` resolves to legacy with a warning,
+  explicit `legacy` resolves silently, and explicit `content` resolves with a
+  warning that the current dataset must provide split tensors.
+- Kept `SIEVEWrapper` as the public legacy wrapper and added
+  `ContentSIEVEWrapper` for split-primary content attribution.
+- Extended `IntegratedGradientsExplainer` with `ig_mode`, defaulting to
+  `ResolvedIGMode.LEGACY`. The explainer rejects unresolved `auto`, selects
+  exactly one wrapper, and constructs exactly one Captum
+  `IntegratedGradients` object.
+- Preserved legacy attribution semantics: `variant_features` remains the
+  differentiable input, split tensors are rejected, and the default baseline is
+  `zeros_like(variant_features)`.
+- Added content attribution semantics: `variant_features` must be `None`,
+  `content_features` is the only differentiable Captum input, and
+  `absolute_position_features` is moved to the explainer device, detached, and
+  passed as a fixed observed forward argument.
+- Added strict baseline validation for both modes: explicit baselines must be
+  Torch tensors with the exact differentiable-input shape and matching dtype
+  after movement to the explainer device.
+- Extended `attribute_batch()` so content mode requires split batch keys,
+  does not require historical `features`, and applies the existing per-sample
+  variant truncation indices to content, absolute position, positions, gene IDs,
+  masks, and chromosome IDs together.
+
+Runtime behavior:
+
+- Existing Python callers keep legacy full-feature attribution unless they pass
+  `ig_mode=ResolvedIGMode.CONTENT`.
+- Content mode is available only through the Python explainer API in this
+  phase. `scripts/explain.py` and downstream output schemas still use their
+  existing legacy paths.
+- Absolute position remains observed and active in content mode, but it is not
+  a differentiable attribution target.
+- No model, attention, training, checkpoint, config, state-dict, CLI, or
+  ranking behavior changed.
+
+Compatibility:
+
+- `SIEVEWrapper` kept its public name and call signature.
+- Model state-dict keys and tensor shapes are unchanged.
+- Historical checkpoints remain compatible through unchanged model state.
+- The legacy Python explainer API remains the default execution path.
+- Old configs without `position_encoding` do not silently switch attribution
+  target when `auto` is requested.
+
+Validation:
+
+- `tests/test_ig_content_mode.py`: 39 passed.
+- Focused regression command passed 249 tests, 1 skipped, with 1 existing
+  non-failing deprecation warning from `tests/test_phase3_explain.py`.
+- Full test suite passed 705 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for the new resolver, modified gradients module, and new
+  content-mode test file.
+- `git diff --check` passed.
+- The new resolver and new content-mode test file passed Ruff, isort, and
+  Black check with Python 3.10 target. The combined two-file Black invocation
+  hung in this environment and was interrupted, but each new file passed the
+  same Black check individually.
+
+Baseline static debt:
+
+- Modified legacy `src/explain/gradients.py` still carries pre-existing Ruff,
+  isort, and Black debt.
+- Ruff comparison for committed baseline `src/explain/gradients.py` and the
+  current modified file reported 19 findings in both versions.
+- isort comparison failed for the committed baseline and current
+  `src/explain/gradients.py`, reflecting pre-existing import-order debt rather
+  than new debt.
+- Black comparison reported that committed baseline and current
+  `src/explain/gradients.py` would both be reformatted.
+
+Known limitations:
+
+- `scripts/explain.py` still has no `--ig-mode` CLI, config merge, metadata
+  emission, or content-mode output schema.
+- Manual explanation paths outside `IntegratedGradientsExplainer` still operate
+  on historical feature tensors.
+- Deterministic sampling behavior was intentionally not changed.
+- Custom positional strategies remain non-executable.
+- Content mode depends on current split tensors being present in batches; old
+  datasets or hand-built batches without split keys cannot use content IG.
+
 ## Next planned phase
 
-The next objective is to decide and implement the explanation-side transition
-from historical feature attribution to an explicit content/position attribution
-contract. Custom positional strategies should remain disabled until the legacy
-execution and attribution contracts are both stable.
+Phase 5B3C should integrate `--ig-mode` into `scripts/explain.py`, merge the
+request with saved configuration metadata, and record explicit attribution-mode
+metadata in explanation outputs while keeping custom positional strategies
+disabled.
