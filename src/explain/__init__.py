@@ -37,8 +37,9 @@ def load_sample_attributions(per_sample_dir: str | Path, sample_idx: int) -> dic
     Returns
     -------
     dict
-        Keys ``'attributions'`` (shape ``(n_variants, input_dim)``) and
-        ``'variant_scores'`` (shape ``(n_variants,)``).
+        Keys ``'attributions'`` and ``'variant_scores'``. For legacy output
+        files, the attribution matrix width is ``input_dim``. For content-mode
+        output files, the attribution matrix width is ``content_dim``.
     """
     path = Path(per_sample_dir) / f'sample_{sample_idx}.npz'
     with np.load(path, allow_pickle=False) as data:

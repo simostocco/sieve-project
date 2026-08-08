@@ -52,16 +52,30 @@ from src.encoding import (
     ChunkedVariantDataset,
     collate_chunks,
     get_feature_dimension,
+    get_content_feature_dimension,
     AnnotationLevel
 )
+from src.encoding.position_config import ResolvedIGMode
 from src.models.sieve import create_sieve_model, load_state_dict_with_legacy_upgrade
 from src.models import ChunkedSIEVEModel
 from src.explain.gradients import IntegratedGradientsExplainer
+from src.explain.ig_mode import RequestedIGMode, resolve_ig_mode
 from src.explain.attention_analysis import AttentionAnalyzer
 from src.explain.variant_ranking import VariantRanker
 
 
-def parse_args():
+ATTRIBUTION_SCHEMA_VERSION = 1
+VARIANT_SCORE_AGGREGATION = 'l2'
+SAMPLING_POLICY = 'manual_chunk_full_coverage_no_random_subsampling'
+LEGACY_COMPARABILITY_WARNING = (
+    "Legacy IG includes historical positional channels where present; raw "
+    "attribution magnitudes are not directly comparable with content-only "
+    "benchmark attribution."
+)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the explainability CLI parser."""
     parser = argparse.ArgumentParser(
         description='Run explainability analysis on trained SIEVE model',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -111,6 +125,19 @@ def parse_args():
                         help='Skip attention analysis (faster)')
     parser.add_argument('--skip-ig', action='store_true',
                         help='Skip Integrated Gradients computation (use if you only need attention analysis)')
+    parser.add_argument(
+        '--ig-mode',
+        type=str,
+        default=RequestedIGMode.AUTO.value,
+        choices=[mode.value for mode in RequestedIGMode],
+        help=(
+            "Integrated Gradients mode. auto uses the saved attribution policy "
+            "for new-schema configs and preserves historical legacy attribution "
+            "for old configs; content attributes biological content while "
+            "absolute position remains fixed; legacy attributes the complete "
+            "historical feature representation."
+        ),
+    )
     parser.add_argument('--top-k-variants', type=int, default=100,
                         help='Number of top variants to extract')
     parser.add_argument('--top-k-interactions', type=int, default=100,
@@ -143,7 +170,12 @@ def parse_args():
     parser.add_argument('--genome-build', type=str, default='GRCh37',
                         help='Reference genome build (GRCh37 or GRCh38)')
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    return build_arg_parser().parse_args(argv)
 
 
 def load_model_and_config(args):
@@ -195,6 +227,287 @@ def load_model_and_config(args):
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     return config, checkpoint
+
+
+def _validate_config_content_dim(config: dict, annotation_level: AnnotationLevel) -> int:
+    """Return structural content width and reject conflicting serialized width."""
+    content_dim = get_content_feature_dimension(annotation_level)
+    if 'position_encoding' not in config:
+        return content_dim
+    if 'content_dim' not in config:
+        return content_dim
+
+    serialized_content_dim = config['content_dim']
+    if isinstance(serialized_content_dim, bool) or not isinstance(serialized_content_dim, int):
+        raise ValueError("config['content_dim'] must be an integer when present")
+    if serialized_content_dim != content_dim:
+        raise ValueError(
+            "config['content_dim'] does not match annotation level content width: "
+            f"{serialized_content_dim} != {content_dim}"
+        )
+    return content_dim
+
+
+def _read_position_strategy_metadata(config: dict) -> dict[str, object]:
+    """Read position strategy identifiers from new-schema config metadata."""
+    if 'position_encoding' not in config:
+        return {
+            'absolute_position_encoding': None,
+            'relative_position_encoding': None,
+            'chromosome_encoding': None,
+            'position_encoding_metadata_source': 'unavailable_old_config',
+        }
+
+    position_encoding = config['position_encoding']
+    if not isinstance(position_encoding, dict):
+        raise ValueError("config['position_encoding'] must be a mapping")
+
+    def _required_mapping(section: str) -> dict:
+        value = position_encoding.get(section)
+        if not isinstance(value, dict):
+            raise ValueError(f"config['position_encoding']['{section}'] must be a mapping")
+        return value
+
+    def _required_string(mapping: dict, field: str, dotted_name: str) -> str:
+        value = mapping.get(field)
+        if not isinstance(value, str):
+            raise ValueError(f"{dotted_name} must be a string")
+        return value
+
+    absolute = _required_mapping('absolute')
+    relative = _required_mapping('relative')
+    chromosome = _required_mapping('chromosome')
+
+    return {
+        'absolute_position_encoding': _required_string(
+            absolute, 'type', "config['position_encoding']['absolute']['type']"
+        ),
+        'relative_position_encoding': _required_string(
+            relative, 'type', "config['position_encoding']['relative']['type']"
+        ),
+        'chromosome_encoding': _required_string(
+            chromosome, 'encoding', "config['position_encoding']['chromosome']['encoding']"
+        ),
+        'position_encoding_metadata_source': 'config',
+    }
+
+
+def _build_ig_run_metadata(
+    *,
+    requested_ig_mode: str,
+    resolved_ig_mode: ResolvedIGMode,
+    config: dict,
+    content_dim: int,
+    input_dim: int,
+    n_steps: int,
+    max_variants: int,
+) -> dict[str, object]:
+    """Build semantic metadata describing the Integrated Gradients run."""
+    if resolved_ig_mode is ResolvedIGMode.CONTENT:
+        attribution_feature_space = 'content'
+        attribution_width = content_dim
+        baseline_policy = 'zero_content_observed_absolute_position'
+        comparability_warning = None
+    elif resolved_ig_mode is ResolvedIGMode.LEGACY:
+        attribution_feature_space = 'legacy'
+        attribution_width = input_dim
+        baseline_policy = 'zero_historical_features'
+        comparability_warning = LEGACY_COMPARABILITY_WARNING
+    else:
+        raise ValueError(f"unsupported resolved IG mode: {resolved_ig_mode!r}")
+
+    metadata = {
+        'attribution_schema_version': ATTRIBUTION_SCHEMA_VERSION,
+        'requested_ig_mode': requested_ig_mode,
+        'resolved_ig_mode': resolved_ig_mode.value,
+        'attribution_feature_space': attribution_feature_space,
+        'attribution_width': attribution_width,
+        'content_dim': content_dim,
+        'input_dim': input_dim,
+        'variant_score_aggregation': VARIANT_SCORE_AGGREGATION,
+        'baseline_policy': baseline_policy,
+        'n_steps': n_steps,
+        'max_variants': max_variants,
+        'sampling_policy': SAMPLING_POLICY,
+        'sampling_seed': None,
+        'comparability_warning': comparability_warning,
+    }
+    metadata.update(_read_position_strategy_metadata(config))
+    return metadata
+
+
+def _build_skipped_ig_metadata(requested_ig_mode: str) -> dict[str, object]:
+    """Build analysis metadata for attention-only runs without resolving IG mode."""
+    return {
+        'executed': False,
+        'requested_ig_mode': requested_ig_mode,
+        'resolved_ig_mode': None,
+    }
+
+
+def _create_integrated_gradients_explainer(
+    *,
+    model,
+    device: str,
+    n_steps: int,
+    max_variants: int,
+    resolved_ig_mode: ResolvedIGMode,
+) -> IntegratedGradientsExplainer:
+    """Construct the 5B3B explainer with the already resolved IG mode."""
+    return IntegratedGradientsExplainer(
+        model=model,
+        device=device,
+        n_steps=n_steps,
+        max_variants=max_variants,
+        ig_mode=resolved_ig_mode,
+    )
+
+
+def _npz_scalar_metadata(
+    metadata: dict[str, object],
+    *,
+    per_sample: bool,
+) -> dict[str, np.ndarray]:
+    """Convert IG metadata scalars to NPZ-safe arrays without object dtype.
+
+    Semantic metadata keeps Python ``None`` values. NPZ scalar fields use
+    explicit sentinels because NumPy would otherwise store ``None`` as object
+    dtype, which cannot be read with ``allow_pickle=False``.
+    """
+    if per_sample:
+        keys = [
+            'attribution_schema_version',
+            'requested_ig_mode',
+            'resolved_ig_mode',
+            'attribution_feature_space',
+            'attribution_width',
+            'content_dim',
+            'input_dim',
+            'variant_score_aggregation',
+            'baseline_policy',
+        ]
+    else:
+        keys = [
+            'attribution_schema_version',
+            'requested_ig_mode',
+            'resolved_ig_mode',
+            'attribution_feature_space',
+            'attribution_width',
+            'content_dim',
+            'input_dim',
+            'absolute_position_encoding',
+            'relative_position_encoding',
+            'chromosome_encoding',
+            'position_encoding_metadata_source',
+            'variant_score_aggregation',
+            'baseline_policy',
+            'n_steps',
+            'max_variants',
+            'sampling_policy',
+            'sampling_seed',
+            'comparability_warning',
+        ]
+
+    scalar_metadata = {}
+    for key in keys:
+        value = metadata[key]
+        if value is None:
+            if key in {
+                'absolute_position_encoding',
+                'relative_position_encoding',
+                'chromosome_encoding',
+            }:
+                value = 'unavailable'
+            elif key == 'sampling_seed':
+                value = -1
+            else:
+                value = ''
+        scalar_metadata[key] = np.asarray(value)
+        if scalar_metadata[key].dtype == object:
+            raise ValueError(f"metadata field {key!r} cannot be serialized without pickle")
+    return scalar_metadata
+
+
+def _validate_attribution_width(
+    attributions: np.ndarray,
+    expected_width: int,
+) -> None:
+    """Validate raw attribution feature width before padded-row filtering."""
+    if attributions.ndim != 2:
+        raise ValueError(
+            "chunk attributions must be a 2D matrix before mask filtering; "
+            f"got shape {attributions.shape}"
+        )
+    actual_width = attributions.shape[1]
+    if actual_width != expected_width:
+        raise ValueError(
+            "unexpected attribution feature width before mask filtering: "
+            f"got {actual_width}, expected {expected_width}"
+        )
+
+
+def _attribute_chunk_for_ig(
+    *,
+    explainer: IntegratedGradientsExplainer,
+    chunk: dict,
+    resolved_ig_mode: ResolvedIGMode,
+    device: str,
+    chunk_covariates: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Invoke 5B3B IG for one chunk while preserving the selected feature boundary."""
+    positions = chunk['positions'].unsqueeze(0).to(device)
+    gene_ids = chunk['gene_ids'].unsqueeze(0).to(device)
+    mask = chunk['mask'].unsqueeze(0).to(device)
+    chrom_ids = (
+        chunk['chrom_ids'].unsqueeze(0).to(device)
+        if 'chrom_ids' in chunk else None
+    )
+    if chunk_covariates is not None:
+        chunk_covariates = chunk_covariates.to(device)
+
+    if resolved_ig_mode is ResolvedIGMode.LEGACY:
+        if 'features' not in chunk:
+            raise ValueError("legacy IG mode requires chunk['features']")
+        features = chunk['features'].unsqueeze(0).to(device)
+        attributions = explainer.attribute(
+            features,
+            positions,
+            gene_ids,
+            mask,
+            covariates=chunk_covariates,
+            chrom_ids=chrom_ids,
+        )
+    elif resolved_ig_mode is ResolvedIGMode.CONTENT:
+        if 'content_features' not in chunk or 'absolute_position_features' not in chunk:
+            raise ValueError(
+                "content IG mode requires chunk['content_features'] and "
+                "chunk['absolute_position_features']"
+            )
+        content_features = chunk['content_features'].unsqueeze(0).to(device)
+        absolute_position_features = chunk['absolute_position_features'].unsqueeze(0).to(device)
+        attributions = explainer.attribute(
+            None,
+            positions,
+            gene_ids,
+            mask,
+            covariates=chunk_covariates,
+            chrom_ids=chrom_ids,
+            content_features=content_features,
+            absolute_position_features=absolute_position_features,
+        )
+    else:
+        raise ValueError(f"unsupported resolved IG mode: {resolved_ig_mode!r}")
+
+    return attributions, positions, gene_ids, mask, chrom_ids
+
+
+def _annotate_ranking_metadata(df, ig_metadata: dict[str, object]):
+    """Add informational IG provenance columns after ranking calculations."""
+    annotated = df.copy()
+    annotated['resolved_ig_mode'] = ig_metadata['resolved_ig_mode']
+    annotated['attribution_feature_space'] = ig_metadata['attribution_feature_space']
+    annotated['variant_score_aggregation'] = ig_metadata['variant_score_aggregation']
+    return annotated
 
 
 def main():
@@ -275,6 +588,7 @@ def main():
     print("\nCreating model...")
     if 'input_dim' not in config:
         config['input_dim'] = get_feature_dimension(annotation_level)
+    input_dim = config['input_dim']
     # The chromosome embedding / cross-chromosome bias bucket are sized from
     # the dataset, not stored in the original config, surface it here so the
     # constructed model matches the checkpoint's tensor shapes.
@@ -332,21 +646,46 @@ def main():
         variant_rankings = None
         gene_rankings = None
         case_enriched = None
+        integrated_gradients_metadata = _build_skipped_ig_metadata(args.ig_mode)
     else:
         print("\n" + "="*60)
         print("Computing Integrated Gradients Attributions (CHUNKED)")
         print("="*60)
 
-        explainer = IntegratedGradientsExplainer(
+        content_dim = _validate_config_content_dim(config, annotation_level)
+        resolved_ig_mode = resolve_ig_mode(
+            args.ig_mode,
+            config=config,
+        )
+        ig_metadata = _build_ig_run_metadata(
+            requested_ig_mode=args.ig_mode,
+            resolved_ig_mode=resolved_ig_mode,
+            config=config,
+            content_dim=content_dim,
+            input_dim=input_dim,
+            n_steps=args.n_steps,
+            max_variants=chunk_size,
+        )
+        expected_attribution_width = ig_metadata['attribution_width']
+        integrated_gradients_metadata = {
+            'executed': True,
+            **ig_metadata,
+        }
+
+        explainer = _create_integrated_gradients_explainer(
             model=ig_model,
             device=args.device,
             n_steps=args.n_steps,
-            max_variants=chunk_size  # Process full chunks (no truncation within chunks)
+            max_variants=chunk_size,  # Process full chunks (no truncation within chunks)
+            resolved_ig_mode=resolved_ig_mode,
         )
 
         print(f"IG Configuration:")
+        print(f"  Requested IG mode: {args.ig_mode}")
+        print(f"  Resolved IG mode: {resolved_ig_mode.value}")
         print(f"  Integration steps: {args.n_steps}")
         print(f"  Chunk size: {chunk_size}")
+        print(f"  Attribution width: {expected_attribution_width}")
         print(f"  Processing ALL chunks per sample for FULL GENOME coverage")
 
         # === BUILD VARIANT INFO MAP (before IG loop, needed for ranker) ===
@@ -435,16 +774,6 @@ def main():
                 end_idx = chunk_info['end_idx']
                 original_variants = all_samples[sample_idx].variants[start_idx:end_idx]
 
-                # Move to device
-                features = chunk['features'].unsqueeze(0).to(args.device)
-                positions = chunk['positions'].unsqueeze(0).to(args.device)
-                gene_ids = chunk['gene_ids'].unsqueeze(0).to(args.device)
-                mask = chunk['mask'].unsqueeze(0).to(args.device)
-                chrom_ids = (
-                    chunk['chrom_ids'].unsqueeze(0).to(args.device)
-                    if 'chrom_ids' in chunk else None
-                )
-
                 # Build covariate tensor for this sample if the model needs it
                 chunk_covariates = None
                 if ig_num_covariates > 0:
@@ -472,15 +801,19 @@ def main():
                     )
 
                 # Compute attributions for this chunk
-                attr = explainer.attribute(
-                    features, positions, gene_ids, mask,
-                    covariates=chunk_covariates,
-                    chrom_ids=chrom_ids,
+                attr, positions, gene_ids, mask, chrom_ids = _attribute_chunk_for_ig(
+                    explainer=explainer,
+                    chunk=chunk,
+                    resolved_ig_mode=resolved_ig_mode,
+                    device=args.device,
+                    chunk_covariates=chunk_covariates,
                 )
 
                 # Extract valid variants (non-padded) to CPU numpy immediately
                 valid_mask = mask[0].cpu().numpy()
-                attr_valid = attr[0][valid_mask].cpu().numpy()
+                attr_matrix = attr[0].cpu().numpy()
+                _validate_attribution_width(attr_matrix, expected_attribution_width)
+                attr_valid = attr_matrix[valid_mask]
 
                 # Get chromosomes from original variants (matching valid positions)
                 valid_chroms = np.array([v.chrom for v in original_variants])[valid_mask]
@@ -491,7 +824,7 @@ def main():
                 chunk_chromosomes.append(valid_chroms)
 
                 # Free GPU tensors immediately after extracting to CPU
-                del features, positions, gene_ids, mask, attr
+                del positions, gene_ids, mask, attr
                 if chrom_ids is not None:
                     del chrom_ids
 
@@ -512,6 +845,7 @@ def main():
                 tmp_dir / f'sample_{sample_idx}.npz',
                 attributions=sample_attributions,
                 variant_scores=sample_variant_scores,
+                **_npz_scalar_metadata(ig_metadata, per_sample=True),
             )
 
             # Feed scores into ranker incrementally (then discard per-sample arrays)
@@ -588,6 +922,7 @@ def main():
             attributions_path,
             variant_scores=np.array(all_variant_scores, dtype=object),
             metadata=np.array(all_metadata, dtype=object),
+            **_npz_scalar_metadata(ig_metadata, per_sample=False),
         )
         print(f"Saved variant scores + metadata to {attributions_path}")
 
@@ -657,6 +992,13 @@ def main():
                 case_enriched = None
         else:
             case_enriched = None
+
+        variant_rankings = _annotate_ranking_metadata(variant_rankings, ig_metadata)
+        gene_rankings = _annotate_ranking_metadata(gene_rankings, ig_metadata)
+        gene_rankings_mean = _annotate_ranking_metadata(gene_rankings_mean, ig_metadata)
+        gene_rankings_size_norm = _annotate_ranking_metadata(
+            gene_rankings_size_norm, ig_metadata
+        )
 
         # Export rankings
         ranker.export_rankings(
@@ -786,6 +1128,7 @@ def main():
         'aggregation_method': args.aggregation_method,
         'skip_attention': args.skip_attention,
         'skip_ig': args.skip_ig,
+        'integrated_gradients': integrated_gradients_metadata,
         'attention_threshold_mode': args.attention_threshold_mode,
         'attention_threshold': args.attention_threshold,
         'attention_percentile': args.attention_percentile,

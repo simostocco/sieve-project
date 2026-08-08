@@ -688,9 +688,142 @@ Known limitations:
 - Content mode depends on current split tensors being present in batches; old
   datasets or hand-built batches without split keys cannot use content IG.
 
+## Phase 5B3C - Explanation CLI and Attribution Metadata
+
+Goal:
+
+Integrate the 5B3B Integrated Gradients mode boundary into `scripts/explain.py`
+and persist enough provenance to identify whether saved attribution files are
+legacy full-feature or content-only outputs.
+
+Exact files changed:
+
+- `scripts/explain.py`
+- `src/explain/__init__.py`
+- `tests/test_explain_ig_mode.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `--ig-mode {auto,content,legacy}` to the explanation CLI. The default
+  is `auto`.
+- Extracted `build_arg_parser()` and kept `parse_args(argv=None)` compatible
+  with normal command-line execution.
+- Resolved IG mode only when IG executes. `auto` uses saved attribution policy
+  for new-schema configs and preserves historical legacy attribution for old
+  configs through the existing resolver warning.
+- Preserved explicit old-config `--ig-mode content` behavior from the 5B3B
+  resolver: it resolves to content and warns that split tensors are required.
+- Kept `--skip-ig` attention-only execution from resolving IG mode, validating
+  IG metadata, validating IG content dimensions or positional strategy metadata,
+  constructing an explainer, or emitting compatibility warnings.
+- Routed the production manual `sample -> chunks -> explainer.attribute()` loop
+  through `_attribute_chunk_for_ig()`.
+- In legacy mode, the chunk helper requires historical `features` and passes no
+  split tensor keyword arguments.
+- In content mode, the chunk helper requires `content_features` and
+  `absolute_position_features`, does not require historical `features`, passes
+  `None` as the historical feature input, and leaves fixed-position behavior to
+  the 5B3B `ContentSIEVEWrapper`.
+- Added structural content-dimension validation using
+  `get_content_feature_dimension(annotation_level)`. If a new config includes
+  top-level `content_dim`, it must be an integer matching that structural
+  content width.
+- Validated raw attribution width before mask-based row filtering. Content
+  outputs must have width `content_dim`; legacy outputs must have width
+  `input_dim`.
+- Preserved the existing boolean mask authority for excluding padded variants
+  from raw attributions, L2 scores, positions, gene IDs, and chromosome
+  metadata.
+- Kept per-variant score aggregation unchanged as L2 norm over the active
+  attribution feature axis.
+- Added semantic IG run metadata including requested/resolved mode, attribution
+  feature space, widths, baseline policy, n-step/chunk parameters, sampling
+  policy, and comparability warning.
+- Added position-strategy metadata extraction for new-schema configs from
+  `position_encoding.absolute.type`, `position_encoding.relative.type`, and
+  `position_encoding.chromosome.encoding`. Old configs record those strategy
+  fields as unavailable rather than inferred.
+- Added NPZ-safe scalar metadata to per-sample attribution files while
+  preserving the existing `attributions` and `variant_scores` keys.
+- Added NPZ-safe scalar run metadata to top-level `attributions.npz` while
+  preserving historical `variant_scores` and `metadata` arrays.
+- Kept semantic Python metadata values as `None` where applicable. NPZ scalar
+  serialization uses explicit non-object sentinels: unavailable positional
+  strategies become `"unavailable"`, `sampling_seed=None` becomes `-1`, and
+  `comparability_warning=None` becomes an empty string.
+- Added `analysis_metadata.yaml` nested `integrated_gradients` metadata. Skipped
+  IG records `executed: false`, the requested mode, and `resolved_ig_mode:
+  null`.
+- Added informational IG provenance columns to variant rankings, primary gene
+  rankings, mean gene rankings, and size-normalised gene rankings after all
+  ranking calculations complete.
+- Updated `load_sample_attributions()` documentation so raw attribution width is
+  described as `input_dim` for legacy files and `content_dim` for content files.
+
+Runtime behavior:
+
+- Attention analysis remains unchanged and continues to consume historical
+  `batch["features"]`.
+- 5B3B IG mathematics are unchanged. The script selects between those already
+  implemented legacy/content explainer paths.
+- No deterministic or random sampling behavior changed. The manual script path
+  still processes deterministic dataset chunks without `attribute_batch()`
+  random subsampling.
+- No model, training, checkpoint, attention, ranking algorithm, or downstream
+  comparison code changed.
+
+Compatibility:
+
+- Existing `--skip-ig` attention-only usage remains compatible and does not
+  require IG content-dimension validation, positional-strategy metadata
+  validation, or IG mode resolution.
+- Existing per-sample NPZ consumers still find `attributions` and
+  `variant_scores`.
+- Existing top-level `attributions.npz` consumers still find `variant_scores`
+  and the historical object-array `metadata`.
+- `load_sample_attributions()` still returns exactly `attributions` and
+  `variant_scores`.
+- Old configs do not receive guessed positional strategy identifiers.
+
+Validation:
+
+- `tests/test_explain_ig_mode.py`: 41 passed.
+- Focused regression command passed 279 tests, 1 skipped, with 1 existing
+  non-failing deprecation warning from `tests/test_phase3_explain.py`.
+- Full test suite passed 746 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `scripts/explain.py`, `src/explain/__init__.py`, and
+  `tests/test_explain_ig_mode.py`.
+- `git diff --check` passed.
+- The new test file passed Ruff, Black check with Python 3.10 target, and isort
+  check.
+
+Baseline static debt:
+
+- `scripts/explain.py` retained 19 Ruff findings in both committed baseline and
+  current code.
+- `src/explain/__init__.py` retained 1 Ruff finding in both committed baseline
+  and current code.
+- Black check reported that committed baseline and current `scripts/explain.py`
+  would both be reformatted.
+- Black check reported that committed baseline and current
+  `src/explain/__init__.py` would both be reformatted.
+- isort check failed for committed baseline and current `scripts/explain.py`,
+  reflecting pre-existing import-order debt rather than new debt.
+- isort check failed for committed baseline and current
+  `src/explain/__init__.py`, reflecting pre-existing import-order debt rather
+  than new debt.
+
+Known limitations:
+
+- Downstream comparison tools do not yet reject or warn on incompatible
+  attribution modes.
+- Deterministic sampling and selected-index persistence remain deferred.
+- Custom positional strategies remain non-executable.
+- New scalar metadata is added to explainability outputs, but checkpoint and
+  training serialization are unchanged in this phase.
+
 ## Next planned phase
 
-Phase 5B3C should integrate `--ig-mode` into `scripts/explain.py`, merge the
-request with saved configuration metadata, and record explicit attribution-mode
-metadata in explanation outputs while keeping custom positional strategies
-disabled.
+Phase 5B3D - deterministic sampling and selected-index persistence.
