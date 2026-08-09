@@ -824,6 +824,129 @@ Known limitations:
 - New scalar metadata is added to explainability outputs, but checkpoint and
   training serialization are unchanged in this phase.
 
+## Phase 5B3D - Deterministic IG Batch Sampling
+
+Goal:
+
+Make `IntegratedGradientsExplainer.attribute_batch()` reproducible when it
+must subsample valid variants, and persist the exact original per-sample
+variant rows that produced returned attributions, scores, and metadata.
+
+Exact files changed:
+
+- `src/explain/gradients.py`
+- `tests/test_ig_sampling_reproducibility.py`
+- `tests/test_ig_content_mode.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Preserved the historical `attribute_batch()` variant limit, mask filtering,
+  attribution baselines, content/legacy differentiable input boundary,
+  covariate handling, chromosome handling, and aggregation definitions.
+- Replaced historical truncation sampling that depended on Torch's global RNG
+  and was not independently reproducible unless external code controlled that
+  state. The new explicit constructor argument defaults to `sampling_seed=0`
+  for reproducible scientific attribution. Passing `sampling_seed=None`
+  explicitly preserves nondeterministic compatibility behavior for Python
+  callers.
+- Added `MAX_TORCH_SEED = 2**63 - 1` and strict seed validation. The explainer
+  accepts `None` or integer seeds from zero through `MAX_TORCH_SEED`, and
+  rejects booleans, floats, strings, negative integers, other types, and
+  integers above the Torch seed maximum without coercion.
+- Added deterministic per-sample seed derivation using the global sample index:
+  `(sampling_seed + global_sample_idx) % (MAX_TORCH_SEED + 1)`. This keeps
+  selected subsets stable across DataLoader batch-size changes when sample
+  order is unchanged, and documents the remaining limitation that changing
+  sample order changes global-index seed assignment.
+- Generated deterministic permutations with a local CPU `torch.Generator`, so
+  unrelated global Torch RNG state and CUDA RNG state do not affect selected
+  rows and are not consumed.
+- Added no fallback to global RNG when `sampling_seed` is an integer. The only
+  intentional nondeterministic compatibility path is `sampling_seed=None`.
+- Preserved historical no-truncation execution by passing the original full
+  padded per-sample tensors and original mask to attribution when
+  `num_valid_variants <= max_variants`. No-truncation samples only add
+  selected-index provenance after attribution.
+- Updated the existing content-mode truncation test so it asserts tensor
+  alignment through the persisted `selected_variant_indices` contract rather
+  than monkeypatching the historical global `torch.randperm` call.
+- Centralised variant-row selection around original row indices from the
+  padded per-sample variant axis. The same selected row set is applied to
+  historical `features`, `content_features`, `absolute_position_features`,
+  `positions`, `gene_ids`, `mask`, and `chrom_ids`.
+- Added always-present `selected_variant_indices` metadata as a sorted
+  `np.int64` array of original valid row indices. Its length equals
+  `num_variants_analyzed` whether or not truncation occurred.
+- Added per-sample metadata fields `sampling_seed`,
+  `effective_sampling_seed`, and `sampling_applied`. In this phase,
+  `sampling_applied == truncated`; the separate field records the
+  reproducibility semantics explicitly.
+- Guaranteed that legacy and content IG modes select the same row indices when
+  run over the same sample order, mask, `max_variants`, and `sampling_seed`.
+
+Runtime behavior:
+
+- `attribute_batch()` now defaults to deterministic variant subsampling when a
+  sample has more valid variants than `max_variants`.
+- No-truncation samples preserve historical full-padded-tensor attribution
+  execution and now also persist their full valid original row indices in
+  metadata, with `sampling_applied=False`, `truncated=False`, and
+  `effective_sampling_seed=None`.
+- `scripts/explain.py` remains unchanged. Its production manual chunk path
+  still processes deterministic full chunks through `attribute()` and does not
+  use `attribute_batch()` random subsampling.
+- No model, training, checkpoint, config, attention, ranking, NPZ/YAML schema,
+  or positional-encoding execution behavior changed.
+
+Compatibility:
+
+- Existing constructor call sites remain valid because `sampling_seed` is an
+  optional keyword with a default.
+- Existing `attribute_batch()` callers still receive exactly the same
+  three-element return tuple: attributions, variant scores, metadata.
+- Existing metadata keys remain present; the phase only adds new per-sample
+  metadata keys.
+- Explicit `sampling_seed=None` remains available for callers that need the
+  historical nondeterministic subsampling path.
+
+Validation:
+
+- `tests/test_ig_sampling_reproducibility.py`: 33 passed.
+- Focused regression command passed 141 tests with 1 existing non-failing
+  deprecation warning from `tests/test_phase3_explain.py`.
+- Full test suite passed 779 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/explain/gradients.py` and
+  `tests/test_ig_sampling_reproducibility.py`, and
+  `tests/test_ig_content_mode.py`.
+- `git diff --check` passed.
+- The new sampling test file passed Ruff, Black check with Python 3.10 target,
+  and isort check.
+
+Baseline static debt:
+
+- Modified legacy `src/explain/gradients.py` retained 19 Ruff findings in both
+  the committed baseline and current code.
+- Black check reported that committed baseline and current
+  `src/explain/gradients.py` would both be reformatted.
+- isort check failed for committed baseline and current
+  `src/explain/gradients.py`, reflecting pre-existing import-order debt rather
+  than new debt.
+- `tests/test_ig_content_mode.py` retained zero Ruff findings in both the
+  committed baseline and current code. Black and isort checks improved from
+  failing on the committed baseline to passing on the current file.
+
+Known limitations:
+
+- `attribute_batch()` deterministic seed assignment is tied to global sample
+  order. Changing DataLoader/sample order changes which sample receives which
+  effective seed.
+- `scripts/explain.py` still records `sampling_seed=None` because its manual
+  chunk path does not perform random subsampling.
+- Downstream comparison tools do not yet enforce selected-index compatibility.
+- Custom positional strategies remain non-executable.
+
 ## Next planned phase
 
-Phase 5B3D - deterministic sampling and selected-index persistence.
+Phase 6A - common positional-encoding interface design.

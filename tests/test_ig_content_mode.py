@@ -603,7 +603,6 @@ def test_attribute_batch_content_mode_truncates_all_variant_tensors(monkeypatch)
         return torch.ones_like(content_features)
 
     monkeypatch.setattr(explainer, "attribute", fake_attribute)
-    monkeypatch.setattr(torch, "randperm", lambda n: torch.tensor([3, 1, 0, 2]))
     batch = {
         "content_features": torch.arange(8, dtype=torch.float32).reshape(1, 4, 2),
         "absolute_position_features": torch.arange(4, dtype=torch.float32).reshape(1, 4, 1),
@@ -614,20 +613,29 @@ def test_attribute_batch_content_mode_truncates_all_variant_tensors(monkeypatch)
     }
 
     attrs, _, metadata = explainer.attribute_batch(_fake_loader(batch))
+    selected_indices = torch.as_tensor(metadata[0]["selected_variant_indices"])
 
     assert captured["variant_features"] is None
-    assert torch.equal(captured["content_features"], batch["content_features"][:, [1, 3], :])
+    assert torch.equal(
+        captured["content_features"],
+        batch["content_features"][:, selected_indices, :],
+    )
     assert torch.equal(
         captured["absolute_position_features"],
-        batch["absolute_position_features"][:, [1, 3], :],
+        batch["absolute_position_features"][:, selected_indices, :],
     )
-    assert torch.equal(captured["positions"], batch["positions"][:, [1, 3]])
-    assert torch.equal(captured["gene_ids"], batch["gene_ids"][:, [1, 3]])
-    assert torch.equal(captured["mask"], batch["mask"][:, [1, 3]])
-    assert torch.equal(captured["chrom_ids"], batch["chrom_ids"][:, [1, 3]])
+    assert torch.equal(captured["positions"], batch["positions"][:, selected_indices])
+    assert torch.equal(captured["gene_ids"], batch["gene_ids"][:, selected_indices])
+    assert torch.equal(captured["mask"], batch["mask"][:, selected_indices])
+    assert torch.equal(captured["chrom_ids"], batch["chrom_ids"][:, selected_indices])
     assert attrs[0].shape == (2, 2)
-    assert metadata[0]["positions"].tolist() == [20, 40]
+    assert metadata[0]["positions"].tolist() == batch["positions"][0, selected_indices].tolist()
     assert metadata[0]["truncated"] is True
+    assert metadata[0]["sampling_applied"] is True
+    assert metadata[0]["selected_variant_indices"].tolist() == sorted(
+        metadata[0]["selected_variant_indices"].tolist()
+    )
+    assert len(metadata[0]["selected_variant_indices"]) == 2
 
 
 def test_attribute_batch_legacy_mode_preserves_historical_behavior():

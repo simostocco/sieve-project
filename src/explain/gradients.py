@@ -19,6 +19,9 @@ from captum.attr import IntegratedGradients
 from src.encoding.position_config import ResolvedIGMode
 
 
+MAX_TORCH_SEED = 2**63 - 1
+
+
 class IntegratedGradientsExplainer:
     """
     Compute variant attributions using Integrated Gradients.
@@ -41,6 +44,10 @@ class IntegratedGradientsExplainer:
         Resolved attribution mode. ``legacy`` preserves the historical Python
         API. ``content`` uses SIEVE's split-primary model path. ``auto`` must be
         resolved from configuration before constructing this explainer.
+    sampling_seed : Optional[int]
+        Deterministic base seed for ``attribute_batch()`` variant subsampling.
+        The default ``0`` makes scientific batch attribution reproducible.
+        ``None`` preserves explicit nondeterministic compatibility behavior.
 
     Attributes
     ----------
@@ -65,6 +72,7 @@ class IntegratedGradientsExplainer:
         n_steps: int = 50,
         max_variants: int = 2000,
         ig_mode: ResolvedIGMode | str = ResolvedIGMode.LEGACY,
+        sampling_seed: int | None = 0,
     ):
         self.model = model.to(device)
         self.model.eval()
@@ -72,6 +80,7 @@ class IntegratedGradientsExplainer:
         self.n_steps = n_steps
         self.max_variants = max_variants
         self.ig_mode = _coerce_resolved_ig_mode(ig_mode)
+        self.sampling_seed = _validate_sampling_seed(sampling_seed)
 
         if self.ig_mode is ResolvedIGMode.LEGACY:
             self.model_wrapper = SIEVEWrapper(model)
@@ -348,43 +357,51 @@ class IntegratedGradientsExplainer:
                     batch_covariates_full[i:i+1] if batch_covariates_full is not None else None
                 )
 
-                # CRITICAL: Limit variants to avoid OOM
-                # Count valid variants for this sample
-                num_valid_variants = sample_mask[0].sum().item()
+                global_sample_idx = len(all_metadata)
+                (
+                    selected_indices_cpu,
+                    sampling_applied,
+                    effective_sampling_seed,
+                ) = _select_variant_rows(
+                    sample_mask,
+                    self.max_variants,
+                    self.sampling_seed,
+                    global_sample_idx,
+                )
+                num_valid_variants = int(torch.where(sample_mask[0].detach().cpu())[0].numel())
 
-                if num_valid_variants > self.max_variants:
-                    # Too many variants - need to subsample
-                    valid_indices = torch.where(sample_mask[0])[0]
-
-                    # Random sampling of variant indices
-                    selected_indices = valid_indices[torch.randperm(len(valid_indices))[:self.max_variants]]
-                    selected_indices = selected_indices.sort()[0]  # Keep sorted for locality
-
-                    # Truncate to selected variants
+                if sampling_applied:
+                    selected_indices = selected_indices_cpu.to(sample_positions.device)
+                    # CRITICAL: Limit variants to avoid OOM. The same original
+                    # row indices drive every variant-level tensor so returned
+                    # rows and metadata remain comparable across legacy/content
+                    # IG modes.
                     sample_features_truncated = (
-                        sample_features[:, selected_indices, :]
+                        sample_features[:, selected_indices.to(sample_features.device), :]
                         if sample_features is not None else None
                     )
                     sample_content_truncated = (
-                        sample_content[:, selected_indices, :]
+                        sample_content[:, selected_indices.to(sample_content.device), :]
                         if sample_content is not None else None
                     )
                     sample_absolute_position_truncated = (
-                        sample_absolute_position[:, selected_indices, :]
+                        sample_absolute_position[
+                            :, selected_indices.to(sample_absolute_position.device), :
+                        ]
                         if sample_absolute_position is not None else None
                     )
                     sample_positions_truncated = sample_positions[:, selected_indices]
-                    sample_gene_ids_truncated = sample_gene_ids[:, selected_indices]
-                    sample_mask_truncated = sample_mask[:, selected_indices]
+                    sample_gene_ids_truncated = sample_gene_ids[
+                        :, selected_indices.to(sample_gene_ids.device)
+                    ]
+                    sample_mask_truncated = sample_mask[
+                        :, selected_indices.to(sample_mask.device)
+                    ]
                     sample_chrom_ids_truncated = (
-                        sample_chrom_ids[:, selected_indices]
+                        sample_chrom_ids[:, selected_indices.to(sample_chrom_ids.device)]
                         if sample_chrom_ids is not None else None
                     )
-
-                    # Track original indices for metadata
-                    original_indices = selected_indices
                 else:
-                    # Use all variants
                     sample_features_truncated = sample_features
                     sample_content_truncated = sample_content
                     sample_absolute_position_truncated = sample_absolute_position
@@ -392,7 +409,6 @@ class IntegratedGradientsExplainer:
                     sample_gene_ids_truncated = sample_gene_ids
                     sample_mask_truncated = sample_mask
                     sample_chrom_ids_truncated = sample_chrom_ids
-                    original_indices = None
 
                 # Compute attributions for this single sample (possibly truncated)
                 sample_attributions = self.attribute(
@@ -426,27 +442,19 @@ class IntegratedGradientsExplainer:
                 all_attributions.append(attributions_np[valid_mask])
                 all_variant_scores.append(variant_scores[valid_mask])
 
-                # Store metadata (use truncated positions/genes if applicable)
-                if original_indices is not None:
-                    # Was truncated - use the selected subset
-                    metadata = {
-                        'positions': sample_positions_truncated[0][sample_mask_truncated[0]].cpu().numpy(),
-                        'gene_ids': sample_gene_ids_truncated[0][sample_mask_truncated[0]].cpu().numpy(),
-                        'sample_idx': len(all_metadata),
-                        'num_variants_original': num_valid_variants,
-                        'num_variants_analyzed': self.max_variants,
-                        'truncated': True,
-                    }
-                else:
-                    # Not truncated - use all
-                    metadata = {
-                        'positions': positions[i][mask[i]].cpu().numpy(),
-                        'gene_ids': gene_ids[i][mask[i]].cpu().numpy(),
-                        'sample_idx': len(all_metadata),
-                        'num_variants_original': num_valid_variants,
-                        'num_variants_analyzed': num_valid_variants,
-                        'truncated': False,
-                    }
+                selected_variant_indices = selected_indices_cpu.numpy().astype(np.int64)
+                metadata = {
+                    'positions': sample_positions_truncated[0][sample_mask_truncated[0]].cpu().numpy(),
+                    'gene_ids': sample_gene_ids_truncated[0][sample_mask_truncated[0]].cpu().numpy(),
+                    'sample_idx': global_sample_idx,
+                    'num_variants_original': num_valid_variants,
+                    'num_variants_analyzed': len(selected_variant_indices),
+                    'truncated': sampling_applied,
+                    'selected_variant_indices': selected_variant_indices,
+                    'sampling_seed': self.sampling_seed,
+                    'effective_sampling_seed': effective_sampling_seed,
+                    'sampling_applied': sampling_applied,
+                }
                 # Fix: use sample_ids (plural) not sample_id
                 if 'sample_ids' in batch:
                     metadata['sample_id'] = batch['sample_ids'][i]
@@ -582,6 +590,59 @@ class ContentSIEVEWrapper(nn.Module):
             absolute_position_features=absolute_position_features,
         )
         return logits
+
+
+def _validate_sampling_seed(sampling_seed: int | None) -> int | None:
+    """Validate the configured batch-sampling seed without silent coercion."""
+    if sampling_seed is None:
+        return None
+    if isinstance(sampling_seed, bool) or not isinstance(sampling_seed, int):
+        raise ValueError(
+            "sampling_seed must be None or an integer in the range "
+            f"0..{MAX_TORCH_SEED}"
+        )
+    if sampling_seed < 0 or sampling_seed > MAX_TORCH_SEED:
+        raise ValueError(
+            "sampling_seed must be None or an integer in the range "
+            f"0..{MAX_TORCH_SEED}"
+        )
+    return sampling_seed
+
+
+def _derive_effective_sampling_seed(sampling_seed: int, global_sample_idx: int) -> int:
+    """Derive a deterministic per-sample seed from the global sample order."""
+    return (sampling_seed + global_sample_idx) % (MAX_TORCH_SEED + 1)
+
+
+def _select_variant_rows(
+    sample_mask: Tensor,
+    max_variants: int,
+    sampling_seed: int | None,
+    global_sample_idx: int,
+) -> tuple[Tensor, bool, int | None]:
+    """Select original variant rows for batch IG without touching CUDA RNG.
+
+    Returned indices are CPU ``torch.long`` row numbers into the original padded
+    per-sample variant axis. Deterministic sampling uses a local CPU generator so
+    unrelated global or CUDA random state cannot change the selected subset.
+    """
+    valid_indices = torch.where(sample_mask[0].detach().cpu())[0]
+    if len(valid_indices) <= max_variants:
+        return valid_indices, False, None
+
+    if sampling_seed is None:
+        selected_indices = valid_indices[torch.randperm(len(valid_indices))[:max_variants]]
+        return selected_indices.sort()[0], True, None
+
+    effective_sampling_seed = _derive_effective_sampling_seed(
+        sampling_seed,
+        global_sample_idx,
+    )
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(effective_sampling_seed)
+    permutation = torch.randperm(len(valid_indices), generator=generator)
+    selected_indices = valid_indices[permutation[:max_variants]]
+    return selected_indices.sort()[0], True, effective_sampling_seed
 
 
 def _coerce_resolved_ig_mode(ig_mode: ResolvedIGMode | str) -> ResolvedIGMode:
