@@ -31,20 +31,24 @@ def resolve_ig_mode(
     requested_mode: RequestedIGMode | str,
     *,
     config: Mapping[str, object],
+    is_new_schema: bool | None = None,
 ) -> ResolvedIGMode:
     """
     Resolve an IG mode from a request and an authoritative config mapping.
 
-    New-schema configs contain ``position_encoding`` and must include valid
-    nested attribution metadata, even when the caller explicitly requests a
-    concrete mode. Old configs lack ``position_encoding``; ``auto`` resolves to
-    legacy attribution with a compatibility warning, while an explicit content
-    override is allowed but warned because it depends on split tensors from the
-    current dataset.
+    ``is_new_schema`` is the execution-authority result from checkpoint
+    reconstruction. When omitted, the historical Python API is preserved:
+    ``position_encoding`` presence is treated as new schema. Explanation code
+    should pass the reconstruction result explicitly so transitional configs
+    with non-executed positional metadata keep historical attribution policy.
     """
     mode = _coerce_requested_mode(requested_mode)
+    if is_new_schema is None:
+        is_new_schema = "position_encoding" in config
+    elif type(is_new_schema) is not bool:
+        raise ValueError("is_new_schema must be None or an exact boolean")
 
-    if "position_encoding" in config:
+    if is_new_schema:
         saved_default = _read_saved_default_ig_mode(config)
         if mode is RequestedIGMode.AUTO:
             return saved_default
@@ -54,20 +58,15 @@ def resolve_ig_mode(
             return ResolvedIGMode.LEGACY
 
     if mode is RequestedIGMode.AUTO:
-        # Old configs predate the content/position split, so automatic mode
-        # must preserve the historical attribution target instead of guessing.
         warnings.warn(
-            "Old config has no position_encoding metadata; resolving "
-            "ig_mode='auto' to historical legacy attribution.",
+            _compatibility_warning(config, explicit_content=False),
             IGModeCompatibilityWarning,
             stacklevel=2,
         )
         return ResolvedIGMode.LEGACY
     if mode is RequestedIGMode.CONTENT:
         warnings.warn(
-            "Old config has no position_encoding metadata; using explicit "
-            "content-only attribution override. This requires split tensors "
-            "from the current dataset.",
+            _compatibility_warning(config, explicit_content=True),
             IGModeCompatibilityWarning,
             stacklevel=2,
         )
@@ -108,3 +107,33 @@ def _read_saved_default_ig_mode(config: Mapping[str, object]) -> ResolvedIGMode:
     if saved_default == ResolvedIGMode.LEGACY.value:
         return ResolvedIGMode.LEGACY
     raise ValueError("position_encoding.attribution.default_ig_mode must be 'content' or 'legacy'")
+
+
+def _compatibility_warning(
+    config: Mapping[str, object],
+    *,
+    explicit_content: bool,
+) -> str:
+    if "position_encoding" in config:
+        if explicit_content:
+            return (
+                "Config contains position_encoding metadata, but checkpoint "
+                "reconstruction identified historical/transitional execution; "
+                "using explicit content-only attribution override. This "
+                "requires split tensors from the current dataset."
+            )
+        return (
+            "Config contains position_encoding metadata, but checkpoint "
+            "reconstruction identified historical/transitional execution; "
+            "resolving ig_mode='auto' to historical legacy attribution."
+        )
+    if explicit_content:
+        return (
+            "Old config has no position_encoding metadata; using explicit "
+            "content-only attribution override. This requires split tensors "
+            "from the current dataset."
+        )
+    return (
+        "Old config has no position_encoding metadata; resolving "
+        "ig_mode='auto' to historical legacy attribution."
+    )

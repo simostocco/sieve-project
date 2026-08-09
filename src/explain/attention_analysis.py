@@ -68,19 +68,24 @@ class AttentionAnalyzer:
 
     def extract_attention_weights(
         self,
-        variant_features: Tensor,
+        variant_features: Tensor | None,
         positions: Tensor,
         gene_ids: Tensor,
         mask: Tensor,
         chrom_ids: Optional[Tensor] = None,
+        *,
+        content_features: Tensor | None = None,
+        absolute_position_features: Tensor | None = None,
     ) -> List[Tensor]:
         """
         Extract attention weights from all layers.
 
         Parameters
         ----------
-        variant_features : Tensor
-            Variant features, shape (batch, num_variants, input_dim)
+        variant_features : Optional[Tensor]
+            Historical variant features, shape (batch, num_variants,
+            input_dim). Must be supplied without split tensors in historical
+            mode.
         positions : Tensor
             Genomic positions, shape (batch, num_variants)
         gene_ids : Tensor
@@ -91,6 +96,9 @@ class AttentionAnalyzer:
             Chromosome indices, shape (batch, num_variants). When provided
             (and the model was constructed with ``num_chromosomes > 0``),
             enables chromosome-aware position bias and chromosome embedding.
+        content_features, absolute_position_features : Optional[Tensor]
+            Split feature pair for custom positional execution. Must be
+            supplied together, with ``variant_features=None``.
 
         Returns
         -------
@@ -98,23 +106,57 @@ class AttentionAnalyzer:
             Attention weights from each layer
             Each tensor: (batch, num_heads, num_variants, num_variants)
         """
-        # Move to device
-        variant_features = variant_features.to(self.device)
+        has_historical = variant_features is not None
+        has_content = content_features is not None
+        has_position = absolute_position_features is not None
+
+        if has_historical and (has_content or has_position):
+            raise ValueError(
+                "variant_features cannot be mixed with content_features or "
+                "absolute_position_features"
+            )
+        if not has_historical and not has_content and not has_position:
+            raise ValueError(
+                "attention extraction requires either variant_features or the "
+                "content_features/absolute_position_features pair"
+            )
+        if has_content != has_position:
+            raise ValueError(
+                "content_features and absolute_position_features must be supplied "
+                "together"
+            )
+
+        if variant_features is not None:
+            variant_features = variant_features.to(self.device)
+        if content_features is not None:
+            content_features = content_features.to(self.device)
+        if absolute_position_features is not None:
+            absolute_position_features = absolute_position_features.to(self.device)
         positions = positions.to(self.device)
         gene_ids = gene_ids.to(self.device)
         mask = mask.to(self.device)
         if chrom_ids is not None:
             chrom_ids = chrom_ids.to(self.device)
 
-        # Get attention patterns
         with torch.no_grad():
-            attention_weights = self.model.get_attention_patterns(
-                variant_features,
-                positions,
-                gene_ids,
-                mask,
-                chrom_ids=chrom_ids,
-            )
+            if has_historical:
+                attention_weights = self.model.get_attention_patterns(
+                    variant_features,
+                    positions,
+                    gene_ids,
+                    mask,
+                    chrom_ids=chrom_ids,
+                )
+            else:
+                attention_weights = self.model.get_attention_patterns(
+                    None,
+                    positions,
+                    gene_ids,
+                    mask,
+                    chrom_ids=chrom_ids,
+                    content_features=content_features,
+                    absolute_position_features=absolute_position_features,
+                )
 
         return attention_weights
 

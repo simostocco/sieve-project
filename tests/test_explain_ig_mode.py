@@ -4,6 +4,7 @@ import inspect
 import sys
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -50,6 +51,30 @@ def _new_config(default_ig_mode: str = "content") -> dict[str, object]:
             "attribution": {"default_ig_mode": default_ig_mode},
         },
     }
+
+
+def _reconstruction_from_config(config: dict[str, object], *, is_new_schema: bool = True):
+    if is_new_schema:
+        position_encoding = config["position_encoding"]
+        resolved = SimpleNamespace(
+            absolute=SimpleNamespace(
+                encoding=SimpleNamespace(value=position_encoding["absolute"]["type"])
+            ),
+            relative=SimpleNamespace(
+                encoding=SimpleNamespace(value=position_encoding["relative"]["type"])
+            ),
+            chromosome=SimpleNamespace(
+                encoding=SimpleNamespace(value=position_encoding["chromosome"]["encoding"])
+            ),
+        )
+    else:
+        resolved = None
+    return SimpleNamespace(
+        is_new_schema=is_new_schema,
+        resolved_position_encoding=resolved,
+        effective_config=config,
+        base_model=SimpleNamespace(input_dim=config.get("input_dim", 71)),
+    )
 
 
 class RecordingExplainer:
@@ -168,7 +193,7 @@ def test_production_skip_branch_does_not_validate_or_resolve_ig_metadata():
     assert "resolve_ig_mode" not in skip_branch
     assert "_read_position_strategy_metadata" not in skip_branch
     assert "_create_integrated_gradients_explainer" not in skip_branch
-    assert "_validate_config_content_dim" in ig_branch
+    assert "_content_dim_for_reconstruction" in ig_branch
 
 
 def test_create_integrated_gradients_explainer_preserves_parameters(monkeypatch):
@@ -283,21 +308,20 @@ def test_legacy_chunk_execution_requires_historical_features():
 
 
 def test_expected_widths_follow_resolved_mode_metadata():
+    reconstruction = _reconstruction_from_config(_new_config())
     content = explain._build_ig_run_metadata(
         requested_ig_mode="content",
         resolved_ig_mode=ResolvedIGMode.CONTENT,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=71,
         n_steps=50,
         max_variants=2000,
     )
     legacy = explain._build_ig_run_metadata(
         requested_ig_mode="legacy",
         resolved_ig_mode=ResolvedIGMode.LEGACY,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=71,
         n_steps=50,
         max_variants=2000,
     )
@@ -366,15 +390,16 @@ def test_config_content_dim_rejects_conflicts_and_non_integer_values(value):
         explain._validate_config_content_dim(config, AnnotationLevel.L3)
 
 
-def test_input_dim_remains_config_width_authority():
+def test_input_dim_uses_reconstructed_model_width_authority():
     config = _new_config()
-    config["input_dim"] = 123
+    config["input_dim"] = 999
+    reconstruction = _reconstruction_from_config(config)
+    reconstruction.base_model.input_dim = 123
     metadata = explain._build_ig_run_metadata(
         requested_ig_mode="legacy",
         resolved_ig_mode=ResolvedIGMode.LEGACY,
-        config=config,
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=config["input_dim"],
         n_steps=9,
         max_variants=11,
     )
@@ -384,12 +409,12 @@ def test_input_dim_remains_config_width_authority():
 
 
 def test_content_metadata_values_match_contract():
+    reconstruction = _reconstruction_from_config(_new_config())
     metadata = explain._build_ig_run_metadata(
         requested_ig_mode="auto",
         resolved_ig_mode=ResolvedIGMode.CONTENT,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=71,
         n_steps=9,
         max_variants=11,
     )
@@ -411,12 +436,12 @@ def test_content_metadata_values_match_contract():
 
 
 def test_legacy_metadata_values_match_contract():
+    reconstruction = _reconstruction_from_config(_new_config())
     metadata = explain._build_ig_run_metadata(
         requested_ig_mode="legacy",
         resolved_ig_mode=ResolvedIGMode.LEGACY,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=71,
         n_steps=9,
         max_variants=11,
     )
@@ -429,13 +454,17 @@ def test_legacy_metadata_values_match_contract():
 
 
 def test_position_strategy_metadata_new_schema_and_old_config():
-    assert explain._read_position_strategy_metadata(_new_config()) == {
+    assert explain._read_position_strategy_metadata(
+        _reconstruction_from_config(_new_config())
+    ) == {
         "absolute_position_encoding": "sinusoidal",
         "relative_position_encoding": "t5_bucket",
         "chromosome_encoding": "learned",
-        "position_encoding_metadata_source": "config",
+        "position_encoding_metadata_source": "reconstructed_resolved_config",
     }
-    assert explain._read_position_strategy_metadata({}) == {
+    assert explain._read_position_strategy_metadata(
+        _reconstruction_from_config({}, is_new_schema=False)
+    ) == {
         "absolute_position_encoding": None,
         "relative_position_encoding": None,
         "chromosome_encoding": None,
@@ -443,32 +472,13 @@ def test_position_strategy_metadata_new_schema_and_old_config():
     }
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        {"position_encoding": "bad"},
-        {"position_encoding": {"absolute": {}, "relative": {}, "chromosome": {}}},
-        {
-            "position_encoding": {
-                "absolute": {"type": "sinusoidal"},
-                "relative": {"type": 1},
-                "chromosome": {"encoding": "learned"},
-            }
-        },
-    ],
-)
-def test_malformed_position_strategy_metadata_raises(config):
-    with pytest.raises(ValueError, match="position_encoding|must be a string"):
-        explain._read_position_strategy_metadata(config)
-
-
 def test_per_sample_npz_metadata_is_pickle_free_and_keeps_existing_keys(tmp_path):
+    reconstruction = _reconstruction_from_config(_new_config())
     metadata = explain._build_ig_run_metadata(
         requested_ig_mode="content",
         resolved_ig_mode=ResolvedIGMode.CONTENT,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=2,
-        input_dim=66,
         n_steps=3,
         max_variants=4,
     )
@@ -488,12 +498,13 @@ def test_per_sample_npz_metadata_is_pickle_free_and_keeps_existing_keys(tmp_path
 
 
 def test_top_level_npz_metadata_is_pickle_free_except_historical_arrays(tmp_path):
+    reconstruction = _reconstruction_from_config({}, is_new_schema=False)
+    reconstruction.base_model.input_dim = 66
     metadata = explain._build_ig_run_metadata(
         requested_ig_mode="legacy",
         resolved_ig_mode=ResolvedIGMode.LEGACY,
-        config={},
+        reconstruction=reconstruction,
         content_dim=2,
-        input_dim=66,
         n_steps=3,
         max_variants=4,
     )
@@ -519,12 +530,12 @@ def test_top_level_npz_metadata_is_pickle_free_except_historical_arrays(tmp_path
 
 
 def test_analysis_metadata_shapes_for_executed_and_skipped_ig():
+    reconstruction = _reconstruction_from_config(_new_config())
     ig_metadata = explain._build_ig_run_metadata(
         requested_ig_mode="content",
         resolved_ig_mode=ResolvedIGMode.CONTENT,
-        config=_new_config(),
+        reconstruction=reconstruction,
         content_dim=7,
-        input_dim=71,
         n_steps=9,
         max_variants=11,
     )
@@ -587,12 +598,13 @@ def test_production_main_uses_mode_aware_chunk_helper():
     assert "_attribute_chunk_for_ig(" in inspect.getsource(explain.main)
 
 
-def test_attention_code_path_remains_historical_feature_based():
+def test_attention_code_path_supports_historical_and_custom_split_routing():
     source = inspect.getsource(explain.main)
     attention_section = source.split("# === ATTENTION ANALYSIS ===", maxsplit=1)[1]
 
     assert "features = batch['features'].to(args.device)" in attention_section
-    assert "content_features" not in attention_section
+    assert "content_features = batch['content_features'].to(args.device)" in attention_section
+    assert "use_split_attention = _attention_uses_split_inputs(reconstruction)" in attention_section
 
 
 def test_no_custom_position_strategy_cli_flags_are_exposed():

@@ -1612,4 +1612,116 @@ Known limitations:
 
 ## Next planned phase
 
-Phase 7B4B - explanation, IG policy, and attention integration.
+## Phase 7B4B - Explanation, IG Policy, and Attention Integration
+
+Goal:
+
+Make explanation consume Phase 7B4A reconstruction so supported Phase-7
+positional models are explainable through the same architecture authority used
+for checkpoint loading.
+
+Exact files changed:
+
+- `scripts/explain.py`
+- `src/explain/ig_mode.py`
+- `src/explain/attention_analysis.py`
+- `tests/test_explain_position_phase7.py`
+- `tests/test_explain_ig_mode.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- `scripts/explain.py` now calls `reconstruct_sieve_from_checkpoint()` after
+  creating the chunked dataset and uses the returned model/base model for
+  attention and chunk-level IG.
+- Explanation no longer mutates loaded config to fill `input_dim` or
+  `num_chromosomes` for reconstruction. Actual model input width comes from
+  `reconstruction.base_model.input_dim`.
+- IG metadata also derives `input_dim` and legacy attribution width directly
+  from `reconstruction.base_model.input_dim`; callers no longer pass a
+  duplicate width.
+- Content attribution width comes from the reconstructed resolved config for
+  authoritative schema-v2 Case A and from structural annotation-level content
+  width for historical/transitional Cases B/C.
+- `resolve_ig_mode()` accepts an explicit `is_new_schema` execution-authority
+  flag while preserving the old Python API when omitted. The flag accepts only
+  `None` or exact booleans, rejecting integer/string lookalikes.
+- Case A uses saved attribution metadata for `auto`; explicit `content` is
+  allowed; explicit `legacy` is resolved but rejected later for custom
+  positional execution.
+- Case A normalized legacy still allows legacy IG because the historical
+  complete feature representation remains meaningful for that preset.
+- Cases B/C resolve through historical compatibility. Case C positional
+  metadata is not treated as executed architecture, and warnings describe
+  historical/transitional execution.
+- Custom schema-v2 legacy IG is rejected before attribution execution because
+  custom positional execution no longer corresponds to the historical complete
+  `features` attribution target.
+- `AttentionAnalyzer.extract_attention_weights()` now supports two explicit
+  modes: historical `variant_features` or split `content_features` plus
+  `absolute_position_features`. Missing, partial, or mixed feature inputs raise
+  clear `ValueError`s.
+- `scripts/explain.py` routes attention through split-primary inputs only for
+  Case A custom positional models. Case A legacy and Cases B/C keep historical
+  feature attention routing.
+- Position strategy provenance is now reconstruction-aware: Case A reports
+  executed resolved strategies, Case B reports unavailable old-config
+  strategies, and Case C reports transitional historical execution without
+  claiming intended positional metadata was executed.
+- `--skip-ig` still does not resolve IG mode, validate custom legacy IG,
+  validate attribution content dimensions, or construct the IG explainer.
+
+Runtime behavior:
+
+- No training, preprocessing, model, attention runtime, checkpoint
+  reconstruction, or gradients implementation files were changed.
+- Existing content IG remains differentiable only over `content_features`;
+  absolute position, positions, chromosome IDs, gene IDs, masks, and covariates
+  remain fixed.
+- Existing old-schema explanation compatibility remains intact through Case B/C
+  reconstruction and historical IG/attention routing.
+
+Validation:
+
+- `tests/test_explain_position_phase7.py`: 19 passed.
+- IG/content/sampling command passed 110 tests.
+- `tests/test_attention_analysis.py`: 2 passed.
+- `tests/test_position_reconstruction_phase7.py`: 87 passed.
+- `tests/test_phase3_explain.py`: 20 passed, with 1 existing deprecation
+  warning.
+- Attention/reconstruction/explanation regression command passed 109 tests,
+  with 1 existing deprecation warning.
+- Broader focused command passed 314 tests, with 1 existing deprecation
+  warning.
+- Full test suite passed 1047 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `scripts/explain.py`, `src/explain/ig_mode.py`,
+  `src/explain/attention_analysis.py`, and
+  `tests/test_explain_position_phase7.py`.
+- `git diff --check` passed.
+- `tests/test_explain_position_phase7.py` passed Ruff, Black check with
+  Python 3.10 target, and isort check.
+- Modified legacy `tests/test_explain_ig_mode.py` passed Ruff and isort; Black
+  check retained matching pre-existing formatting debt relative to committed
+  baseline.
+- Modified legacy `scripts/explain.py` retained matching Ruff, Black, and
+  isort debt relative to committed baseline.
+- Modified legacy `src/explain/attention_analysis.py` retained matching Ruff,
+  Black, and isort debt relative to committed baseline.
+- Modified legacy `src/explain/ig_mode.py` passed Ruff and isort checks;
+  Black check improved from baseline formatting debt to clean current output.
+
+Known limitations:
+
+- Explanation support is limited to the Phase-7 strategies already accepted by
+  reconstruction/runtime support: legacy, none, sinusoidal, and T5 bucket
+  combinations.
+- Learned-binned absolute position, RoPE, fixed ALiBi, and learned ALiBi remain
+  deferred even if their serialized configs can be parsed.
+- Dataset mapping checksum verification is still deferred.
+- Downstream validation and analysis scripts have not yet been aligned to the
+  Phase 7B4A reconstruction helper.
+
+## Next planned phase
+
+Phase 8 - learned binned absolute positional encoding.

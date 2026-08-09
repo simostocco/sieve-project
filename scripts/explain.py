@@ -51,13 +51,14 @@ from src.data.covariates import attach_pc_covariates_to_samples, load_pc_map
 from src.encoding import (
     ChunkedVariantDataset,
     collate_chunks,
-    get_feature_dimension,
     get_content_feature_dimension,
     AnnotationLevel
 )
-from src.encoding.position_config import ResolvedIGMode
-from src.models.sieve import create_sieve_model, load_state_dict_with_legacy_upgrade
-from src.models import ChunkedSIEVEModel
+from src.encoding.position_config import PositionPreset, ResolvedIGMode
+from src.models.reconstruction import (
+    ReconstructedSIEVEModel,
+    reconstruct_sieve_from_checkpoint,
+)
 from src.explain.gradients import IntegratedGradientsExplainer
 from src.explain.ig_mode import RequestedIGMode, resolve_ig_mode
 from src.explain.attention_analysis import AttentionAnalyzer
@@ -248,9 +249,68 @@ def _validate_config_content_dim(config: dict, annotation_level: AnnotationLevel
     return content_dim
 
 
-def _read_position_strategy_metadata(config: dict) -> dict[str, object]:
-    """Read position strategy identifiers from new-schema config metadata."""
-    if 'position_encoding' not in config:
+def _content_dim_for_reconstruction(
+    reconstruction: ReconstructedSIEVEModel,
+    annotation_level: AnnotationLevel,
+) -> int:
+    """Return the content attribution width from execution authority.
+
+    Case A stores the resolved positional architecture that actually
+    constructed the model. Cases B/C are historical compatibility paths, so
+    structural annotation-level content width is the only execution authority.
+    """
+    if reconstruction.is_new_schema:
+        if reconstruction.resolved_position_encoding is None:
+            raise ValueError("new-schema reconstruction is missing resolved position encoding")
+        return reconstruction.resolved_position_encoding.content_dim
+    return get_content_feature_dimension(annotation_level)
+
+
+def _validate_ig_mode_for_reconstruction(
+    resolved_ig_mode: ResolvedIGMode,
+    reconstruction: ReconstructedSIEVEModel,
+) -> None:
+    """Reject legacy IG only for authoritative custom positional execution."""
+    if not reconstruction.is_new_schema:
+        return
+    resolved_position_encoding = reconstruction.resolved_position_encoding
+    if resolved_position_encoding is None:
+        raise ValueError("new-schema reconstruction is missing resolved position encoding")
+    if (
+        resolved_position_encoding.preset is PositionPreset.CUSTOM
+        and resolved_ig_mode is ResolvedIGMode.LEGACY
+    ):
+        raise ValueError(
+            "legacy IG is not supported for custom positional execution; use "
+            "ig_mode='content' or ig_mode='auto'."
+        )
+
+
+def _attention_uses_split_inputs(reconstruction: ReconstructedSIEVEModel) -> bool:
+    """Return True only when attention must use custom split-primary inputs."""
+    return (
+        reconstruction.is_new_schema
+        and reconstruction.resolved_position_encoding is not None
+        and reconstruction.resolved_position_encoding.preset is PositionPreset.CUSTOM
+    )
+
+
+def _read_position_strategy_metadata(
+    reconstruction: ReconstructedSIEVEModel,
+) -> dict[str, object]:
+    """Read positional strategy provenance from reconstruction authority."""
+    if reconstruction.is_new_schema:
+        resolved = reconstruction.resolved_position_encoding
+        if resolved is None:
+            raise ValueError("new-schema reconstruction is missing resolved position encoding")
+        return {
+            'absolute_position_encoding': resolved.absolute.encoding.value,
+            'relative_position_encoding': resolved.relative.encoding.value,
+            'chromosome_encoding': resolved.chromosome.encoding.value,
+            'position_encoding_metadata_source': 'reconstructed_resolved_config',
+        }
+
+    if 'position_encoding' not in reconstruction.effective_config:
         return {
             'absolute_position_encoding': None,
             'relative_position_encoding': None,
@@ -258,37 +318,11 @@ def _read_position_strategy_metadata(config: dict) -> dict[str, object]:
             'position_encoding_metadata_source': 'unavailable_old_config',
         }
 
-    position_encoding = config['position_encoding']
-    if not isinstance(position_encoding, dict):
-        raise ValueError("config['position_encoding'] must be a mapping")
-
-    def _required_mapping(section: str) -> dict:
-        value = position_encoding.get(section)
-        if not isinstance(value, dict):
-            raise ValueError(f"config['position_encoding']['{section}'] must be a mapping")
-        return value
-
-    def _required_string(mapping: dict, field: str, dotted_name: str) -> str:
-        value = mapping.get(field)
-        if not isinstance(value, str):
-            raise ValueError(f"{dotted_name} must be a string")
-        return value
-
-    absolute = _required_mapping('absolute')
-    relative = _required_mapping('relative')
-    chromosome = _required_mapping('chromosome')
-
     return {
-        'absolute_position_encoding': _required_string(
-            absolute, 'type', "config['position_encoding']['absolute']['type']"
-        ),
-        'relative_position_encoding': _required_string(
-            relative, 'type', "config['position_encoding']['relative']['type']"
-        ),
-        'chromosome_encoding': _required_string(
-            chromosome, 'encoding', "config['position_encoding']['chromosome']['encoding']"
-        ),
-        'position_encoding_metadata_source': 'config',
+        'absolute_position_encoding': None,
+        'relative_position_encoding': None,
+        'chromosome_encoding': None,
+        'position_encoding_metadata_source': 'transitional_historical_execution',
     }
 
 
@@ -296,13 +330,13 @@ def _build_ig_run_metadata(
     *,
     requested_ig_mode: str,
     resolved_ig_mode: ResolvedIGMode,
-    config: dict,
+    reconstruction: ReconstructedSIEVEModel,
     content_dim: int,
-    input_dim: int,
     n_steps: int,
     max_variants: int,
 ) -> dict[str, object]:
     """Build semantic metadata describing the Integrated Gradients run."""
+    input_dim = reconstruction.base_model.input_dim
     if resolved_ig_mode is ResolvedIGMode.CONTENT:
         attribution_feature_space = 'content'
         attribution_width = content_dim
@@ -332,7 +366,7 @@ def _build_ig_run_metadata(
         'sampling_seed': None,
         'comparability_warning': comparability_warning,
     }
-    metadata.update(_read_position_strategy_metadata(config))
+    metadata.update(_read_position_strategy_metadata(reconstruction))
     return metadata
 
 
@@ -510,6 +544,20 @@ def _annotate_ranking_metadata(df, ig_metadata: dict[str, object]):
     return annotated
 
 
+def _reconstruct_model_for_explanation(
+    config: dict,
+    checkpoint: dict,
+    dataset: ChunkedVariantDataset,
+) -> ReconstructedSIEVEModel:
+    """Reconstruct the model without mutating loaded config metadata."""
+    return reconstruct_sieve_from_checkpoint(
+        config,
+        checkpoint,
+        num_genes=dataset.num_genes,
+        dataset_num_chromosomes=dataset.num_chromosomes,
+    )
+
+
 def main():
     args = parse_args()
 
@@ -584,35 +632,12 @@ def main():
         overlap=0
     )
 
-    # Create model (add input_dim if missing from config)
+    # Create model through Phase 7B4A reconstruction. That result is the sole
+    # architecture authority: Case A uses resolved schema-v2 metadata, while
+    # Cases B/C infer historical structure from checkpoint tensors.
     print("\nCreating model...")
-    if 'input_dim' not in config:
-        config['input_dim'] = get_feature_dimension(annotation_level)
-    input_dim = config['input_dim']
-    # The chromosome embedding / cross-chromosome bias bucket are sized from
-    # the dataset, not stored in the original config, surface it here so the
-    # constructed model matches the checkpoint's tensor shapes.
-    config['num_chromosomes'] = dataset.num_chromosomes
-
-    # Load base model
-    base_model = create_sieve_model(config, num_genes=dataset.num_genes)
-
-    # Check if checkpoint has chunked model or base model
-    state_dict = checkpoint['model_state_dict']
-
-    # Try to detect if this is a chunked model checkpoint
-    if any(k.startswith('base_model.') for k in state_dict.keys()):
-        # Checkpoint is from chunked model - need to wrap base model
-        model = ChunkedSIEVEModel(
-            base_model=base_model,
-            aggregation_method=config.get('aggregation_method', 'mean')
-        )
-        load_state_dict_with_legacy_upgrade(model, state_dict)
-    else:
-        # Checkpoint is from base model only - just use base model for IG
-        # (IG works on individual chunks, doesn't need aggregation)
-        model = base_model
-        load_state_dict_with_legacy_upgrade(model, state_dict)
+    reconstruction = _reconstruct_model_for_explanation(config, checkpoint, dataset)
+    model = reconstruction.model
 
     model = model.to(args.device)
     model.eval()
@@ -620,12 +645,11 @@ def main():
     print(f"Model loaded successfully")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # For IG, we need the base model (not wrapped)
-    if isinstance(model, ChunkedSIEVEModel):
-        ig_model = model.base_model
+    # For IG, we need the reconstructed base model (not the chunked wrapper).
+    ig_model = reconstruction.base_model
+    if reconstruction.is_chunked_checkpoint:
         print("  Using base model for Integrated Gradients (chunk-level attributions)")
     else:
-        ig_model = model
         print("  Using model directly for Integrated Gradients")
 
     # Detect covariate requirements from loaded model
@@ -652,17 +676,18 @@ def main():
         print("Computing Integrated Gradients Attributions (CHUNKED)")
         print("="*60)
 
-        content_dim = _validate_config_content_dim(config, annotation_level)
+        content_dim = _content_dim_for_reconstruction(reconstruction, annotation_level)
         resolved_ig_mode = resolve_ig_mode(
             args.ig_mode,
             config=config,
+            is_new_schema=reconstruction.is_new_schema,
         )
+        _validate_ig_mode_for_reconstruction(resolved_ig_mode, reconstruction)
         ig_metadata = _build_ig_run_metadata(
             requested_ig_mode=args.ig_mode,
             resolved_ig_mode=resolved_ig_mode,
-            config=config,
+            reconstruction=reconstruction,
             content_dim=content_dim,
-            input_dim=input_dim,
             n_steps=args.n_steps,
             max_variants=chunk_size,
         )
@@ -1045,11 +1070,11 @@ def main():
 
         all_interactions = []
         interactions_by_sample = {}
+        use_split_attention = _attention_uses_split_inputs(reconstruction)
 
         print("Extracting attention weights...")
         for batch_idx, batch in enumerate(dataloader):
             # Move batch to device
-            features = batch['features'].to(args.device)
             positions = batch['positions'].to(args.device)
             gene_ids = batch['gene_ids'].to(args.device)
             mask = batch['mask'].to(args.device)
@@ -1058,14 +1083,35 @@ def main():
                 if 'chrom_ids' in batch else None
             )
 
-            # Extract attention
-            attention_weights = analyzer.extract_attention_weights(
-                variant_features=features,
-                positions=positions,
-                gene_ids=gene_ids,
-                mask=mask,
-                chrom_ids=chrom_ids,
-            )
+            if use_split_attention:
+                if (
+                    'content_features' not in batch
+                    or 'absolute_position_features' not in batch
+                ):
+                    raise ValueError(
+                        "custom positional attention requires batch['content_features'] "
+                        "and batch['absolute_position_features']"
+                    )
+                content_features = batch['content_features'].to(args.device)
+                absolute_position_features = batch['absolute_position_features'].to(args.device)
+                attention_weights = analyzer.extract_attention_weights(
+                    variant_features=None,
+                    positions=positions,
+                    gene_ids=gene_ids,
+                    mask=mask,
+                    chrom_ids=chrom_ids,
+                    content_features=content_features,
+                    absolute_position_features=absolute_position_features,
+                )
+            else:
+                features = batch['features'].to(args.device)
+                attention_weights = analyzer.extract_attention_weights(
+                    variant_features=features,
+                    positions=positions,
+                    gene_ids=gene_ids,
+                    mask=mask,
+                    chrom_ids=chrom_ids,
+                )
 
             # Find interactions
             interactions = analyzer.find_top_interactions(
@@ -1085,7 +1131,11 @@ def main():
                 interactions_by_sample.setdefault(interaction['sample_idx'], []).append(interaction)
 
             # Free GPU tensors after each batch
-            del features, positions, gene_ids, mask, attention_weights
+            del positions, gene_ids, mask, attention_weights
+            if use_split_attention:
+                del content_features, absolute_position_features
+            else:
+                del features
             if chrom_ids is not None:
                 del chrom_ids
             if args.device == 'cuda':
