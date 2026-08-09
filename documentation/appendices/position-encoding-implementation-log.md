@@ -1235,6 +1235,138 @@ Known limitations:
 - Historical CV/single-split chromosome differences remain old-schema
   compatibility concerns until later integration phases.
 
+## Phase 7B2 - Baseline Model Selection and State Surfaces
+
+Goal:
+
+Wire the Phase 7B1 baseline positional runtimes into SIEVE and attention while
+preserving historical/no-config construction as the old-checkpoint-compatible
+execution path.
+
+Exact files changed:
+
+- `src/models/attention.py`
+- `src/models/sieve.py`
+- `tests/test_position_model_phase7_selection.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added an optional `ResolvedPositionEncodingConfig` constructor boundary to
+  `SIEVE`, `MultiLayerAttention`, and `PositionAwareSparseAttention`. Existing
+  callers remain compatible because the argument is final and defaults to
+  `None`.
+- Kept historical/no-config mode as the Phase 6B path: observed absolute
+  runtime, legacy T5 runtime, historical `position_bias` allocation with an
+  extra row, historical `num_chromosomes` authority, permissive missing
+  chromosome ids, historical key-only padding mask, and historical
+  `variant_features` fallback.
+- Added explicit new-schema mode when `position_encoding` is supplied. The
+  resolved config is validated, `input_dim` must match
+  `position_encoding.input_dim`, and nonzero conflicting constructor
+  `num_chromosomes` values are rejected.
+- Made explicit configs select absolute and relative runtimes through the
+  Phase 7B1 factories. Explicit legacy configs still select observed absolute
+  and legacy T5 runtimes, while custom configs can select absolute none,
+  sinusoidal, relative none, or T5.
+- Enforced the custom split-primary rule in SIEVE: explicit custom models must
+  receive both `content_features` and `absolute_position_features`. Historical
+  `variant_features` fallback remains allowed for no-config and explicit
+  resolved legacy models.
+- Preserved the model-side composer. Split inputs are still recomposed into the
+  historical `VariantEncoder` order: dosage, absolute block, remaining content.
+- Allocated `position_bias` according to resolved relative strategy in explicit
+  mode: no parameter for relative none, `total_bias_rows` rows for T5, and no
+  runtime-owned parameters.
+- Allocated chromosome embeddings according to resolved chromosome strategy in
+  explicit mode: no parameter for chromosome none, direct zero-initialized
+  `chrom_embedding.weight` with `num_chromosomes + 1` rows for learned
+  chromosome encoding.
+- Kept chromosome routing independent from chromosome embedding. Chromosome ids
+  can still be required for T5 separate or cross-policy mask when
+  `chromosome_encoding=none`.
+- Added explicit-config chromosome-id validation in attention. Required
+  chromosome ids must be present, rank-2 tensors with shape matching positions,
+  and real, unmasked ids must satisfy `0 <= chrom_id < num_chromosomes`. Padding
+  remains mask-defined; chromosome id zero remains a valid real id.
+- Added explicit-config cross-policy masking. `separate` applies no generic
+  pair mask, while `mask` applies `build_same_chromosome_pair_mask()` after
+  relative score adjustment and before padding validity masking.
+- Added explicit-config query/key padding safety. When `mask` is supplied, both
+  invalid query rows and invalid key columns are set to `-inf` before softmax,
+  with existing `torch.nan_to_num(..., nan=0.0)` preserving zero weights for
+  fully masked padded query rows.
+- Kept `_compute_position_bias()` for T5-compatible callers and made it raise
+  clearly when explicit relative none has no position bias.
+
+Runtime behavior:
+
+- Historical/no-config construction remains the compatibility path for old
+  Python callers and old checkpoints.
+- Explicit resolved legacy is new-schema execution and consistently allocates
+  according to the resolved config, including learned chromosome embedding when
+  the resolved config requires it.
+- Explicit custom models now execute baseline absolute none, custom sinusoidal,
+  relative none, T5 separate, T5 mask, and relative-none mask behavior through
+  the selected runtimes.
+- Training CLI custom execution is still blocked by `scripts/train.py`; this
+  phase does not make custom training available.
+- `scripts/train.py`, `scripts/explain.py`, `src/models/chunked_sieve.py`,
+  `src/explain/*`, `src/training/*`, preprocessing, checkpoint serialization,
+  and `src/models/position_runtime.py` were not changed.
+
+State surfaces:
+
+- Explicit relative none creates no `position_bias.weight` state-dict key.
+- Explicit T5 separate creates direct per-layer `position_bias.weight` with
+  `num_buckets + 1` rows.
+- Explicit T5 mask creates direct per-layer `position_bias.weight` with
+  `num_buckets` rows.
+- Explicit chromosome none creates no `chrom_embedding.weight` state-dict key.
+- Explicit learned chromosome creates direct per-layer
+  `chrom_embedding.weight` with `num_chromosomes + 1` rows.
+- No absolute-position runtime in Phase 7B2 owns trainable state.
+- Resolved config objects and runtime dataclasses remain plain Python state; no
+  `position_encoding`, `position_runtime`, `_relative_position_runtime`, or
+  `_absolute_position_runtime` namespace appears in `state_dict()`.
+
+Validation:
+
+- `tests/test_position_model_phase7_selection.py`: 40 passed.
+- Focused regression command passed 178 tests, 1 skipped.
+- `tests/test_ig_content_mode.py`: 39 passed.
+- Full test suite passed 906 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/models/attention.py`, `src/models/sieve.py`,
+  and `tests/test_position_model_phase7_selection.py`.
+- `git diff --check` passed.
+- The new Phase 7B2 test file passed Ruff, Black check with Python 3.10 target,
+  and isort check.
+
+Baseline static debt:
+
+- Modified legacy production files improved Ruff findings: committed baseline
+  `src/models/attention.py` plus `src/models/sieve.py` reported 29 findings,
+  while current code reports 28.
+- Black check retained matching pre-existing formatting debt: committed
+  baseline and current `src/models/attention.py` plus `src/models/sieve.py`
+  would be reformatted.
+- isort check improved: committed baseline reported import-sorting debt in
+  `src/models/sieve.py`, while current `src/models/attention.py` and
+  `src/models/sieve.py` pass isort check.
+
+Known limitations:
+
+- Training still blocks custom execution until Phase 7B3.
+- Config deserialization, checkpoint metadata reconstruction, and exact
+  new-schema checkpoint restoration are not yet wired.
+- `scripts/explain.py` does not yet reconstruct custom positional models.
+- Legacy IG custom rejection and custom-model attribution compatibility are
+  deferred.
+- Learned-binned absolute position, RoPE, fixed ALiBi, and learned ALiBi remain
+  unsupported.
+- Old checkpoint compatibility still uses the no-config historical path.
+
 ## Next planned phase
 
-Phase 7B2 - baseline model selection and state surfaces.
+Phase 7B3 - training, serialization, and checkpoint integration.

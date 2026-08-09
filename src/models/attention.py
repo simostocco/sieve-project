@@ -21,7 +21,19 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .position_runtime import LegacyT5RelativePositionRuntime
+from src.encoding.position_config import (
+    ChromosomeEncoding,
+    CrossChromosomePolicy,
+    RelativePositionEncoding,
+    ResolvedPositionEncodingConfig,
+)
+
+from .position_runtime import (
+    LegacyT5RelativePositionRuntime,
+    build_relative_position_runtime,
+    build_same_chromosome_pair_mask,
+    validate_phase7_runtime_support,
+)
 
 
 class PositionAwareSparseAttention(nn.Module):
@@ -94,40 +106,80 @@ class PositionAwareSparseAttention(nn.Module):
         num_position_buckets: int = 32,
         max_distance: int = 100000,
         num_chromosomes: int = 0,
+        position_encoding: ResolvedPositionEncodingConfig | None = None,
     ):
         super().__init__()
 
         assert latent_dim % num_heads == 0, "latent_dim must be divisible by num_heads"
 
+        if position_encoding is not None:
+            if not isinstance(position_encoding, ResolvedPositionEncodingConfig):
+                raise ValueError("position_encoding must be a ResolvedPositionEncodingConfig.")
+            validate_phase7_runtime_support(position_encoding)
+            resolved_num_chromosomes = position_encoding.chromosome.num_chromosomes
+            if num_chromosomes not in {0, resolved_num_chromosomes}:
+                raise ValueError(
+                    "num_chromosomes must be 0 or match "
+                    "position_encoding.chromosome.num_chromosomes when position_encoding "
+                    "is supplied."
+                )
+        else:
+            resolved_num_chromosomes = num_chromosomes
+
         self.latent_dim = latent_dim
         self.num_heads = num_heads
         self.head_dim = latent_dim // num_heads
-        self.num_position_buckets = num_position_buckets
-        self.max_distance = max_distance
-        self.num_chromosomes = num_chromosomes
-        self._relative_position_runtime = LegacyT5RelativePositionRuntime(
-            num_position_buckets=num_position_buckets,
-            max_distance=max_distance,
-        )
+        self.position_encoding = position_encoding
+        self.num_chromosomes = resolved_num_chromosomes
+        if position_encoding is None:
+            self.num_position_buckets = num_position_buckets
+            self.max_distance = max_distance
+            self._relative_position_runtime = LegacyT5RelativePositionRuntime(
+                num_position_buckets=num_position_buckets,
+                max_distance=max_distance,
+            )
+        else:
+            self.num_position_buckets = position_encoding.relative.num_buckets or 0
+            self.max_distance = position_encoding.relative.max_distance_bp or 0
+            self._relative_position_runtime = build_relative_position_runtime(position_encoding)
 
         # Attention projections
         self.query = nn.Linear(latent_dim, latent_dim)
         self.key = nn.Linear(latent_dim, latent_dim)
         self.value = nn.Linear(latent_dim, latent_dim)
 
-        # Learnable position bias.
-        # Shape: (num_position_buckets + 1, num_heads). The extra row holds the
-        # single learned cross-chromosome bias used when chrom_ids are passed
-        # through forward(); it is unused (and untouched) in the legacy
-        # chromosome-blind path.
-        self.position_bias = nn.Embedding(num_position_buckets + 1, num_heads)
+        # Learnable position bias. In historical/no-config mode the allocation
+        # is exactly the Phase 6 surface. Explicit configs allocate only the
+        # rows required by the resolved relative strategy.
+        if position_encoding is None:
+            self.position_bias = nn.Embedding(num_position_buckets + 1, num_heads)
+        elif position_encoding.relative.encoding is RelativePositionEncoding.NONE:
+            self.position_bias = None
+        elif position_encoding.relative.encoding is RelativePositionEncoding.T5_BUCKET:
+            total_bias_rows = position_encoding.relative.total_bias_rows
+            if not isinstance(total_bias_rows, int) or total_bias_rows <= 0:
+                raise ValueError("position_encoding.relative.total_bias_rows must be positive.")
+            self.position_bias = nn.Embedding(total_bias_rows, num_heads)
+        else:
+            raise NotImplementedError(
+                f"relative_position_encoding={position_encoding.relative.encoding.value} "
+                "is not implemented."
+            )
 
         # Optional chromosome embedding added to inputs before computing Q/K/V.
         # Disambiguates variants that share a coordinate on different
         # chromosomes. Allocated only when num_chromosomes > 0; one extra row
         # covers padding sentinel values that may be passed during forward().
-        if num_chromosomes > 0:
-            self.chrom_embedding = nn.Embedding(num_chromosomes + 1, latent_dim)
+        if position_encoding is None:
+            use_chrom_embedding = num_chromosomes > 0
+        else:
+            use_chrom_embedding = (
+                position_encoding.chromosome.encoding is ChromosomeEncoding.LEARNED
+            )
+            if use_chrom_embedding and resolved_num_chromosomes <= 0:
+                raise ValueError("learned chromosome encoding requires num_chromosomes > 0.")
+        if use_chrom_embedding:
+            self.chrom_embedding = nn.Embedding(resolved_num_chromosomes + 1, latent_dim)
             nn.init.zeros_(self.chrom_embedding.weight)
         else:
             self.chrom_embedding = None
@@ -138,7 +190,8 @@ class PositionAwareSparseAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Initialize position bias to zero (no bias initially)
-        nn.init.zeros_(self.position_bias.weight)
+        if self.position_bias is not None:
+            nn.init.zeros_(self.position_bias.weight)
 
     def _compute_position_bias(
         self,
@@ -167,6 +220,8 @@ class PositionAwareSparseAttention(nn.Module):
         Tensor
             Position bias, shape (batch, num_heads, num_queries, num_keys)
         """
+        if self.position_bias is None:
+            raise ValueError("No position bias exists for relative_position_encoding=none.")
         return self._relative_position_runtime.compute_bias(
             query_positions,
             key_positions,
@@ -217,6 +272,9 @@ class PositionAwareSparseAttention(nn.Module):
             shape (batch, num_heads, num_variants, num_variants)
         """
         batch_size, num_variants, _ = x.shape
+        configured_execution = self.position_encoding is not None
+        if configured_execution:
+            self._validate_configured_attention_inputs(positions, mask, chrom_ids)
 
         # Add chromosome embedding to inputs (when configured). This is the
         # absolute-disambiguation half of the chromosome-aware fix and is
@@ -258,14 +316,31 @@ class PositionAwareSparseAttention(nn.Module):
             position_bias=self.position_bias,
         )
 
-        # Apply mask if provided
-        if mask is not None:
-            # Create attention mask: (batch, 1, 1, num_variants)
-            # Broadcasting will expand to (batch, num_heads, num_variants, num_variants)
-            attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, num_variants)
+        if configured_execution:
+            if (
+                self.position_encoding.chromosome.cross_chromosome_policy
+                is CrossChromosomePolicy.MASK
+            ):
+                same_chromosome = build_same_chromosome_pair_mask(chrom_ids)
+                attn_scores = attn_scores.masked_fill(
+                    ~same_chromosome.unsqueeze(1),
+                    float("-inf"),
+                )
+            if mask is not None:
+                valid_pairs = mask[:, :, None] & mask[:, None, :]
+                attn_scores = attn_scores.masked_fill(
+                    ~valid_pairs.unsqueeze(1),
+                    float("-inf"),
+                )
+        else:
+            # Apply mask if provided
+            if mask is not None:
+                # Create attention mask: (batch, 1, 1, num_variants)
+                # Broadcasting will expand to (batch, num_heads, num_variants, num_variants)
+                attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, num_variants)
 
-            # Set masked positions to large negative value
-            attn_scores = attn_scores.masked_fill(~attn_mask, float('-inf'))
+                # Set masked positions to large negative value
+                attn_scores = attn_scores.masked_fill(~attn_mask, float('-inf'))
 
         # Softmax over key dimension
         # Shape: (batch, num_heads, num_variants, num_variants)
@@ -296,6 +371,44 @@ class PositionAwareSparseAttention(nn.Module):
             return output, attn_weights
         else:
             return output, None
+
+    def _validate_configured_attention_inputs(
+        self,
+        positions: Tensor,
+        mask: Tensor | None,
+        chrom_ids: Tensor | None,
+    ) -> None:
+        """Validate explicit new-schema chromosome and padding inputs."""
+        if not isinstance(positions, Tensor) or positions.ndim != 2:
+            raise ValueError("positions must be a rank-2 torch.Tensor in explicit-config mode.")
+        if mask is not None:
+            if not isinstance(mask, Tensor):
+                raise ValueError("mask must be a torch.Tensor in explicit-config mode.")
+            if mask.dtype is not torch.bool:
+                raise ValueError("mask must be a boolean torch.Tensor in explicit-config mode.")
+            if mask.shape != positions.shape:
+                raise ValueError("mask shape must match positions shape in explicit-config mode.")
+
+        requires_chrom_ids = self.position_encoding.chromosome.requires_chrom_ids
+        if requires_chrom_ids and chrom_ids is None:
+            raise ValueError("chrom_ids are required by the resolved position encoding.")
+        if chrom_ids is None:
+            return
+        if not isinstance(chrom_ids, Tensor):
+            raise ValueError("chrom_ids must be a torch.Tensor in explicit-config mode.")
+        if chrom_ids.ndim != 2:
+            raise ValueError("chrom_ids must have shape [batch, variants].")
+        if chrom_ids.shape != positions.shape:
+            raise ValueError("chrom_ids shape must match positions shape.")
+
+        real_chrom_ids = chrom_ids[mask] if mask is not None else chrom_ids.reshape(-1)
+        if real_chrom_ids.numel() == 0:
+            return
+        if torch.any(real_chrom_ids < 0) or torch.any(real_chrom_ids >= self.num_chromosomes):
+            raise ValueError(
+                "real chromosome ids must satisfy 0 <= chrom_id < "
+                "position_encoding.chromosome.num_chromosomes."
+            )
 
 
 class MultiLayerAttention(nn.Module):
@@ -337,6 +450,7 @@ class MultiLayerAttention(nn.Module):
         num_position_buckets: int = 32,
         max_distance: int = 100000,
         num_chromosomes: int = 0,
+        position_encoding: ResolvedPositionEncodingConfig | None = None,
     ):
         super().__init__()
 
@@ -350,6 +464,7 @@ class MultiLayerAttention(nn.Module):
                 num_position_buckets=num_position_buckets,
                 max_distance=max_distance,
                 num_chromosomes=num_chromosomes,
+                position_encoding=position_encoding,
             )
             for _ in range(num_layers)
         ])

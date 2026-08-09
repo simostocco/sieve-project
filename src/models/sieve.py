@@ -16,12 +16,18 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .encoder import VariantEncoder
-from .attention import MultiLayerAttention
+from src.encoding.position_config import PositionPreset, ResolvedPositionEncodingConfig
+
 from .aggregation import EfficientGeneAggregator
+from .attention import MultiLayerAttention
 from .classifier import AttentionPoolingClassifier, PhenotypeClassifier
+from .encoder import VariantEncoder
 from .feature_composition import compose_legacy_variant_features_torch
-from .position_runtime import ObservedAbsolutePositionRuntime
+from .position_runtime import (
+    ObservedAbsolutePositionRuntime,
+    build_absolute_position_runtime,
+    validate_phase7_runtime_support,
+)
 
 
 class SIEVE(nn.Module):
@@ -98,16 +104,41 @@ class SIEVE(nn.Module):
         num_covariates: int = 0,
         num_chromosomes: int = 0,
         classifier_type: str = 'flatten',
+        position_encoding: ResolvedPositionEncodingConfig | None = None,
     ):
         super().__init__()
+
+        if position_encoding is not None:
+            if not isinstance(position_encoding, ResolvedPositionEncodingConfig):
+                raise ValueError("position_encoding must be a ResolvedPositionEncodingConfig.")
+            validate_phase7_runtime_support(position_encoding)
+            if input_dim != position_encoding.input_dim:
+                raise ValueError(
+                    "input_dim must match position_encoding.input_dim when "
+                    "position_encoding is supplied."
+                )
+            resolved_num_chromosomes = position_encoding.chromosome.num_chromosomes
+            if num_chromosomes not in {0, resolved_num_chromosomes}:
+                raise ValueError(
+                    "num_chromosomes must be 0 or match "
+                    "position_encoding.chromosome.num_chromosomes when position_encoding "
+                    "is supplied."
+                )
+        else:
+            resolved_num_chromosomes = num_chromosomes
 
         self.input_dim = input_dim
         self.num_genes = num_genes
         self.latent_dim = latent_dim
         self.num_covariates = num_covariates
-        self.num_chromosomes = num_chromosomes
+        self.num_chromosomes = resolved_num_chromosomes
         self.classifier_type = classifier_type
-        self._absolute_position_runtime = ObservedAbsolutePositionRuntime()
+        self.position_encoding = position_encoding
+        self._absolute_position_runtime = (
+            ObservedAbsolutePositionRuntime()
+            if position_encoding is None
+            else build_absolute_position_runtime(position_encoding)
+        )
 
         # 1. Variant encoder
         self.variant_encoder = VariantEncoder(
@@ -125,7 +156,8 @@ class SIEVE(nn.Module):
             dropout=dropout,
             num_position_buckets=num_position_buckets,
             max_distance=max_distance,
-            num_chromosomes=num_chromosomes,
+            num_chromosomes=self.num_chromosomes,
+            position_encoding=position_encoding,
         )
 
         # 3. Gene aggregation
@@ -387,8 +419,17 @@ class SIEVE(nn.Module):
                     "Composed legacy VariantEncoder input width does not match "
                     f"model input_dim: got {composed.shape[-1]}, expected "
                     f"{self.input_dim}"
-                )
+            )
             return composed
+
+        if (
+            self.position_encoding is not None
+            and self.position_encoding.preset is PositionPreset.CUSTOM
+        ):
+            raise ValueError(
+                "custom positional execution requires content_features and "
+                "absolute_position_features."
+            )
 
         if variant_features is None:
             raise ValueError(
