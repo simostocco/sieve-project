@@ -56,6 +56,7 @@ from src.encoding.position_config import (
     resolve_position_encoding_config,
 )
 from src.models import SIEVE, ChunkedSIEVEModel
+from src.models.position_runtime import validate_phase7_runtime_support
 from src.training import (
     SIEVELoss,
     Trainer,
@@ -296,13 +297,7 @@ def prepare_training_position_encoding(
     *,
     num_chromosomes: int,
 ) -> ResolvedPositionEncodingConfig:
-    """
-    Resolve training position encoding without changing model computation.
-
-    Custom positional execution is intentionally deferred until model
-    integration phases wire these resolved settings into preprocessing,
-    attention, and model construction.
-    """
+    """Resolve and validate the position-encoding configuration used for training."""
     request = build_position_encoding_request(args)
     resolved = resolve_position_encoding_config(
         request,
@@ -311,6 +306,7 @@ def prepare_training_position_encoding(
         num_heads=args.num_heads,
         num_chromosomes=num_chromosomes,
     )
+    validate_phase7_runtime_support(resolved)
 
     if request.preset is PositionPreset.LEGACY:
         historical_input_dim = get_feature_dimension(annotation_level)
@@ -319,11 +315,8 @@ def prepare_training_position_encoding(
                 "legacy position configuration resolved input_dim "
                 f"{resolved.input_dim}, expected historical input_dim {historical_input_dim}"
             )
-        return resolved
 
-    raise NotImplementedError(
-        "Custom positional execution will be enabled in a later model-integration phase."
-    )
+    return resolved
 
 
 def _canonical_index_items(
@@ -444,38 +437,56 @@ def serialize_position_encoding_for_training(
 ) -> dict[str, object]:
     """Serialize resolved position config with chromosome row mapping attached."""
     position_encoding = copy.deepcopy(resolved_position_encoding.to_dict())
+    chromosome_mapping = build_chromosome_id_to_name(chrom_index)
+    resolved_num_chromosomes = resolved_position_encoding.chromosome.num_chromosomes
+    if len(chromosome_mapping) != resolved_num_chromosomes:
+        raise ValueError(
+            "chrom_index cardinality must match resolved chromosome count "
+            f"({len(chromosome_mapping)} != {resolved_num_chromosomes})"
+        )
     chromosome_config = position_encoding.setdefault("chromosome", {})
-    chromosome_config["mapping"] = build_chromosome_id_to_name(chrom_index)
+    chromosome_config["mapping"] = chromosome_mapping
     return position_encoding
 
 
 def build_position_encoding_execution_metadata(
     *,
+    resolved_position_encoding: ResolvedPositionEncodingConfig,
     training_mode: Literal["cv", "single_split"],
-    dataset_num_chromosomes: int,
 ) -> dict[str, object]:
-    """Describe the legacy position-encoding path that is actually executed."""
-    if training_mode == "cv":
-        return {
-            "schema_version": 1,
-            "source": "legacy_existing_model_paths",
-            "resolved_config_applied_to_model": False,
-            "model_num_chromosomes": dataset_num_chromosomes,
-            "chrom_ids_passed_to_attention": True,
-            "chromosome_embedding_executed": True,
-            "chromosome_aware_relative_bias_executed": True,
-        }
-    if training_mode == "single_split":
-        return {
-            "schema_version": 1,
-            "source": "legacy_existing_model_paths",
-            "resolved_config_applied_to_model": False,
-            "model_num_chromosomes": 0,
-            "chrom_ids_passed_to_attention": True,
-            "chromosome_embedding_executed": False,
-            "chromosome_aware_relative_bias_executed": True,
-        }
-    raise ValueError(f"unsupported training_mode: {training_mode!r}")
+    """Describe the resolved position configuration applied to new training runs."""
+    if training_mode not in {"cv", "single_split"}:
+        raise ValueError(f"unsupported training_mode: {training_mode!r}")
+
+    relative = resolved_position_encoding.relative
+    chromosome = resolved_position_encoding.chromosome
+    position_bias_rows = (
+        None
+        if relative.encoding is RelativePositionEncoding.NONE
+        else relative.total_bias_rows
+    )
+    return {
+        "schema_version": 2,
+        "source": "resolved_position_encoding_applied_to_model",
+        "resolved_config_applied_to_model": True,
+        "training_mode": training_mode,
+        "preset": resolved_position_encoding.preset.value,
+        "absolute_position_encoding": resolved_position_encoding.absolute.encoding.value,
+        "absolute_position_dim": resolved_position_encoding.absolute.position_dim or 0,
+        "relative_position_encoding": relative.encoding.value,
+        "position_bias_rows": position_bias_rows,
+        "chromosome_encoding": chromosome.encoding.value,
+        "chromosome_embedding_executed": chromosome.encoding is ChromosomeEncoding.LEARNED,
+        "cross_chromosome_policy": chromosome.cross_chromosome_policy.value,
+        "cross_chromosome_mask_executed": (
+            chromosome.cross_chromosome_policy is CrossChromosomePolicy.MASK
+        ),
+        "requires_chrom_ids": chromosome.requires_chrom_ids,
+        "chrom_ids_passed_to_attention": True,
+        "model_num_chromosomes": chromosome.num_chromosomes,
+        "input_dim": resolved_position_encoding.input_dim,
+        "content_dim": resolved_position_encoding.content_dim,
+    }
 
 
 def build_training_run_metadata(
@@ -491,8 +502,19 @@ def build_training_run_metadata(
     training_mode: Literal["cv", "single_split"],
 ) -> dict[str, object]:
     """Build lightweight run metadata for configs and checkpoints."""
+    if input_dim != resolved_position_encoding.input_dim:
+        raise ValueError(
+            "input_dim must match resolved_position_encoding.input_dim before serialization"
+        )
+    if num_chromosomes != resolved_position_encoding.chromosome.num_chromosomes:
+        raise ValueError(
+            "num_chromosomes must match "
+            "resolved_position_encoding.chromosome.num_chromosomes before serialization"
+        )
     return {
+        "config_schema_version": 2,
         "metadata_schema_version": 1,
+        "position_encoding_schema_version": resolved_position_encoding.schema_version,
         "input_dim": input_dim,
         "content_dim": resolved_position_encoding.content_dim,
         "num_genes": num_genes,
@@ -509,8 +531,8 @@ def build_training_run_metadata(
             "mappings_artifact_base": "experiment_root",
         },
         "position_encoding_execution": build_position_encoding_execution_metadata(
+            resolved_position_encoding=resolved_position_encoding,
             training_mode=training_mode,
-            dataset_num_chromosomes=num_chromosomes,
         ),
     }
 
@@ -535,6 +557,7 @@ def create_model(
     num_covariates: int = 0,
     num_chromosomes: int = 0,
     classifier_type: str = 'flatten',
+    position_encoding: ResolvedPositionEncodingConfig | None = None,
 ) -> ChunkedSIEVEModel:
     """
     Create Chunked SIEVE model for whole-genome processing.
@@ -553,6 +576,7 @@ def create_model(
         num_covariates=num_covariates,
         num_chromosomes=num_chromosomes,
         classifier_type=classifier_type,
+        position_encoding=position_encoding,
     )
 
     # Wrap in chunked model for whole-genome coverage
@@ -563,6 +587,30 @@ def create_model(
     )
 
     return model
+
+
+def create_training_model(
+    *,
+    args: argparse.Namespace,
+    resolved_position_encoding: ResolvedPositionEncodingConfig,
+    num_genes: int,
+    num_chromosomes: int,
+    num_covariates: int,
+) -> ChunkedSIEVEModel:
+    """Create the new-schema training model from the resolved positional config."""
+    return create_model(
+        input_dim=resolved_position_encoding.input_dim,
+        num_genes=num_genes,
+        latent_dim=args.latent_dim,
+        num_heads=args.num_heads,
+        num_attention_layers=args.num_attention_layers,
+        hidden_dim=args.hidden_dim,
+        aggregation_method=args.aggregation_method,
+        num_covariates=num_covariates,
+        num_chromosomes=num_chromosomes,
+        classifier_type=args.classifier_type,
+        position_encoding=resolved_position_encoding,
+    )
 
 
 def save_fold_config(
@@ -931,14 +979,15 @@ def main():
             f"({dataset.num_covariates} vs {num_covariates})."
         )
 
-    # Get dimensions
-    input_dim = get_feature_dimension(annotation_level)
-    num_genes = dataset.num_genes
+    # Get dimensions. New training runs are always explicit new-schema runs, so
+    # the resolved positional configuration is the model-width authority.
     resolved_position_encoding = prepare_training_position_encoding(
         args,
         annotation_level,
         num_chromosomes=dataset.num_chromosomes,
     )
+    input_dim = resolved_position_encoding.input_dim
+    num_genes = dataset.num_genes
     dataset_identity = write_dataset_mappings_artifact(
         output_dir,
         dataset.gene_index,
@@ -957,9 +1006,17 @@ def main():
         training_mode=training_mode,
     )
     _update_saved_config(config_path, **run_metadata)
-    print(f"Input dimension: {input_dim}")
+    print(f"Content dimension: {resolved_position_encoding.content_dim}")
+    print(f"Resolved model input dimension: {input_dim}")
     print(f"Number of genes: {num_genes}")
     print(f"Position encoding preset: {resolved_position_encoding.preset.value}")
+    print(
+        "Position strategies: "
+        f"absolute={resolved_position_encoding.absolute.encoding.value}, "
+        f"relative={resolved_position_encoding.relative.encoding.value}, "
+        f"chromosome={resolved_position_encoding.chromosome.encoding.value}, "
+        f"cross={resolved_position_encoding.chromosome.cross_chromosome_policy.value}"
+    )
     print(f"CRITICAL: Using chunked processing for FULL GENOME coverage (not just chr1/chr2)!")
 
     # Get labels
@@ -1045,17 +1102,12 @@ def main():
             )
 
             # Create chunked model (for whole-genome processing)
-            model = create_model(
-                input_dim=input_dim,
+            model = create_training_model(
+                args=args,
+                resolved_position_encoding=resolved_position_encoding,
                 num_genes=num_genes,
-                latent_dim=args.latent_dim,
-                num_heads=args.num_heads,
-                num_attention_layers=args.num_attention_layers,
-                hidden_dim=args.hidden_dim,
-                aggregation_method=args.aggregation_method,
                 num_covariates=num_covariates,
                 num_chromosomes=dataset.num_chromosomes,
-                classifier_type=args.classifier_type,
             )
 
             # Create fold checkpoint directory
@@ -1182,16 +1234,12 @@ def main():
         )
 
         # Create chunked model (for whole-genome processing)
-        model = create_model(
-            input_dim=input_dim,
+        model = create_training_model(
+            args=args,
+            resolved_position_encoding=resolved_position_encoding,
             num_genes=num_genes,
-            latent_dim=args.latent_dim,
-            num_heads=args.num_heads,
-            num_attention_layers=args.num_attention_layers,
-            hidden_dim=args.hidden_dim,
-            aggregation_method=args.aggregation_method,
             num_covariates=num_covariates,
-            classifier_type=args.classifier_type,
+            num_chromosomes=dataset.num_chromosomes,
         )
 
         # Resolve class weighting for this split

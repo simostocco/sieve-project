@@ -9,7 +9,12 @@ import yaml
 from scripts import train
 from src.encoding.levels import AnnotationLevel
 from src.encoding.position_config import (
+    AbsolutePositionEncoding,
+    ChromosomeEncoding,
+    CrossChromosomePolicy,
     PositionEncodingRequest,
+    PositionPreset,
+    RelativePositionEncoding,
     resolve_position_encoding_config,
 )
 
@@ -21,6 +26,22 @@ def resolved_l3():
         latent_dim=64,
         num_heads=4,
         num_chromosomes=3,
+    )
+
+
+def resolved_l3_without_chromosomes():
+    return resolve_position_encoding_config(
+        PositionEncodingRequest(
+            preset=PositionPreset.CUSTOM,
+            absolute_position_encoding=AbsolutePositionEncoding.NONE,
+            relative_position_encoding=RelativePositionEncoding.NONE,
+            chromosome_encoding=ChromosomeEncoding.NONE,
+            cross_chromosome_policy=CrossChromosomePolicy.SEPARATE,
+        ),
+        AnnotationLevel.L3,
+        latent_dim=64,
+        num_heads=4,
+        num_chromosomes=0,
     )
 
 
@@ -144,9 +165,24 @@ def test_serialized_position_config_does_not_mutate_resolved_config():
     resolved = resolved_l3()
     before = resolved.to_dict()
 
-    train.serialize_position_encoding_for_training(resolved, {"1": 0})
+    train.serialize_position_encoding_for_training(resolved, {"1": 0, "2": 1, "X": 2})
 
     assert resolved.to_dict() == before
+
+
+@pytest.mark.parametrize(
+    ("resolved", "chrom_index"),
+    [
+        (resolved_l3(), {"1": 0, "2": 1}),
+        (resolved_l3_without_chromosomes(), {"1": 0}),
+    ],
+)
+def test_serialized_position_config_rejects_chromosome_mapping_cardinality_mismatch(
+    resolved,
+    chrom_index,
+):
+    with pytest.raises(ValueError, match="chrom_index cardinality.*resolved chromosome count"):
+        train.serialize_position_encoding_for_training(resolved, chrom_index)
 
 
 def test_run_metadata_contains_required_dimensions_identity_and_resolved_config():
@@ -163,7 +199,9 @@ def test_run_metadata_contains_required_dimensions_identity_and_resolved_config(
         training_mode="cv",
     )
 
+    assert metadata["config_schema_version"] == 2
     assert metadata["metadata_schema_version"] == 1
+    assert metadata["position_encoding_schema_version"] == resolved.schema_version
     assert metadata["input_dim"] == 71
     assert metadata["content_dim"] == resolved.content_dim
     assert metadata["num_genes"] == 2
@@ -179,49 +217,67 @@ def test_run_metadata_contains_required_dimensions_identity_and_resolved_config(
 
 
 def test_cv_execution_metadata_is_accurate():
+    resolved = resolved_l3()
+
     assert train.build_position_encoding_execution_metadata(
+        resolved_position_encoding=resolved,
         training_mode="cv",
-        dataset_num_chromosomes=3,
     ) == {
-        "schema_version": 1,
-        "source": "legacy_existing_model_paths",
-        "resolved_config_applied_to_model": False,
+        "schema_version": 2,
+        "source": "resolved_position_encoding_applied_to_model",
+        "resolved_config_applied_to_model": True,
+        "training_mode": "cv",
+        "preset": "legacy",
+        "absolute_position_encoding": "sinusoidal",
+        "absolute_position_dim": 64,
+        "relative_position_encoding": "t5_bucket",
+        "position_bias_rows": 33,
+        "chromosome_encoding": "learned",
+        "cross_chromosome_policy": "separate",
+        "cross_chromosome_mask_executed": False,
+        "requires_chrom_ids": True,
         "model_num_chromosomes": 3,
+        "input_dim": 71,
+        "content_dim": 7,
         "chrom_ids_passed_to_attention": True,
         "chromosome_embedding_executed": True,
-        "chromosome_aware_relative_bias_executed": True,
     }
 
 
 def test_single_split_execution_metadata_records_relative_routing_active():
+    resolved = resolved_l3()
+
     metadata = train.build_position_encoding_execution_metadata(
+        resolved_position_encoding=resolved,
         training_mode="single_split",
-        dataset_num_chromosomes=3,
     )
 
-    assert metadata["model_num_chromosomes"] == 0
+    assert metadata["schema_version"] == 2
+    assert metadata["training_mode"] == "single_split"
+    assert metadata["model_num_chromosomes"] == 3
     assert metadata["chrom_ids_passed_to_attention"] is True
-    assert metadata["chromosome_embedding_executed"] is False
-    assert metadata["chromosome_aware_relative_bias_executed"] is True
-    assert metadata["resolved_config_applied_to_model"] is False
+    assert metadata["chromosome_embedding_executed"] is True
+    assert metadata["relative_position_encoding"] == "t5_bucket"
+    assert metadata["cross_chromosome_policy"] == "separate"
+    assert metadata["resolved_config_applied_to_model"] is True
 
 
 def test_invalid_training_mode_is_rejected():
     with pytest.raises(ValueError, match="unsupported training_mode"):
         train.build_position_encoding_execution_metadata(
+            resolved_position_encoding=resolved_l3(),
             training_mode="holdout",
-            dataset_num_chromosomes=3,
         )
 
 
 def test_helpers_accept_read_only_mappings_without_mutating():
     gene_index = MappingProxyType({"BRCA1": 0, "TP53": 1})
-    chrom_index = MappingProxyType({"1": 0, "2": 1})
+    chrom_index = MappingProxyType({"1": 0, "2": 1, "X": 2})
 
     metadata = train.build_training_run_metadata(
         input_dim=71,
         num_genes=2,
-        num_chromosomes=2,
+        num_chromosomes=3,
         genome_build="GRCh37",
         resolved_position_encoding=resolved_l3(),
         chrom_index=chrom_index,
@@ -274,12 +330,12 @@ def test_helpers_do_not_construct_datasets_or_models(monkeypatch):
     train.mapping_sha256({"BRCA1": 0})
     train.build_chromosome_id_to_name({"1": 0})
     train.build_training_run_metadata(
-        input_dim=1,
+        input_dim=71,
         num_genes=1,
-        num_chromosomes=1,
+        num_chromosomes=3,
         genome_build="GRCh37",
         resolved_position_encoding=resolved_l3(),
-        chrom_index={"1": 0},
+        chrom_index={"1": 0, "2": 1, "X": 2},
         gene_mapping_sha256="genehash",
         chromosome_mapping_sha256="chromhash",
         training_mode="single_split",

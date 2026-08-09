@@ -224,7 +224,7 @@ def test_legacy_resolved_input_dim_matches_historical_dimensions(base_argv, leve
     assert resolved.input_dim == get_feature_dimension(level)
 
 
-def test_valid_custom_configuration_raises_deferred_model_integration_guard(base_argv):
+def test_valid_supported_custom_configuration_resolves_for_training(base_argv):
     args = parse_with(
         base_argv,
         "--position-preset",
@@ -237,12 +237,16 @@ def test_valid_custom_configuration_raises_deferred_model_integration_guard(base
         "none",
     )
 
-    with pytest.raises(NotImplementedError, match="model-integration phase"):
-        train.prepare_training_position_encoding(
-            args,
-            AnnotationLevel.L3,
-            num_chromosomes=0,
-        )
+    resolved = train.prepare_training_position_encoding(
+        args,
+        AnnotationLevel.L3,
+        num_chromosomes=0,
+    )
+
+    assert resolved.preset is PositionPreset.CUSTOM
+    assert resolved.absolute.encoding is AbsolutePositionEncoding.NONE
+    assert resolved.relative.encoding is RelativePositionEncoding.NONE
+    assert resolved.chromosome.encoding is ChromosomeEncoding.NONE
 
 
 def test_invalid_custom_configuration_raises_value_error_before_custom_guard(base_argv):

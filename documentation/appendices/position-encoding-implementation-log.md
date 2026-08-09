@@ -1367,6 +1367,125 @@ Known limitations:
   unsupported.
 - Old checkpoint compatibility still uses the no-config historical path.
 
+## Phase 7B3 - Training, Serialization, and Checkpoint Integration
+
+Goal:
+
+Enable new training runs to use the supported Phase 7 baseline positional
+strategies through the resolved configuration, while preserving old no-config
+construction as the compatibility path for existing callers and checkpoints.
+
+Exact files changed:
+
+- `scripts/train.py`
+- `tests/test_position_training_phase7.py`
+- `tests/test_train_position_cli.py`
+- `tests/test_train_config_metadata.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Removed the Phase 4B blanket custom-training guard from
+  `prepare_training_position_encoding()` and replaced it with
+  `validate_phase7_runtime_support()`. Supported configs now resolve for
+  training; learned-binned absolute position, RoPE, fixed ALiBi, and learned
+  ALiBi still raise `NotImplementedError` before model construction.
+- Kept resolver validation as the source of invalid-config `ValueError`
+  failures. `scripts/train.py` does not duplicate position-configuration
+  validation.
+- Made the resolved configuration the new training model-width authority.
+  `main()` now uses `resolved_position_encoding.input_dim` after dataset
+  construction and before the CV/single-split branch.
+- Added `create_training_model()` so CV and single-split training construct
+  models through the same resolved-config path.
+- Extended `create_model()` with an optional final `position_encoding`
+  argument. Existing callers can omit it and retain historical/no-config model
+  construction.
+- Passed the resolved config to `SIEVE` for new training runs. CV and
+  single-split training now both pass `dataset.num_chromosomes` to model
+  construction.
+- Updated execution metadata to schema version 2, recording the applied
+  resolved strategy surface rather than the older transitional
+  path-dependent legacy description.
+- Validated serialized chromosome mapping cardinality against the resolved
+  chromosome count before attaching the mapping to the nested position config.
+- Added consistency checks before serialization so top-level `input_dim` and
+  `num_chromosomes` must match the resolved configuration being recorded.
+- Added `config_schema_version=2` and
+  `position_encoding_schema_version=<resolved schema>` to run metadata while
+  preserving existing raw CLI fields and nested `position_encoding`.
+
+Runtime behavior:
+
+- New training runs execute supported custom baselines:
+  absolute `none`/`sinusoidal`, relative `none`/`t5_bucket`, chromosome
+  `none`/`learned`, and cross-chromosome `separate`/`mask`.
+- Default CLI behavior still resolves the legacy preset, but new training now
+  uses explicit resolved legacy model construction rather than the old
+  path-dependent no-config model path.
+- Split-primary batches remain recomposed into the historical
+  `VariantEncoder` representation before encoding, preserving historical
+  feature semantics and ordering.
+- The historical `features` tensor remains the compatibility fallback when
+  split tensors are absent in model calls that allow fallback.
+- No preprocessing, feature tensor generation, attention math, model runtime
+  classes, checkpoint-writing machinery, or explanation code was changed in
+  this phase.
+
+Serialization and checkpoint compatibility:
+
+- Parent training configs and CV fold configs now receive the same normalized
+  run metadata produced from the resolved position config.
+- Checkpoint metadata receives the same run metadata through the existing
+  `Trainer` path; no `Trainer` code changed.
+- New-schema checkpoints preserve strategy state through ordinary model
+  `state_dict()` keys selected by the resolved config, such as direct T5
+  `position_bias.weight` and learned chromosome `chrom_embedding.weight` when
+  configured.
+- Old checkpoints and old Python callers remain compatible through omitted
+  `position_encoding`, which still constructs the historical/no-config model
+  surface.
+- Explanation-time reconstruction of new custom positional models is still
+  deferred; `scripts/explain.py` was not changed.
+
+Validation:
+
+- `tests/test_position_training_phase7.py`: 36 passed.
+- Focused regression command including train parser/config helpers passed 375
+  tests.
+- Full test suite passed 944 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `scripts/train.py`,
+  `tests/test_position_training_phase7.py`, `tests/test_train_position_cli.py`,
+  and `tests/test_train_config_metadata.py`.
+- `git diff --check` passed.
+- `tests/test_position_training_phase7.py` passed Ruff, Black check with
+  Python 3.10 target, and isort check.
+- The modified train/config test files also passed Ruff, Black check with
+  Python 3.10 target, and isort check.
+
+Baseline static debt:
+
+- `scripts/train.py` retained matching Ruff debt: committed baseline and
+  current code both report 20 Ruff findings.
+- `scripts/train.py` retained matching Black formatting debt: committed
+  baseline and current code both would be reformatted.
+- `scripts/train.py` retained matching isort import-order debt: committed
+  baseline and current code both fail isort check.
+
+Known limitations:
+
+- Config-driven reconstruction in `scripts/explain.py` and validation scripts
+  is still deferred.
+- This phase does not implement learned-binned absolute position, RoPE, fixed
+  ALiBi, or learned ALiBi.
+- No real training was run; coverage uses deterministic unit tests and helper
+  integration tests only.
+- Historical no-config behavior remains necessary for old checkpoints and old
+  callers, so new-schema training and old-checkpoint reconstruction remain
+  intentionally separate paths.
+
 ## Next planned phase
 
-Phase 7B3 - training, serialization, and checkpoint integration.
+Phase 7B4 - config/checkpoint reconstruction readers for new-schema positional
+models, including explanation-time compatibility boundaries.
