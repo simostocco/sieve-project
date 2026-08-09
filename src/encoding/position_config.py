@@ -9,6 +9,7 @@ PyTorch, parse CLI arguments, write files, or change preprocessing behavior.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -290,6 +291,177 @@ def resolve_position_encoding_config(
         content_dim=content_dim,
         input_dim=content_dim + position_dim,
     )
+
+
+def resolved_position_encoding_from_dict(
+    data: Mapping[str, object],
+    *,
+    latent_dim: int,
+    num_heads: int,
+) -> ResolvedPositionEncodingConfig:
+    """Deserialize and canonical-validate a resolved position config.
+
+    Serialized resolved configs are treated as claims about what the resolver
+    produced during training. This helper reconstructs the unresolved request,
+    calls the resolver again, and then compares every canonical field. That
+    keeps the resolver as the single source of configuration math.
+
+    The training-only ``chromosome.mapping`` extension is validated but not
+    copied into the returned dataclass.
+    """
+    if not isinstance(data, Mapping):
+        raise ValueError("position_encoding must be a mapping")
+
+    required = {
+        "schema_version",
+        "preset",
+        "annotation_level",
+        "absolute",
+        "relative",
+        "chromosome",
+        "attribution",
+        "content_dim",
+        "input_dim",
+    }
+    _require_keys(data, required, "position_encoding")
+    _reject_unknown_keys(data, required, "position_encoding")
+
+    schema_version = _serialized_int(
+        data["schema_version"],
+        "position_encoding.schema_version",
+    )
+    if schema_version != 1:
+        raise ValueError("position_encoding.schema_version must be 1")
+
+    preset = _enum_from_serialized(
+        data["preset"],
+        PositionPreset,
+        "position_encoding.preset",
+    )
+    annotation_level = _enum_from_serialized(
+        data["annotation_level"],
+        AnnotationLevel,
+        "position_encoding.annotation_level",
+    )
+    absolute = _required_mapping(data, "absolute", "position_encoding.absolute")
+    relative = _required_mapping(data, "relative", "position_encoding.relative")
+    chromosome = _required_mapping(data, "chromosome", "position_encoding.chromosome")
+    attribution = _required_mapping(data, "attribution", "position_encoding.attribution")
+
+    _validate_serialized_absolute_section(absolute)
+    _validate_serialized_relative_section(relative)
+    _validate_serialized_chromosome_section(chromosome)
+    _validate_serialized_attribution_section(attribution)
+
+    absolute_encoding = _enum_from_serialized(
+        absolute["type"],
+        AbsolutePositionEncoding,
+        "position_encoding.absolute.type",
+    )
+    relative_encoding = _enum_from_serialized(
+        relative["type"],
+        RelativePositionEncoding,
+        "position_encoding.relative.type",
+    )
+    chromosome_encoding = _enum_from_serialized(
+        chromosome["encoding"],
+        ChromosomeEncoding,
+        "position_encoding.chromosome.encoding",
+    )
+    cross_policy = _enum_from_serialized(
+        chromosome["cross_chromosome_policy"],
+        CrossChromosomePolicy,
+        "position_encoding.chromosome.cross_chromosome_policy",
+    )
+    num_chromosomes = _serialized_int(
+        chromosome["num_chromosomes"],
+        "position_encoding.chromosome.num_chromosomes",
+    )
+    if "mapping" in chromosome:
+        _validate_chromosome_mapping_extension(
+            chromosome["mapping"],
+            num_chromosomes=num_chromosomes,
+        )
+
+    if preset is PositionPreset.LEGACY:
+        request = PositionEncodingRequest(preset=PositionPreset.LEGACY)
+    else:
+        request = PositionEncodingRequest(
+            preset=PositionPreset.CUSTOM,
+            absolute_position_encoding=absolute_encoding,
+            relative_position_encoding=relative_encoding,
+            chromosome_encoding=chromosome_encoding,
+            cross_chromosome_policy=cross_policy,
+            **_absolute_request_kwargs(absolute_encoding, absolute),
+            **_relative_request_kwargs(relative_encoding, relative),
+        )
+
+    resolved = resolve_position_encoding_config(
+        request,
+        annotation_level,
+        latent_dim=latent_dim,
+        num_heads=num_heads,
+        num_chromosomes=num_chromosomes,
+    )
+    canonical = resolved.to_dict()
+    serialized_canonical = _strip_training_extensions(data)
+    _assert_canonical_equal(
+        serialized_canonical,
+        canonical,
+        "position_encoding",
+    )
+    return resolved
+
+
+def _absolute_request_kwargs(
+    encoding: AbsolutePositionEncoding,
+    absolute: Mapping[str, object],
+) -> dict[str, object]:
+    if encoding is AbsolutePositionEncoding.NONE:
+        return {}
+    if encoding is AbsolutePositionEncoding.SINUSOIDAL:
+        return {
+            "position_dim": absolute["dim"],
+            "sinusoidal_coordinate_scale": absolute["coordinate_scale"],
+            "sinusoidal_max_wavelength": absolute["max_wavelength"],
+        }
+    if encoding is AbsolutePositionEncoding.LEARNED_BINNED:
+        return {
+            "position_dim": absolute["dim"],
+            "position_bin_size": absolute["bin_size_bp"],
+        }
+    raise ValueError(f"unsupported position_encoding.absolute.type: {encoding.value}")
+
+
+def _relative_request_kwargs(
+    encoding: RelativePositionEncoding,
+    relative: Mapping[str, object],
+) -> dict[str, object]:
+    if encoding is RelativePositionEncoding.NONE:
+        return {}
+    if encoding is RelativePositionEncoding.T5_BUCKET:
+        return {
+            "num_position_buckets": relative["num_buckets"],
+            "max_position_distance": relative["max_distance_bp"],
+        }
+    if encoding is RelativePositionEncoding.ROPE:
+        return {
+            "rope_coordinate_scale": relative["rope_coordinate_scale"],
+            "rope_base": relative["rope_base"],
+        }
+    if encoding in {
+        RelativePositionEncoding.ALIBI_FIXED,
+        RelativePositionEncoding.ALIBI_LEARNED,
+    }:
+        return {
+            "alibi_distance_function": _enum_from_serialized(
+                relative["alibi_distance_function"],
+                AlibiDistanceFunction,
+                "position_encoding.relative.alibi_distance_function",
+            ),
+            "alibi_distance_scale": relative["alibi_distance_scale"],
+        }
+    raise ValueError(f"unsupported position_encoding.relative.type: {encoding.value}")
 
 
 def _resolve_absolute(
@@ -627,3 +799,166 @@ def _enum_value(value: Enum | None) -> str | None:
     if value is None:
         return None
     return value.value
+
+
+def _required_mapping(
+    data: Mapping[str, object],
+    key: str,
+    dotted_name: str,
+) -> Mapping[str, object]:
+    value = data[key]
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{dotted_name} must be a mapping")
+    return value
+
+
+def _require_keys(
+    data: Mapping[str, object],
+    required: set[str],
+    dotted_name: str,
+) -> None:
+    missing = sorted(required - set(data))
+    if missing:
+        raise ValueError(f"{dotted_name} missing required field: {missing[0]}")
+
+
+def _reject_unknown_keys(
+    data: Mapping[str, object],
+    allowed: set[str],
+    dotted_name: str,
+) -> None:
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ValueError(f"{dotted_name} contains unknown field: {unknown[0]}")
+
+
+def _enum_from_serialized(
+    value: object,
+    enum_type: type[Enum],
+    dotted_name: str,
+) -> Enum:
+    if not isinstance(value, str):
+        raise ValueError(f"{dotted_name} must be a string")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ValueError(f"{dotted_name} has invalid value: {value!r}") from exc
+
+
+def _serialized_int(value: object, dotted_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{dotted_name} must be an integer")
+    return value
+
+
+def _validate_serialized_absolute_section(data: Mapping[str, object]) -> None:
+    allowed = {
+        "type",
+        "fusion",
+        "dim",
+        "coordinate_scale",
+        "max_wavelength",
+        "bin_size_bp",
+    }
+    _require_keys(data, allowed, "position_encoding.absolute")
+    _reject_unknown_keys(data, allowed, "position_encoding.absolute")
+
+
+def _validate_serialized_relative_section(data: Mapping[str, object]) -> None:
+    allowed = {
+        "type",
+        "num_buckets",
+        "total_bias_rows",
+        "max_distance_bp",
+        "rope_coordinate_scale",
+        "rope_base",
+        "alibi_distance_function",
+        "alibi_distance_scale",
+    }
+    _require_keys(data, allowed, "position_encoding.relative")
+    _reject_unknown_keys(data, allowed, "position_encoding.relative")
+
+
+def _validate_serialized_chromosome_section(data: Mapping[str, object]) -> None:
+    canonical = {
+        "encoding",
+        "cross_chromosome_policy",
+        "num_chromosomes",
+        "requires_chrom_ids",
+        "cross_chromosome_parameter",
+    }
+    allowed = canonical | {"mapping"}
+    _require_keys(data, canonical, "position_encoding.chromosome")
+    _reject_unknown_keys(data, allowed, "position_encoding.chromosome")
+
+
+def _validate_serialized_attribution_section(data: Mapping[str, object]) -> None:
+    allowed = {"default_ig_mode"}
+    _require_keys(data, allowed, "position_encoding.attribution")
+    _reject_unknown_keys(data, allowed, "position_encoding.attribution")
+
+
+def _validate_chromosome_mapping_extension(
+    mapping: object,
+    *,
+    num_chromosomes: int,
+) -> None:
+    if not isinstance(mapping, Mapping):
+        raise ValueError("position_encoding.chromosome.mapping must be a mapping")
+    expected_keys = {str(idx) for idx in range(num_chromosomes)}
+    actual_keys = set(mapping)
+    if actual_keys != expected_keys:
+        raise ValueError(
+            "position_encoding.chromosome.mapping keys must exactly cover "
+            "0..num_chromosomes-1"
+        )
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise ValueError("position_encoding.chromosome.mapping keys must be strings")
+        if not isinstance(value, str):
+            raise ValueError("position_encoding.chromosome.mapping values must be strings")
+
+
+def _strip_training_extensions(data: Mapping[str, object]) -> dict[str, object]:
+    stripped = {}
+    for key, value in data.items():
+        if key == "chromosome" and isinstance(value, Mapping):
+            stripped[key] = {
+                sub_key: sub_value
+                for sub_key, sub_value in value.items()
+                if sub_key != "mapping"
+            }
+        else:
+            stripped[key] = value
+    return stripped
+
+
+def _assert_canonical_equal(
+    serialized: object,
+    canonical: object,
+    dotted_name: str,
+) -> None:
+    if isinstance(serialized, Mapping) and isinstance(canonical, Mapping):
+        if set(serialized) != set(canonical):
+            missing = sorted(set(canonical) - set(serialized))
+            extra = sorted(set(serialized) - set(canonical))
+            if missing:
+                raise ValueError(f"{dotted_name} missing canonical field: {missing[0]}")
+            raise ValueError(f"{dotted_name} contains unknown field: {extra[0]}")
+        for key in sorted(canonical):
+            _assert_canonical_equal(
+                serialized[key],
+                canonical[key],
+                f"{dotted_name}.{key}",
+            )
+        return
+    if type(serialized) is not type(canonical):
+        raise ValueError(
+            f"{dotted_name} differs from resolver canonical type: "
+            f"{type(serialized).__name__} != {type(canonical).__name__}"
+        )
+    if serialized != canonical:
+        raise ValueError(
+            f"{dotted_name} differs from resolver canonical value: "
+            f"{serialized!r} != {canonical!r}"
+        )

@@ -1485,7 +1485,131 @@ Known limitations:
   callers, so new-schema training and old-checkpoint reconstruction remain
   intentionally separate paths.
 
+## Phase 7B4A - Config and Checkpoint Reconstruction Foundation
+
+Goal:
+
+Add the reusable config/checkpoint reconstruction layer that Phase 7B4B will
+use to make explanation new-schema aware, without changing explanation,
+training, or model execution paths yet.
+
+Exact files changed:
+
+- `src/encoding/position_config.py`
+- `src/models/reconstruction.py`
+- `tests/test_position_reconstruction_phase7.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Reconstruction classes:
+
+- Case A is the authoritative schema-v2 new-run format produced by all training
+  from Phase 7B3 onward. It is triggered only by config-level
+  `position_encoding` plus `config_schema_version == 2`.
+- Case B is old historical config compatibility for configs without
+  `position_encoding`. Checkpoint state is the structural authority.
+- Case C is transitional metadata-only compatibility for pre-v2 configs that
+  contain `position_encoding` but explicitly record
+  `position_encoding_execution.resolved_config_applied_to_model == False`.
+  These configs did not execute the resolved config and therefore reconstruct
+  through the same state-driven historical path as Case B.
+- Cases B and C are read-only compatibility paths. No future training path
+  should create them.
+
+Implementation:
+
+- Added `resolved_position_encoding_from_dict()`, a pure deserializer that does
+  not import Torch, construct models, access files, or apply runtime support
+  gates.
+- The deserializer rebuilds a `PositionEncodingRequest` from serialized active
+  strategy fields, calls `resolve_position_encoding_config()`, and compares the
+  result against the serialized canonical fields. This keeps the resolver as
+  the single source of positional configuration math.
+- The training-only `position_encoding.chromosome.mapping` extension is allowed
+  and validated. It must be a mapping from the real zero-based chromosome IDs
+  `"0"` through `str(num_chromosomes - 1)` to chromosome-name strings. It is
+  not retained in the resolved dataclass.
+- Unknown fields in canonical position-encoding sections are rejected, and
+  corruption in resolved fields such as `input_dim`, `content_dim`,
+  `total_bias_rows`, `requires_chrom_ids`, `cross_chromosome_parameter`, and
+  `default_ig_mode` raises explicit `ValueError`s.
+- Added `src/models/reconstruction.py` with `ReconstructedSIEVEModel` and
+  `reconstruct_sieve_from_checkpoint()`.
+- Case A reconciles only Phase 7B3 architecture/provenance metadata from
+  checkpoint metadata, without mutating caller mappings. Config values remain
+  primary; matching metadata succeeds, missing metadata is tolerated, allowed
+  missing config fields may be filled from metadata, and conflicts raise.
+- Case A validates structural consistency between top-level config fields and
+  the resolved config, including `input_dim`, `content_dim`,
+  `num_chromosomes`, and `position_encoding_schema_version`.
+- Case A validates current Phase-7 runtime support during model reconstruction,
+  constructs explicit resolved SIEVE, wraps chunked checkpoints when the state
+  keys are consistently `base_model.`-prefixed, and loads with
+  `strict=True`.
+- Schema-v2 normalized `preset=legacy` is still Case A. It reconstructs an
+  explicit resolved legacy SIEVE, allocates the normalized learned chromosome
+  embedding, and strict-loads exact state.
+- Case B/C historical reconstruction infers old `input_dim` from the unique
+  `variant_encoder.encoder.0.weight` state tensor and infers chromosome module
+  presence from `chrom_embedding.weight` state tensors. Dataset chromosome
+  count is not used as old-checkpoint architecture authority.
+- Compatibility loading now has a preflight before calling the existing
+  `load_state_dict_with_legacy_upgrade()`. The only accepted shape migration
+  is historical T5 `position_bias.weight` rows `32 -> 33` with the same head
+  width; arbitrary missing keys, unexpected keys, and tensor-shape corruption
+  are rejected.
+- Checkpoint metadata alone cannot promote Case B or C into Case A.
+- Raw nullable training CLI fields, such as `num_position_buckets=None`, do not
+  override authoritative resolved positional metadata or historical defaults
+  during reconstruction.
+- Canonical serialized resolved fields are type-strict as well as
+  value-strict, so malformed metadata such as `True` for integer fields or
+  float representations of integer dimensions is rejected.
+- `position_encoding.chromosome.mapping` may be absent, but if present it must
+  be a real mapping; explicit null is invalid.
+- Authoritative outer schema and architecture metadata are type-strict as well
+  as value-strict.
+
+Runtime behavior:
+
+- No explanation, IG, attention analysis, training, preprocessing, SIEVE,
+  attention, position runtime, chunked wrapper, or trainer execution file was
+  changed.
+- The new reconstruction helper only consumes existing model APIs.
+
+Validation:
+
+- `tests/test_position_reconstruction_phase7.py`: 87 passed.
+- Focused regression command passed 354 tests.
+- Historical legacy reconstruction regression passed 23 tests.
+- Full test suite passed 1031 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/encoding/position_config.py`,
+  `src/models/reconstruction.py`, and
+  `tests/test_position_reconstruction_phase7.py`.
+- `git diff --check` passed.
+- The new reconstruction module and test file passed Ruff, Black check with
+  Python 3.10 target, and isort check.
+
+Baseline static debt:
+
+- Modified legacy `src/encoding/position_config.py` retained zero Ruff
+  findings in both committed baseline and current code.
+- `src/encoding/position_config.py` retained matching Black formatting debt:
+  committed baseline and current code both would be reformatted.
+- `src/encoding/position_config.py` passed isort check in both committed
+  baseline and current code.
+
+Known limitations:
+
+- `scripts/explain.py` still uses the historical reconstruction path and has
+  not yet consumed `reconstruct_sieve_from_checkpoint()`.
+- IG policy, attention analysis inputs, validation scripts, and downstream
+  reconstruction consumers remain deferred.
+- Dataset mapping checksum verification is not implemented in this phase.
+- Learned-binned absolute position, RoPE, fixed ALiBi, and learned ALiBi can
+  deserialize if resolver-valid, but reconstruction currently rejects them
+  through Phase-7 runtime support validation.
+
 ## Next planned phase
 
-Phase 7B4 - config/checkpoint reconstruction readers for new-schema positional
-models, including explanation-time compatibility boundaries.
+Phase 7B4B - explanation, IG policy, and attention integration.
