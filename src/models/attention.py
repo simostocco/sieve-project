@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.encoding import relative_position_bucket
+from .position_runtime import LegacyT5RelativePositionRuntime
 
 
 class PositionAwareSparseAttention(nn.Module):
@@ -105,6 +105,10 @@ class PositionAwareSparseAttention(nn.Module):
         self.num_position_buckets = num_position_buckets
         self.max_distance = max_distance
         self.num_chromosomes = num_chromosomes
+        self._relative_position_runtime = LegacyT5RelativePositionRuntime(
+            num_position_buckets=num_position_buckets,
+            max_distance=max_distance,
+        )
 
         # Attention projections
         self.query = nn.Linear(latent_dim, latent_dim)
@@ -163,44 +167,13 @@ class PositionAwareSparseAttention(nn.Module):
         Tensor
             Position bias, shape (batch, num_heads, num_queries, num_keys)
         """
-        batch_size = query_positions.shape[0]
-
-        # Compute relative position buckets for each batch element
-        # We need to process each sample in the batch separately
-        position_buckets_list = []
-        for b in range(batch_size):
-            # Get positions for this batch element
-            query_pos_b = query_positions[b]  # (num_queries,)
-            key_pos_b = key_positions[b]      # (num_keys,)
-
-            q_chrom_b = query_chroms[b] if query_chroms is not None else None
-            k_chrom_b = key_chroms[b] if key_chroms is not None else None
-
-            # Compute buckets for this sample
-            buckets_b = relative_position_bucket(
-                query_pos_b,
-                key_pos_b,
-                num_buckets=self.num_position_buckets,
-                max_distance=self.max_distance,
-                query_chroms=q_chrom_b,
-                key_chroms=k_chrom_b,
-            )  # (num_queries, num_keys)
-
-            position_buckets_list.append(buckets_b)
-
-        # Stack to get (batch, num_queries, num_keys)
-        position_buckets = torch.stack(position_buckets_list, dim=0)
-
-        # Get learnable bias for each bucket
-        # position_bias.weight: (num_position_buckets + 1, num_heads)
-        # position_buckets: (batch, num_queries, num_keys)
-        # Result: (batch, num_queries, num_keys, num_heads)
-        bias = self.position_bias(position_buckets)
-
-        # Permute to (batch, num_heads, num_queries, num_keys)
-        bias = bias.permute(0, 3, 1, 2)
-
-        return bias
+        return self._relative_position_runtime.compute_bias(
+            query_positions,
+            key_positions,
+            self.position_bias,
+            query_chroms=query_chroms,
+            key_chroms=key_chroms,
+        )
 
     def forward(
         self,
@@ -271,16 +244,19 @@ class PositionAwareSparseAttention(nn.Module):
         # Compute attention scores
         # (batch, num_heads, num_variants, head_dim) @ (batch, num_heads, head_dim, num_variants)
         # -> (batch, num_heads, num_variants, num_variants)
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        base_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
         # Add relative position bias. When chrom_ids is supplied, cross-
         # chromosome pairs use the dedicated bucket; otherwise the legacy
         # chromosome-blind bucketing is preserved for backward compatibility.
-        position_bias = self._compute_position_bias(
-            positions, positions,
-            query_chroms=chrom_ids, key_chroms=chrom_ids,
+        attn_scores = self._relative_position_runtime.adjust_attention_scores(
+            base_scores,
+            query=Q,
+            key=K,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            position_bias=self.position_bias,
         )
-        attn_scores = attn_scores + position_bias
 
         # Apply mask if provided
         if mask is not None:

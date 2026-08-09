@@ -21,6 +21,7 @@ from .attention import MultiLayerAttention
 from .aggregation import EfficientGeneAggregator
 from .classifier import AttentionPoolingClassifier, PhenotypeClassifier
 from .feature_composition import compose_legacy_variant_features_torch
+from .position_runtime import ObservedAbsolutePositionRuntime
 
 
 class SIEVE(nn.Module):
@@ -106,6 +107,7 @@ class SIEVE(nn.Module):
         self.num_covariates = num_covariates
         self.num_chromosomes = num_chromosomes
         self.classifier_type = classifier_type
+        self._absolute_position_runtime = ObservedAbsolutePositionRuntime()
 
         # 1. Variant encoder
         self.variant_encoder = VariantEncoder(
@@ -231,6 +233,9 @@ class SIEVE(nn.Module):
         # Historical checkpoints remain compatible because model state is unchanged.
         encoder_input = self._resolve_variant_encoder_input(
             variant_features,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            mask=mask,
             content_features=content_features,
             absolute_position_features=absolute_position_features,
         )
@@ -349,6 +354,9 @@ class SIEVE(nn.Module):
         self,
         variant_features: Tensor | None,
         *,
+        positions: Tensor,
+        chrom_ids: Tensor | None,
+        mask: Tensor | None,
         content_features: Tensor | None,
         absolute_position_features: Tensor | None,
     ) -> Tensor:
@@ -363,9 +371,16 @@ class SIEVE(nn.Module):
             )
 
         if has_content and has_position:
+            resolved_absolute_position_features = self._absolute_position_runtime.resolve(
+                absolute_position_features,
+                positions=positions,
+                chrom_ids=chrom_ids,
+                mask=mask,
+                reference=content_features,
+            )
             composed = compose_legacy_variant_features_torch(
                 content_features,
-                absolute_position_features,
+                resolved_absolute_position_features,
             )
             if composed.shape[-1] != self.input_dim:
                 raise ValueError(

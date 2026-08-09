@@ -950,3 +950,149 @@ Known limitations:
 ## Next planned phase
 
 Phase 6A - common positional-encoding interface design.
+
+## Phase 6A - Positional Runtime Interface Design
+
+Goal:
+
+Define the model-side positional-runtime boundary before adding selectable
+non-legacy strategies.
+
+Design decisions:
+
+- The observed absolute-position tensor is the legacy absolute boundary.
+  Historical sinusoidal feature values are not recomputed inside the model.
+- Absolute position remains separate from content features until the last
+  compatibility step before `VariantEncoder`.
+- Relative position uses a score-level runtime abstraction. The runtime sees
+  base attention scores, query/key tensors, positions, chromosome ids, and the
+  existing bias owner. This boundary is required for future RoPE behavior where
+  same-chromosome scores may be rotated while cross-chromosome scores remain
+  unrotated plus explicit bias.
+- Cross-chromosome policy remains separate from relative strategy. The current
+  legacy behavior still routes cross-chromosome pairs to a dedicated bucket
+  only when chromosome ids are supplied; it does not mask cross-chromosome
+  attention.
+- Existing `position_bias` and `chrom_embedding` parameter ownership must stay
+  on `PositionAwareSparseAttention`. Runtime objects must not own parameters,
+  buffers, checkpoint metadata, or state-dict namespaces.
+- Phase 6B was planned as a zero-intended-runtime-change refactor.
+
+## Phase 6B - Legacy Positional Runtime Interfaces
+
+Goal:
+
+Introduce parameterless runtime interfaces for the executed legacy positional
+behavior without enabling custom strategies or changing model computation.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `src/models/attention.py`
+- `src/models/sieve.py`
+- `tests/test_position_runtime_legacy_equivalence.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `AbsolutePositionRuntime`, a protocol whose `resolve()` method receives
+  observed absolute-position features, genomic positions, chromosome ids, mask,
+  and a reference content tensor.
+- Added `ObservedAbsolutePositionRuntime`, a frozen, parameterless dataclass
+  that returns the exact observed absolute-position tensor after minimal
+  rank/leading-dimension validation. It does not clone, detach, cast, move, or
+  recompute sinusoidal features. The L0 zero-width absolute-position tensor and
+  L1-L4 64-channel observed tensors pass through unchanged.
+- Added `RelativePositionRuntime`, a score-level protocol whose
+  `adjust_attention_scores()` method receives base scores, query/key tensors,
+  positions, chromosome ids, and the externally owned position-bias embedding.
+- Added `LegacyT5RelativePositionRuntime`, a frozen, parameterless dataclass
+  that reproduces the historical T5-style relative bucket bias.
+- Added `compute_bias()` on `LegacyT5RelativePositionRuntime` as the
+  compatibility helper. It preserves the historical per-batch loop, direct
+  `relative_position_bucket()` call, direct `position_bias` lookup, and
+  `[batch, heads, queries, keys]` permutation.
+- Updated `PositionAwareSparseAttention._compute_position_bias()` to delegate
+  to the runtime helper while preserving the method name and signature.
+- Updated attention forward execution so Q/K/V projection, reshape, base QK
+  scores, score-level bias adjustment, padding mask, softmax, `nan_to_num`,
+  dropout, value aggregation, reshape, and output projection remain in the
+  historical order.
+- Added `ObservedAbsolutePositionRuntime` to `SIEVE` as a plain attribute, not
+  an `nn.Module`. The split-primary path resolves the observed
+  absolute-position tensor and then calls the unchanged historical feature
+  composer before `VariantEncoder`.
+- Preserved the historical `variant_features` fallback path. When split tensors
+  are absent, the absolute runtime is not called.
+
+Runtime behavior:
+
+- Historical feature composition remains runtime authority for executed legacy
+  model input.
+- `position_bias` ownership is unchanged on each
+  `PositionAwareSparseAttention` layer.
+- `chrom_embedding` ownership is unchanged and remains allocated only when
+  `num_chromosomes > 0`.
+- State-dict keys are unchanged. No key contains `_absolute_position_runtime`,
+  `_relative_position_runtime`, or `position_runtime`.
+- State-dict tensor shapes are unchanged, including direct
+  `attention.attention_layers.<N>.position_bias.weight` and
+  `attention.attention_layers.<N>.chrom_embedding.weight` when configured.
+- Parameter count is unchanged because runtime objects are not modules and own
+  no parameters or buffers.
+- L0-L4 historical input dimensions and content/absolute split dimensions are
+  unchanged.
+- Chromosome semantics are unchanged: chromosome ids are zero-based as passed,
+  zero can still be a real chromosome id under `mask=True`, padding authority
+  remains the mask, and cross-chromosome attention remains allowed.
+- `scripts/train.py`, `scripts/explain.py`, `src/models/chunked_sieve.py`, and
+  `src/encoding/*` were not changed.
+
+Compatibility:
+
+- Existing checkpoint key names and tensor ownership remain compatible.
+- The synthetic old-checkpoint test with 32-row `position_bias.weight` loads
+  through `load_state_dict_with_legacy_upgrade()`. The overlapping 32 rows are
+  preserved exactly, and the destination cross-chromosome row remains valid
+  according to the existing upgrade semantics.
+- Existing chunked tests continue to prove split tensors and chromosome ids
+  reach base `SIEVE`; no positional strategy logic was added to
+  `ChunkedSIEVEModel`.
+- Existing explainability tests continue to prove content-mode IG attribution
+  width is `content_dim` and legacy-mode attribution width is `input_dim`.
+
+Validation:
+
+- `tests/test_position_runtime_legacy_equivalence.py`: 23 passed.
+- Focused regression command passed 286 tests, 1 skipped, with 1 existing
+  non-failing deprecation warning from `tests/test_phase3_explain.py`.
+- Full test suite passed 802 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/models/position_runtime.py`,
+  `src/models/attention.py`, `src/models/sieve.py`, and
+  `tests/test_position_runtime_legacy_equivalence.py`.
+- `git diff --check` passed.
+- The two new Python files passed Ruff, Black check with Python 3.10 target,
+  and isort check.
+- Modified legacy files retained no net Ruff debt: committed baseline and
+  current `src/models/attention.py` plus `src/models/sieve.py` both reported
+  29 Ruff findings.
+- Modified legacy files retained matching pre-existing Black debt: committed
+  baseline and current `src/models/attention.py` plus `src/models/sieve.py`
+  would both be reformatted.
+- Modified legacy files retained matching pre-existing isort debt: committed
+  baseline and current `src/models/sieve.py` both report import sorting debt.
+
+Known limitations:
+
+- Custom positional strategies remain non-executable.
+- `cross_chromosome_policy=mask` is not implemented.
+- Learned-binned absolute position is not implemented.
+- RoPE is not implemented.
+- ALiBi is not implemented.
+- The current chromosome padding/zero-ID ambiguity remains unchanged.
+- Normalized metadata/runtime discrepancies are not reconciled.
+
+## Next planned phase
+
+Phase 7 - selectable baseline positional strategies.
