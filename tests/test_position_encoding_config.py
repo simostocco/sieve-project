@@ -20,6 +20,7 @@ from src.encoding.position_config import (
     RelativePositionEncoding,
     ResolvedIGMode,
     resolve_position_encoding_config,
+    resolved_position_encoding_from_dict,
 )
 
 
@@ -602,3 +603,46 @@ def test_zero_chromosomes_remains_valid_when_no_chromosome_information_is_needed
 
     assert config.chromosome.requires_chrom_ids is False
     assert config.input_dim == config.content_dim
+
+
+def test_learned_binned_requires_chromosome_ids_even_without_chromosome_embedding():
+    config = resolve(
+        custom_request(
+            absolute=AbsolutePositionEncoding.LEARNED_BINNED,
+            relative=RelativePositionEncoding.NONE,
+            chromosome=ChromosomeEncoding.NONE,
+        ),
+        num_chromosomes=3,
+    )
+
+    assert config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED
+    assert config.chromosome.encoding is ChromosomeEncoding.NONE
+    assert config.chromosome.requires_chrom_ids is True
+
+
+def test_learned_binned_rejects_zero_chromosomes():
+    with pytest.raises(ValueError, match="learned-binned"):
+        resolve(
+            custom_request(
+                absolute=AbsolutePositionEncoding.LEARNED_BINNED,
+                relative=RelativePositionEncoding.NONE,
+                chromosome=ChromosomeEncoding.NONE,
+            ),
+            num_chromosomes=0,
+        )
+
+
+def test_learned_binned_plain_to_dict_round_trips_without_binning_extension():
+    config = resolve(
+        custom_request(
+            absolute=AbsolutePositionEncoding.LEARNED_BINNED,
+            relative=RelativePositionEncoding.NONE,
+            chromosome=ChromosomeEncoding.NONE,
+        ),
+        num_chromosomes=3,
+    )
+    data = config.to_dict()
+
+    assert "binning" not in data["absolute"]
+    parsed = resolved_position_encoding_from_dict(data, latent_dim=16, num_heads=2)
+    assert parsed == config

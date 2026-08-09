@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .levels import AnnotationLevel, get_content_feature_dimension
+from .position_layout import learned_binned_layout_from_absolute_dict
 
 DEFAULT_POSITION_DIM = 64
 DEFAULT_SINUSOIDAL_COORDINATE_SCALE = 1.0
@@ -275,6 +276,7 @@ def resolve_position_encoding_config(
         chromosome_encoding,
         cross_policy,
         relative_encoding,
+        absolute_encoding,
         num_chromosomes=num_chromosomes,
     )
     content_dim = get_content_feature_dimension(annotation_level)
@@ -306,8 +308,9 @@ def resolved_position_encoding_from_dict(
     calls the resolver again, and then compares every canonical field. That
     keeps the resolver as the single source of configuration math.
 
-    The training-only ``chromosome.mapping`` extension is validated but not
-    copied into the returned dataclass.
+    Training-only ``chromosome.mapping`` and learned-binned
+    ``absolute.binning`` extensions are validated but not copied into the
+    returned dataclass.
     """
     if not isinstance(data, Mapping):
         raise ValueError("position_encoding must be a mapping")
@@ -381,6 +384,20 @@ def resolved_position_encoding_from_dict(
         _validate_chromosome_mapping_extension(
             chromosome["mapping"],
             num_chromosomes=num_chromosomes,
+        )
+    if "binning" in absolute:
+        if absolute_encoding is not AbsolutePositionEncoding.LEARNED_BINNED:
+            raise ValueError(
+                "position_encoding.absolute.binning is only valid for learned_binned"
+            )
+        if "mapping" not in chromosome:
+            raise ValueError(
+                "position_encoding.absolute.binning requires "
+                "position_encoding.chromosome.mapping"
+            )
+        learned_binned_layout_from_absolute_dict(
+            absolute,
+            chromosome_mapping=chromosome["mapping"],
         )
 
     if preset is PositionPreset.LEGACY:
@@ -648,9 +665,11 @@ def _resolve_chromosome(
     encoding: ChromosomeEncoding,
     cross_policy: CrossChromosomePolicy,
     relative_encoding: RelativePositionEncoding,
+    absolute_encoding: AbsolutePositionEncoding,
     *,
     num_chromosomes: int,
 ) -> ResolvedChromosomeConfig:
+    learned_binned_absolute = absolute_encoding is AbsolutePositionEncoding.LEARNED_BINNED
     chromosome_aware_relative = relative_encoding in {
         RelativePositionEncoding.T5_BUCKET,
         RelativePositionEncoding.ROPE,
@@ -659,12 +678,14 @@ def _resolve_chromosome(
     }
     requires_chrom_ids = (
         encoding is ChromosomeEncoding.LEARNED
+        or learned_binned_absolute
         or cross_policy is CrossChromosomePolicy.MASK
         or (cross_policy is CrossChromosomePolicy.SEPARATE and chromosome_aware_relative)
     )
     if requires_chrom_ids and num_chromosomes <= 0:
         raise ValueError(
-            "num_chromosomes must be positive when chromosome-aware encoding or routing is required"
+            "num_chromosomes must be positive when chromosome-aware encoding, "
+            "routing, or learned-binned absolute position is required"
         )
 
     if cross_policy is CrossChromosomePolicy.MASK:
@@ -852,7 +873,7 @@ def _serialized_int(value: object, dotted_name: str) -> int:
 
 
 def _validate_serialized_absolute_section(data: Mapping[str, object]) -> None:
-    allowed = {
+    canonical = {
         "type",
         "fusion",
         "dim",
@@ -860,8 +881,11 @@ def _validate_serialized_absolute_section(data: Mapping[str, object]) -> None:
         "max_wavelength",
         "bin_size_bp",
     }
-    _require_keys(data, allowed, "position_encoding.absolute")
+    allowed = canonical | {"binning"}
+    _require_keys(data, canonical, "position_encoding.absolute")
     _reject_unknown_keys(data, allowed, "position_encoding.absolute")
+    if "binning" in data and not isinstance(data["binning"], Mapping):
+        raise ValueError("position_encoding.absolute.binning must be a mapping")
 
 
 def _validate_serialized_relative_section(data: Mapping[str, object]) -> None:
@@ -927,6 +951,12 @@ def _strip_training_extensions(data: Mapping[str, object]) -> dict[str, object]:
                 sub_key: sub_value
                 for sub_key, sub_value in value.items()
                 if sub_key != "mapping"
+            }
+        elif key == "absolute" and isinstance(value, Mapping):
+            stripped[key] = {
+                sub_key: sub_value
+                for sub_key, sub_value in value.items()
+                if sub_key != "binning"
             }
         else:
             stripped[key] = value

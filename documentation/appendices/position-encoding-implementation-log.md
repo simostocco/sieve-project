@@ -1722,6 +1722,106 @@ Known limitations:
 - Downstream validation and analysis scripts have not yet been aligned to the
   Phase 7B4A reconstruction helper.
 
+## Phase 8B1 - Learned-Binned Genome Layout Metadata
+
+Goal:
+
+Add the reference-genome and serialization metadata needed to make
+`absolute_position_encoding=learned_binned` reconstructable later, without
+allocating learned positional parameters or enabling learned-binned execution.
+
+Exact files changed:
+
+- `src/data/genome.py`
+- `src/encoding/position_config.py`
+- `src/encoding/position_layout.py`
+- `scripts/train.py`
+- `tests/test_learned_binned_position_layout.py`
+- `tests/test_position_encoding_config.py`
+- `tests/test_train_config_metadata.py`
+- `tests/test_position_runtime_phase7_baselines.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added authoritative canonical chromosome lengths for GRCh37 and GRCh38 for
+  normalized chromosomes `1..22`, `X`, `Y`, and `MT`, plus copy-safe lookup
+  helpers in `src/data/genome.py`.
+- Added pure learned-binned layout metadata in
+  `src/encoding/position_layout.py`. The layout records schema version,
+  `coordinate_origin=1`, the `chromosome_local_contiguous` layout identifier,
+  chromosome lengths ordered by chromosome ID, per-chromosome bin counts, and
+  total `num_embeddings`.
+- The coordinate convention is explicit: repository positions are 1-based, so
+  future local bin lookup is `(position_bp - 1) // bin_size_bp`.
+- Layout construction validates saved chromosome ID-to-name mappings as
+  contiguous real zero-based IDs, uses chromosome ID order rather than mapping
+  insertion or lexical order, rejects non-standard contigs, and derives all bin
+  counts by ceiling division from authoritative chromosome lengths. Serialized
+  chromosome ID keys must use canonical string spellings such as `"0"` and
+  `"1"`; alternate decimal spellings such as `"00"` or `"01"` are rejected.
+- Added a pure mapping validator that checks serialized
+  `position_encoding.chromosome.mapping` is the exact inverse of the current
+  `chrom_index`; it does not shift IDs, invent padding rows, or accept
+  non-mapping saved metadata.
+- `ResolvedAbsolutePositionConfig` remains pure strategy configuration only:
+  `type`, `fusion`, `dim`, coordinate parameters, and `bin_size_bp`. It does
+  not retain chromosome lengths, offsets, or table size.
+- `resolved_position_encoding_from_dict()` now allows and validates the
+  training-only learned-binned `position_encoding.absolute.binning` extension,
+  strips it before canonical resolver equality, and still rejects the extension
+  on non-learned-binned absolute encodings.
+- Learned-binned absolute encoding now requires chromosome IDs and positive
+  `num_chromosomes` even when chromosome embedding, relative position, and
+  cross-chromosome routing are otherwise disabled.
+- `serialize_position_encoding_for_training()` attaches the learned-binned
+  `absolute.binning` extension from the resolved `bin_size_bp`, genome build,
+  and validated chromosome mapping. Non-learned-binned configs remain
+  unchanged and omit `absolute.binning`.
+
+Runtime behavior:
+
+- No `nn.Embedding`, runtime lookup, model constructor, attention, explanation,
+  reconstruction, preprocessing tensor, checkpoint state-dict, or training
+  execution behavior was changed.
+- `validate_phase7_runtime_support()` still rejects learned-binned absolute
+  position before model construction.
+- Historical feature composition remains the executed authority for supported
+  Phase-7 paths; learned-binned is metadata/config foundation only.
+
+Validation:
+
+- `tests/test_learned_binned_position_layout.py`: 19 passed.
+- Phase 8B1 focused command passed 262 tests.
+- Full test suite passed 1069 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for changed Python files.
+- `git diff --check` passed.
+- New files `src/encoding/position_layout.py` and
+  `tests/test_learned_binned_position_layout.py` passed Ruff and isort.
+- Black check passed for each new file individually. The combined two-file
+  Black invocation hung twice in this environment and was interrupted; per-file
+  checks were clean.
+
+Baseline static debt:
+
+- Modified legacy files retained matching Ruff debt: committed baseline and
+  current code both report 30 findings across the touched legacy file set.
+- Modified legacy files retained no worse isort debt: committed baseline had 4
+  import-order errors, current code has 1 remaining pre-existing
+  `scripts/train.py` import-order error.
+- Modified legacy files retained no worse Black formatting debt: committed
+  baseline had 6 failing files, current code has 3 remaining production files
+  that Black would reformat.
+
+Known limitations:
+
+- The learned-binned layout is not yet executed by SIEVE or ChunkedSIEVEModel.
+- The serialized layout does not duplicate chromosome names; the authoritative
+  names remain in `position_encoding.chromosome.mapping`.
+- Chromosome offsets are derived prefix sums, not serialized independent state.
+- Non-standard contigs are rejected for learned-binned layout construction.
+
 ## Next planned phase
 
-Phase 8 - learned binned absolute positional encoding.
+Phase 8B2 - learned-binned registered embedding and runtime lookup.

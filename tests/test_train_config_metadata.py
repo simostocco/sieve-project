@@ -151,6 +151,7 @@ def test_serialized_position_config_embeds_chromosome_mapping_without_gene_index
     position_encoding = train.serialize_position_encoding_for_training(
         resolved_l3(),
         {"X": 2, "1": 0, "2": 1},
+        genome_build="GRCh37",
     )
 
     assert position_encoding["chromosome"]["mapping"] == {
@@ -165,7 +166,11 @@ def test_serialized_position_config_does_not_mutate_resolved_config():
     resolved = resolved_l3()
     before = resolved.to_dict()
 
-    train.serialize_position_encoding_for_training(resolved, {"1": 0, "2": 1, "X": 2})
+    train.serialize_position_encoding_for_training(
+        resolved,
+        {"1": 0, "2": 1, "X": 2},
+        genome_build="GRCh37",
+    )
 
     assert resolved.to_dict() == before
 
@@ -182,7 +187,11 @@ def test_serialized_position_config_rejects_chromosome_mapping_cardinality_misma
     chrom_index,
 ):
     with pytest.raises(ValueError, match="chrom_index cardinality.*resolved chromosome count"):
-        train.serialize_position_encoding_for_training(resolved, chrom_index)
+        train.serialize_position_encoding_for_training(
+            resolved,
+            chrom_index,
+            genome_build="GRCh37",
+        )
 
 
 def test_run_metadata_contains_required_dimensions_identity_and_resolved_config():

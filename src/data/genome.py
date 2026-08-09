@@ -13,7 +13,9 @@ module rather than hardcoding coordinates.
 Supported builds: GRCh37, GRCh38
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Dict, List, Tuple
 
 SUPPORTED_BUILDS = ('GRCh37', 'GRCh38')
@@ -29,6 +31,71 @@ class GenomeBuild:
     autosomal_chroms: Tuple[str, ...]
     x_contig_aliases: Tuple[str, ...]
     y_contig_aliases: Tuple[str, ...]
+    chromosome_lengths: Mapping[str, int]
+
+
+# Canonical chromosome lengths for the GRCh37 and GRCh38 primary assemblies.
+# Autosomal and sex-chromosome lengths are the GRC primary assembled sequence
+# lengths; MT uses the 16,569 bp rCRS mitochondrial sequence.
+GRCH37_CHROMOSOME_LENGTHS = MappingProxyType(
+    {
+        "1": 249250621,
+        "2": 243199373,
+        "3": 198022430,
+        "4": 191154276,
+        "5": 180915260,
+        "6": 171115067,
+        "7": 159138663,
+        "8": 146364022,
+        "9": 141213431,
+        "10": 135534747,
+        "11": 135006516,
+        "12": 133851895,
+        "13": 115169878,
+        "14": 107349540,
+        "15": 102531392,
+        "16": 90354753,
+        "17": 81195210,
+        "18": 78077248,
+        "19": 59128983,
+        "20": 63025520,
+        "21": 48129895,
+        "22": 51304566,
+        "X": 155270560,
+        "Y": 59373566,
+        "MT": 16569,
+    }
+)
+
+GRCH38_CHROMOSOME_LENGTHS = MappingProxyType(
+    {
+        "1": 248956422,
+        "2": 242193529,
+        "3": 198295559,
+        "4": 190214555,
+        "5": 181538259,
+        "6": 170805979,
+        "7": 159345973,
+        "8": 145138636,
+        "9": 138394717,
+        "10": 133797422,
+        "11": 135086622,
+        "12": 133275309,
+        "13": 114364328,
+        "14": 107043718,
+        "15": 101991189,
+        "16": 90338345,
+        "17": 83257441,
+        "18": 80373285,
+        "19": 58617616,
+        "20": 64444167,
+        "21": 46709983,
+        "22": 50818468,
+        "X": 156040895,
+        "Y": 57227415,
+        "MT": 16569,
+    }
+)
 
 
 GRCH37 = GenomeBuild(
@@ -41,6 +108,7 @@ GRCH37 = GenomeBuild(
     autosomal_chroms=tuple(str(c) for c in range(1, 23)),
     x_contig_aliases=('X', 'chrX', '23', 'chr23'),
     y_contig_aliases=('Y', 'chrY', '24', 'chr24'),
+    chromosome_lengths=GRCH37_CHROMOSOME_LENGTHS,
 )
 
 GRCH38 = GenomeBuild(
@@ -53,6 +121,7 @@ GRCH38 = GenomeBuild(
     autosomal_chroms=tuple(str(c) for c in range(1, 23)),
     x_contig_aliases=('X', 'chrX', '23', 'chr23'),
     y_contig_aliases=('Y', 'chrY', '24', 'chr24'),
+    chromosome_lengths=GRCH38_CHROMOSOME_LENGTHS,
 )
 
 BUILDS = {
@@ -95,6 +164,35 @@ def get_genome_build(name: str) -> GenomeBuild:
             f"(aliases: hg19, hg38, b37, b38)"
         )
     return BUILDS[normalised]
+
+
+def get_chromosome_lengths(genome_build: str | GenomeBuild) -> dict[str, int]:
+    """Return copy-safe canonical chromosome lengths for a genome build."""
+    build = get_genome_build(genome_build) if isinstance(genome_build, str) else genome_build
+    if not isinstance(build, GenomeBuild):
+        raise ValueError("genome_build must be a build name or GenomeBuild")
+    return dict(build.chromosome_lengths)
+
+
+def get_chromosome_length(
+    genome_build: str | GenomeBuild,
+    chromosome_name: str,
+) -> int:
+    """Return the canonical length for a supported normalized chromosome.
+
+    Chromosome aliases are resolved through :func:`normalise_chrom`; unsupported
+    alternate contigs are rejected so learned-bin tables are deterministic.
+    """
+    build = get_genome_build(genome_build) if isinstance(genome_build, str) else genome_build
+    if not isinstance(build, GenomeBuild):
+        raise ValueError("genome_build must be a build name or GenomeBuild")
+    normalized = normalise_chrom(chromosome_name, build)
+    try:
+        return build.chromosome_lengths[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported chromosome '{chromosome_name}' for genome build {build.name}"
+        ) from exc
 
 
 def is_in_par(pos: int, chrom: str, build: GenomeBuild) -> bool:

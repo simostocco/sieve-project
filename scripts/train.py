@@ -55,6 +55,9 @@ from src.encoding.position_config import (
     ResolvedPositionEncodingConfig,
     resolve_position_encoding_config,
 )
+from src.encoding.position_layout import (
+    build_learned_binned_absolute_position_layout,
+)
 from src.models import SIEVE, ChunkedSIEVEModel
 from src.models.position_runtime import validate_phase7_runtime_support
 from src.training import (
@@ -434,6 +437,8 @@ def write_dataset_mappings_artifact(
 def serialize_position_encoding_for_training(
     resolved_position_encoding: ResolvedPositionEncodingConfig,
     chrom_index: Mapping[str, int],
+    *,
+    genome_build: str,
 ) -> dict[str, object]:
     """Serialize resolved position config with chromosome row mapping attached."""
     position_encoding = copy.deepcopy(resolved_position_encoding.to_dict())
@@ -446,6 +451,20 @@ def serialize_position_encoding_for_training(
         )
     chromosome_config = position_encoding.setdefault("chromosome", {})
     chromosome_config["mapping"] = chromosome_mapping
+    if (
+        resolved_position_encoding.absolute.encoding
+        is AbsolutePositionEncoding.LEARNED_BINNED
+    ):
+        bin_size_bp = resolved_position_encoding.absolute.bin_size_bp
+        if bin_size_bp is None:
+            raise ValueError("learned_binned absolute position requires bin_size_bp")
+        layout = build_learned_binned_absolute_position_layout(
+            genome_build=genome_build,
+            chromosome_mapping=chromosome_mapping,
+            bin_size_bp=bin_size_bp,
+        )
+        absolute_config = position_encoding.setdefault("absolute", {})
+        absolute_config["binning"] = layout.to_dict()
     return position_encoding
 
 
@@ -522,6 +541,7 @@ def build_training_run_metadata(
         "position_encoding": serialize_position_encoding_for_training(
             resolved_position_encoding,
             chrom_index,
+            genome_build=genome_build,
         ),
         "dataset_identity": {
             "genome_build": genome_build,

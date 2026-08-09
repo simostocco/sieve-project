@@ -623,7 +623,7 @@ def test_phase7_runtime_objects_have_no_registered_or_tensor_state(runtime):
             relative=RelativePositionEncoding.NONE,
             position_dim=8,
             position_bin_size=1000,
-            num_chromosomes=0,
+            num_chromosomes=2,
         ),
         _resolve_custom(
             relative=RelativePositionEncoding.ROPE,
