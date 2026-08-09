@@ -1096,3 +1096,145 @@ Known limitations:
 ## Next planned phase
 
 Phase 7 - selectable baseline positional strategies.
+
+## Phase 7A - Selectable Baseline Strategy Design
+
+Goal:
+
+Define the baseline custom strategy architecture before adding executable
+runtime implementations.
+
+Design decisions:
+
+- New-schema legacy runs will execute the normalized resolved configuration
+  consistently in later Phase 7 integration.
+- Historical CV versus single-split chromosome discrepancies remain old-schema
+  compatibility behavior rather than new-schema execution semantics.
+- New-schema checkpoints, whether `preset=legacy` or `preset=custom`, will
+  require exact reconstruction from serialized configuration and state-dict
+  surface.
+- Custom sinusoidal absolute position is computed model-side and honors the
+  configured coordinate scale, wavelength, and width.
+- Custom sinusoidal padding rows are zeroed by mask so padded coordinate zero
+  does not contribute `cos(0)=1` channels.
+- `relative_position_encoding=none` owns no relative-position bias.
+- T5 with `cross_chromosome_policy=mask` uses ordinary position buckets only;
+  cross-chromosome score removal is a separate attention-mask concern.
+- Chromosome policy remains separate from chromosome embedding. Chromosome ids
+  can be required for pair routing even when learned chromosome embedding is
+  disabled.
+- Future custom attention execution will enforce query/key padding validity
+  before softmax.
+- Legacy IG will not be used for custom positional models.
+
+Runtime behavior changed: no.
+
+Known limitations:
+
+- The design phase did not implement runtime algorithms.
+- Model construction, attention wiring, training, explanation, checkpoint
+  compatibility, and custom-strategy execution remained unchanged.
+
+## Phase 7B1 - Baseline Positional Runtime Implementations
+
+Goal:
+
+Implement parameterless baseline positional runtime algorithms without wiring
+them into SIEVE, attention, training, explanation, checkpoints, or preprocessing.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `tests/test_position_runtime_phase7_baselines.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `NoAbsolutePositionRuntime`, which validates the reference tensor and
+  returns the zero-width `reference[..., :0]` view for custom
+  `absolute_position_encoding=none`.
+- Added `SinusoidalAbsolutePositionRuntime`, which computes custom model-side
+  sinusoidal features from genomic positions using the resolved position width,
+  coordinate scale, and max wavelength. It ignores observed historical absolute
+  tensors numerically and zeroes masked padding rows.
+- Added `NoRelativePositionRuntime`, which returns the exact base attention
+  score tensor object unchanged for custom `relative_position_encoding=none`.
+- Added `T5RelativePositionRuntime`, a parameterless custom T5 bias runtime
+  that receives the attention-owned `position_bias` embedding explicitly.
+- Implemented custom T5 `separate` behavior with required query/key chromosome
+  ids, ordinary within-chromosome buckets, and a dedicated cross-chromosome row
+  at `num_position_buckets`.
+- Implemented custom T5 `mask` behavior with ordinary position buckets only and
+  no cross-chromosome bucket lookup; future attention masking remains separate.
+- Added `build_same_chromosome_pair_mask()` for zero-based chromosome routing
+  masks without padding or softmax behavior.
+- Added `validate_phase7_runtime_support()` for the Phase 7 supported runtime
+  subset: absolute `none`/`sinusoidal`, relative `none`/`t5_bucket`, chromosome
+  `none`/`learned`, and cross policy `separate`/`mask`.
+- Added `build_absolute_position_runtime()` and
+  `build_relative_position_runtime()` factories. Legacy configs still build
+  `ObservedAbsolutePositionRuntime` for every level, including L0, and
+  `LegacyT5RelativePositionRuntime` for relative position.
+- Direct runtime construction now validates malformed custom sinusoidal and T5
+  settings clearly, while leaving the pure resolver as the normal construction
+  authority.
+
+Runtime behavior:
+
+- No model, attention, training, explanation, preprocessing, checkpoint, or
+  feature-tensor execution path was changed.
+- Split-primary batches are recomposed into the historical `VariantEncoder`
+  representation, preserving historical feature semantics and ordering.
+  `features` remains the compatibility fallback when split tensors are absent.
+- `ObservedAbsolutePositionRuntime` and `LegacyT5RelativePositionRuntime`
+  behavior remains unchanged.
+- Runtime objects are plain frozen dataclasses, not `nn.Module` instances, and
+  own no parameters, buffers, embeddings, or tensor configuration state.
+
+Compatibility:
+
+- Existing legacy state-dict ownership remains unchanged because factories are
+  not wired into attention or SIEVE yet.
+- Existing checkpoint compatibility remains governed by the Phase 6 state-dict
+  surface.
+- `src/models/attention.py`, `src/models/sieve.py`, `scripts/train.py`, and
+  `scripts/explain.py` were not changed.
+
+Validation:
+
+- `tests/test_position_runtime_phase7_baselines.py`: 64 passed.
+- Focused regression command passed 177 tests.
+- Full test suite passed 866 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/models/position_runtime.py` and
+  `tests/test_position_runtime_phase7_baselines.py`.
+- `git diff --check` passed.
+- The new Phase 7B1 test file passed Ruff, Black check with Python 3.10 target,
+  and isort check.
+
+Baseline static debt:
+
+- Modified legacy `src/models/position_runtime.py` retained zero Ruff findings
+  in both the committed baseline and current code.
+- Black check improved for `src/models/position_runtime.py`: the committed
+  baseline would be reformatted, while the current file passes Black check with
+  Python 3.10 target.
+- isort check passed for both committed baseline and current
+  `src/models/position_runtime.py`.
+
+Known limitations:
+
+- Phase 7B1 does not allocate or remove model parameters for custom strategies.
+- The new runtimes are not yet selected by SIEVE, attention, training, or
+  explanation.
+- Learned binned absolute position, RoPE, fixed ALiBi, and learned ALiBi remain
+  unsupported and raise `NotImplementedError` through the Phase 7 runtime
+  support validator.
+- `cross_chromosome_policy=mask` computes no score mask yet; Phase 7B1 only
+  provides ordinary T5 bias behavior and the same-chromosome pair-mask helper.
+- Historical CV/single-split chromosome differences remain old-schema
+  compatibility concerns until later integration phases.
+
+## Next planned phase
+
+Phase 7B2 - baseline model selection and state surfaces.
