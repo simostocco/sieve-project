@@ -32,7 +32,7 @@ from .position_runtime import (
     LegacyT5RelativePositionRuntime,
     build_relative_position_runtime,
     build_same_chromosome_pair_mask,
-    validate_phase7_runtime_support,
+    validate_attention_runtime_support,
 )
 
 
@@ -115,7 +115,7 @@ class PositionAwareSparseAttention(nn.Module):
         if position_encoding is not None:
             if not isinstance(position_encoding, ResolvedPositionEncodingConfig):
                 raise ValueError("position_encoding must be a ResolvedPositionEncodingConfig.")
-            validate_phase7_runtime_support(position_encoding)
+            validate_attention_runtime_support(position_encoding)
             resolved_num_chromosomes = position_encoding.chromosome.num_chromosomes
             if num_chromosomes not in {0, resolved_num_chromosomes}:
                 raise ValueError(

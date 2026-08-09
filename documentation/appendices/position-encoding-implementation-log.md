@@ -1822,6 +1822,134 @@ Known limitations:
 - Chromosome offsets are derived prefix sums, not serialized independent state.
 - Non-standard contigs are rejected for learned-binned layout construction.
 
+## Phase 8B2 - Learned-Binned Registered Embedding and Runtime Lookup
+
+Goal:
+
+Implement model-side learned-binned absolute-position execution for direct
+SIEVE construction while keeping training, checkpoint reconstruction, and
+explanation unchanged.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `src/models/sieve.py`
+- `src/models/attention.py`
+- `tests/test_learned_binned_position_runtime.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Split runtime validation by ownership. `validate_attention_runtime_support()`
+  validates only attention-owned relative/chromosome/cross-chromosome
+  behavior and does not reject absolute-position strategies. This lets
+  attention receive the truthful resolved config when SIEVE owns learned
+  absolute fusion.
+- Added `validate_model_runtime_support()` for complete SIEVE execution. It
+  calls the attention validator, allows `none` and `sinusoidal` without a
+  layout, and allows `learned_binned` only with a valid
+  `LearnedBinnedAbsolutePositionLayout`.
+- Preserved `validate_phase7_runtime_support()` as the external Phase-7 gate
+  used by training and reconstruction. It still rejects
+  `absolute_position_encoding=learned_binned`.
+- Added `LearnedBinnedAbsolutePositionRuntime`, a plain dataclass that owns no
+  registered state. It references the SIEVE-registered embedding and immutable
+  layout metadata.
+- Extended `SIEVE` with
+  `learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None`.
+  Direct learned-binned construction requires this layout. Supplying a layout
+  for any non-learned-binned absolute strategy raises.
+- For learned-binned only, SIEVE registers exactly one trainable parameter:
+  `absolute_position_embedding.weight` with shape
+  `(layout.num_embeddings, resolved.absolute.position_dim)`.
+- The learned absolute embedding is initialized to exact zeros so the strategy
+  is neutral at construction while selected rows can diverge through gradients.
+- The global row formula is chromosome-local contiguous:
+  `local_bin = (position_bp - 1) // bin_size_bp` and
+  `global_row = layout.chromosome_offsets[chrom_id] + local_bin`.
+- The 1-based boundary is explicit: positions `1` and `bin_size_bp` map to
+  local bin 0, while `bin_size_bp + 1` maps to local bin 1.
+- Accepted integer runtime inputs are canonicalized internally to `torch.long`
+  before row/index arithmetic. This preserves the public integer-dtype
+  validation rule while avoiding narrow-int and `uint8` indexing semantics for
+  genomic coordinates.
+- Padding is mask-authoritative. The learned runtime validates only
+  `mask=True` rows, initializes padded lookup rows to 0, writes real global
+  rows only into real positions, performs embedding lookup, and forces
+  `mask=False` outputs to exact zeros. Real `chrom_id=0` remains valid.
+- Real rows require integer positions/chromosome IDs, position `>= 1`,
+  `0 <= chrom_id < num_chromosomes`, and position not exceeding that
+  chromosome's serialized length. Invalid real coordinates raise `ValueError`;
+  they are not clamped.
+- Exact chromosome-end coordinates are valid, but coordinates past the
+  serialized chromosome length are rejected even when they would fall inside
+  the final allocated bin.
+- Direct layout validation is type-strict for scalar architecture fields:
+  `schema_version`, `coordinate_origin`, and `num_embeddings` must be non-bool
+  integers before equality checks are applied, and `layout` must be a string.
+- The observed historical `absolute_position_features` tensor is ignored as
+  learned-binned execution authority. Learned-binned uses positions,
+  chromosome IDs, mask, layout, and the registered embedding.
+
+Runtime behavior:
+
+- Direct SIEVE construction with custom learned-binned absolute position and a
+  valid layout now succeeds.
+- Direct SIEVE passes the original authoritative resolved config through to
+  attention unchanged; no synthetic absolute=`none` attention view is created.
+- Learned-binned coexists with supported attention-owned strategies, including
+  T5 bucket relative bias and learned chromosome embedding.
+- No training CLI behavior changed. Training still calls
+  `validate_phase7_runtime_support()` and rejects learned-binned before model
+  construction.
+- No checkpoint reconstruction behavior changed. Reconstruction still calls
+  `validate_phase7_runtime_support()` and rejects learned-binned.
+- No explanation, Integrated Gradients, chunked wrapper, feature-composition,
+  preprocessing, or data tensor generation code changed.
+
+Compatibility and state-dict effects:
+
+- Custom `none`, custom `sinusoidal`, explicit legacy, and no-config historical
+  models do not contain `absolute_position_embedding.weight`.
+- Learned-binned direct SIEVE models contain exactly one
+  `absolute_position_embedding.weight` key.
+- Existing Phase-7 relative-position, chromosome embedding, attention,
+  VariantEncoder, and historical checkpoint state keys remain unchanged.
+
+Validation:
+
+- `tests/test_learned_binned_position_runtime.py`: 33 passed.
+- Focused runtime/model command passed 272 tests.
+- Training/reconstruction gate regression command passed 123 tests.
+- Full test suite passed 1102 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/models/position_runtime.py`,
+  `tests/test_learned_binned_position_runtime.py`.
+- `git diff --check` passed.
+- `src/models/position_runtime.py` and
+  `tests/test_learned_binned_position_runtime.py` passed Ruff and isort.
+- A combined two-file Black check hung twice in this environment and was
+  interrupted; per-file Black checks with Python 3.10 target passed for both
+  touched Python files.
+
+Baseline static debt:
+
+- Modified legacy files retained matching Ruff debt: committed baseline and
+  current code both report 28 findings across `src/models/position_runtime.py`,
+  `src/models/sieve.py`, and `src/models/attention.py`.
+- Modified legacy files improved isort status from 3 baseline import-order
+  errors to 0 current errors.
+- Modified legacy files retained matching Black formatting debt: committed
+  baseline and current code both have 3 files that Black would reformat.
+
+Known limitations:
+
+- Learned-binned training serialization consumption and strict checkpoint
+  reconstruction remain deliberately disabled until Phase 8B3.
+- Explanation does not yet reconstruct or attribute learned-binned models.
+- Layout-to-live-dataset mapping verification remains deferred.
+
 ## Next planned phase
 
-Phase 8B2 - learned-binned registered embedding and runtime lookup.
+Phase 8B3 - learned-binned training serialization consumption and strict
+checkpoint reconstruction.

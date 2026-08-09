@@ -16,7 +16,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.encoding.position_config import PositionPreset, ResolvedPositionEncodingConfig
+from src.encoding.position_config import (
+    AbsolutePositionEncoding,
+    PositionPreset,
+    ResolvedPositionEncodingConfig,
+)
+from src.encoding.position_layout import LearnedBinnedAbsolutePositionLayout
 
 from .aggregation import EfficientGeneAggregator
 from .attention import MultiLayerAttention
@@ -26,7 +31,7 @@ from .feature_composition import compose_legacy_variant_features_torch
 from .position_runtime import (
     ObservedAbsolutePositionRuntime,
     build_absolute_position_runtime,
-    validate_phase7_runtime_support,
+    validate_model_runtime_support,
 )
 
 
@@ -105,13 +110,17 @@ class SIEVE(nn.Module):
         num_chromosomes: int = 0,
         classifier_type: str = 'flatten',
         position_encoding: ResolvedPositionEncodingConfig | None = None,
+        learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
     ):
         super().__init__()
 
         if position_encoding is not None:
             if not isinstance(position_encoding, ResolvedPositionEncodingConfig):
                 raise ValueError("position_encoding must be a ResolvedPositionEncodingConfig.")
-            validate_phase7_runtime_support(position_encoding)
+            validate_model_runtime_support(
+                position_encoding,
+                learned_binned_position_layout=learned_binned_position_layout,
+            )
             if input_dim != position_encoding.input_dim:
                 raise ValueError(
                     "input_dim must match position_encoding.input_dim when "
@@ -125,6 +134,10 @@ class SIEVE(nn.Module):
                     "is supplied."
                 )
         else:
+            if learned_binned_position_layout is not None:
+                raise ValueError(
+                    "learned_binned_position_layout requires position_encoding."
+                )
             resolved_num_chromosomes = num_chromosomes
 
         self.input_dim = input_dim
@@ -134,10 +147,27 @@ class SIEVE(nn.Module):
         self.num_chromosomes = resolved_num_chromosomes
         self.classifier_type = classifier_type
         self.position_encoding = position_encoding
+        if (
+            position_encoding is not None
+            and position_encoding.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED
+        ):
+            # SIEVE owns the sole registered learned absolute-position table.
+            # The runtime only computes row IDs and calls this embedding.
+            self.absolute_position_embedding = nn.Embedding(
+                learned_binned_position_layout.num_embeddings,
+                position_encoding.absolute.position_dim,
+            )
+            nn.init.zeros_(self.absolute_position_embedding.weight)
+        else:
+            self.absolute_position_embedding = None
         self._absolute_position_runtime = (
             ObservedAbsolutePositionRuntime()
             if position_encoding is None
-            else build_absolute_position_runtime(position_encoding)
+            else build_absolute_position_runtime(
+                position_encoding,
+                learned_binned_position_layout=learned_binned_position_layout,
+                absolute_position_embedding=self.absolute_position_embedding,
+            )
         )
 
         # 1. Variant encoder

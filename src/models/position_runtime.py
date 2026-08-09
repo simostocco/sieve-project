@@ -23,6 +23,12 @@ from src.encoding.position_config import (
     RelativePositionEncoding,
     ResolvedPositionEncodingConfig,
 )
+from src.encoding.position_layout import (
+    LEARNED_BINNED_COORDINATE_ORIGIN,
+    LEARNED_BINNED_LAYOUT,
+    LEARNED_BINNED_LAYOUT_SCHEMA_VERSION,
+    LearnedBinnedAbsolutePositionLayout,
+)
 
 
 class AbsolutePositionRuntime(Protocol):
@@ -172,6 +178,120 @@ class SinusoidalAbsolutePositionRuntime:
                 0,
             )
         return positional_features
+
+
+@dataclass(frozen=True)
+class LearnedBinnedAbsolutePositionRuntime:
+    """Resolve learned absolute-position rows from chromosome-local bins.
+
+    The trainable table is registered on ``SIEVE`` as
+    ``absolute_position_embedding``. This runtime is a plain routing object: it
+    holds a reference to that registered embedding and to immutable layout
+    metadata, but it does not own independent parameters or buffers.
+    """
+
+    embedding: nn.Embedding
+    layout: LearnedBinnedAbsolutePositionLayout
+    bin_size_bp: int
+    position_dim: int
+
+    def __post_init__(self) -> None:
+        """Validate direct construction outside SIEVE."""
+        if not isinstance(self.embedding, nn.Embedding):
+            raise ValueError("embedding must be an nn.Embedding.")
+        validate_learned_binned_layout_settings(
+            self.layout,
+            bin_size_bp=self.bin_size_bp,
+            position_dim=self.position_dim,
+            num_chromosomes=len(self.layout.chromosome_lengths_bp),
+        )
+        if self.embedding.num_embeddings != self.layout.num_embeddings:
+            raise ValueError("embedding.num_embeddings must match layout.num_embeddings.")
+        if self.embedding.embedding_dim != self.position_dim:
+            raise ValueError("embedding.embedding_dim must match position_dim.")
+
+    def resolve(
+        self,
+        observed_absolute_position_features: Tensor,
+        positions: Tensor,
+        chrom_ids: Tensor | None,
+        mask: Tensor | None,
+        reference: Tensor,
+    ) -> Tensor:
+        """Look up learned absolute features for real variants only.
+
+        Padding is mask-authoritative: padded rows may contain coordinate
+        sentinels such as position 0 or nonsense chromosome IDs, so lookup rows
+        are computed only where ``mask`` is true. Padded outputs are forced to
+        exact zeros after embedding lookup.
+        """
+        del observed_absolute_position_features
+        if not isinstance(reference, Tensor):
+            raise ValueError("reference must be a torch.Tensor.")
+        if reference.ndim < 2:
+            raise ValueError("reference must have rank at least 2.")
+        if not isinstance(positions, Tensor):
+            raise ValueError("positions must be a torch.Tensor.")
+        if chrom_ids is None:
+            raise ValueError("chrom_ids are required for learned_binned absolute position.")
+        if not isinstance(chrom_ids, Tensor):
+            raise ValueError("chrom_ids must be a torch.Tensor.")
+        if mask is None:
+            raise ValueError("mask is required for learned_binned absolute position.")
+        if not isinstance(mask, Tensor):
+            raise ValueError("mask must be a torch.Tensor.")
+        if positions.shape != reference.shape[:-1]:
+            raise ValueError("positions shape must equal reference.shape[:-1].")
+        if chrom_ids.shape != reference.shape[:-1]:
+            raise ValueError("chrom_ids shape must equal reference.shape[:-1].")
+        if mask.shape != reference.shape[:-1]:
+            raise ValueError("mask shape must equal reference.shape[:-1].")
+        if mask.dtype is not torch.bool:
+            raise ValueError("mask must be a boolean torch.Tensor.")
+        if not _is_integer_tensor(positions):
+            raise ValueError("positions must use an integer dtype.")
+        if not _is_integer_tensor(chrom_ids):
+            raise ValueError("chrom_ids must use an integer dtype.")
+
+        device = self.embedding.weight.device
+        positions_on_device = positions.to(device=device, dtype=torch.long)
+        chrom_ids_on_device = chrom_ids.to(device=device, dtype=torch.long)
+        mask_on_device = mask.to(device=device)
+
+        safe_rows = torch.zeros_like(positions_on_device, dtype=torch.long, device=device)
+        real_positions = positions_on_device[mask_on_device]
+        real_chrom_ids = chrom_ids_on_device[mask_on_device]
+        if real_positions.numel() > 0:
+            if torch.any(real_positions < 1):
+                raise ValueError("real learned_binned positions must be >= 1.")
+            if torch.any(real_chrom_ids < 0) or torch.any(
+                real_chrom_ids >= len(self.layout.chromosome_lengths_bp)
+            ):
+                raise ValueError("real chrom_ids must satisfy 0 <= chrom_id < num_chromosomes.")
+
+            lengths = torch.tensor(
+                self.layout.chromosome_lengths_bp,
+                dtype=torch.long,
+                device=device,
+            )
+            real_lengths = lengths[real_chrom_ids]
+            if torch.any(real_positions > real_lengths):
+                raise ValueError("real learned_binned positions must not exceed chromosome length.")
+
+            offsets = torch.tensor(
+                self.layout.chromosome_offsets,
+                dtype=torch.long,
+                device=device,
+            )
+            local_bins = (real_positions - 1) // self.bin_size_bp
+            global_rows = offsets[real_chrom_ids] + local_bins.to(dtype=torch.long)
+            safe_rows[mask_on_device] = global_rows
+
+        resolved = self.embedding(safe_rows)
+        if resolved.dtype != reference.dtype:
+            resolved = resolved.to(dtype=reference.dtype)
+        resolved = resolved.masked_fill(~mask_on_device.unsqueeze(-1), 0)
+        return resolved
 
 
 class RelativePositionRuntime(Protocol):
@@ -367,21 +487,16 @@ def build_same_chromosome_pair_mask(chrom_ids: Tensor) -> Tensor:
     return chrom_ids[:, :, None] == chrom_ids[:, None, :]
 
 
-def validate_phase7_runtime_support(config: ResolvedPositionEncodingConfig) -> None:
-    """Validate that a resolved config is supported by the Phase 7 runtime subset."""
+def validate_attention_runtime_support(config: ResolvedPositionEncodingConfig) -> None:
+    """Validate the positional strategies executed inside attention.
+
+    Absolute-position fusion is owned by ``SIEVE`` before VariantEncoder and is
+    therefore not an attention support decision.
+    """
     if not isinstance(config, ResolvedPositionEncodingConfig):
         raise ValueError("config must be a ResolvedPositionEncodingConfig.")
     if config.preset not in {PositionPreset.LEGACY, PositionPreset.CUSTOM}:
         raise NotImplementedError(f"position preset {config.preset!r} is not supported.")
-    if config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED:
-        raise NotImplementedError("absolute_position_encoding=learned_binned is not implemented.")
-    if config.absolute.encoding not in {
-        AbsolutePositionEncoding.NONE,
-        AbsolutePositionEncoding.SINUSOIDAL,
-    }:
-        raise NotImplementedError(
-            f"absolute_position_encoding={config.absolute.encoding.value} is not implemented."
-        )
     if config.relative.encoding in {
         RelativePositionEncoding.ROPE,
         RelativePositionEncoding.ALIBI_FIXED,
@@ -411,11 +526,131 @@ def validate_phase7_runtime_support(config: ResolvedPositionEncodingConfig) -> N
         )
 
 
+def validate_learned_binned_layout_settings(
+    layout: LearnedBinnedAbsolutePositionLayout,
+    *,
+    bin_size_bp: int,
+    position_dim: int,
+    num_chromosomes: int,
+) -> None:
+    """Validate layout metadata against model-side learned-binned dimensions."""
+    if not isinstance(layout, LearnedBinnedAbsolutePositionLayout):
+        raise ValueError(
+            "learned_binned_position_layout must be a LearnedBinnedAbsolutePositionLayout."
+        )
+    _validate_positive_int(
+        "learned_binned_position_layout.schema_version",
+        layout.schema_version,
+    )
+    if layout.schema_version != LEARNED_BINNED_LAYOUT_SCHEMA_VERSION:
+        raise ValueError("learned_binned_position_layout.schema_version is unsupported.")
+    _validate_positive_int(
+        "learned_binned_position_layout.coordinate_origin",
+        layout.coordinate_origin,
+    )
+    if layout.coordinate_origin != LEARNED_BINNED_COORDINATE_ORIGIN:
+        raise ValueError("learned_binned_position_layout.coordinate_origin must be 1.")
+    if not isinstance(layout.layout, str):
+        raise ValueError("learned_binned_position_layout.layout must be a string.")
+    if layout.layout != LEARNED_BINNED_LAYOUT:
+        raise ValueError(
+            "learned_binned_position_layout.layout must be chromosome_local_contiguous."
+        )
+    _validate_positive_int(
+        "learned_binned_position_layout.num_embeddings",
+        layout.num_embeddings,
+    )
+    _validate_positive_int("position_encoding.absolute.bin_size_bp", bin_size_bp)
+    _validate_positive_int("position_encoding.absolute.position_dim", position_dim)
+    _validate_positive_int("position_encoding.chromosome.num_chromosomes", num_chromosomes)
+    if len(layout.chromosome_lengths_bp) != num_chromosomes:
+        raise ValueError(
+            "learned_binned_position_layout.chromosome_lengths_bp length must match "
+            "position_encoding.chromosome.num_chromosomes."
+        )
+    if len(layout.bins_per_chromosome) != num_chromosomes:
+        raise ValueError(
+            "learned_binned_position_layout.bins_per_chromosome length must match "
+            "position_encoding.chromosome.num_chromosomes."
+        )
+    if layout.num_embeddings != sum(layout.bins_per_chromosome):
+        raise ValueError(
+            "learned_binned_position_layout.num_embeddings must equal sum(bins_per_chromosome)."
+        )
+    for idx, (length, bins) in enumerate(
+        zip(layout.chromosome_lengths_bp, layout.bins_per_chromosome, strict=True)
+    ):
+        _validate_positive_int(
+            f"learned_binned_position_layout.chromosome_lengths_bp[{idx}]",
+            length,
+        )
+        _validate_positive_int(
+            f"learned_binned_position_layout.bins_per_chromosome[{idx}]",
+            bins,
+        )
+        expected_bins = (length + bin_size_bp - 1) // bin_size_bp
+        if bins != expected_bins:
+            raise ValueError(
+                "learned_binned_position_layout.bins_per_chromosome must match "
+                "chromosome_lengths_bp and bin_size_bp."
+            )
+
+
+def validate_model_runtime_support(
+    config: ResolvedPositionEncodingConfig,
+    *,
+    learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
+) -> None:
+    """Validate positional strategies executed by SIEVE as a complete model."""
+    validate_attention_runtime_support(config)
+    if config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED:
+        if config.absolute.bin_size_bp is None or config.absolute.position_dim is None:
+            raise ValueError("resolved learned_binned absolute-position settings are incomplete.")
+        validate_learned_binned_layout_settings(
+            learned_binned_position_layout,
+            bin_size_bp=config.absolute.bin_size_bp,
+            position_dim=config.absolute.position_dim,
+            num_chromosomes=config.chromosome.num_chromosomes,
+        )
+        return
+    if learned_binned_position_layout is not None:
+        raise ValueError(
+            "learned_binned_position_layout is only valid for absolute_position_encoding=learned_binned."
+        )
+    if config.absolute.encoding not in {
+        AbsolutePositionEncoding.NONE,
+        AbsolutePositionEncoding.SINUSOIDAL,
+    }:
+        raise NotImplementedError(
+            f"absolute_position_encoding={config.absolute.encoding.value} is not implemented."
+        )
+
+
+def validate_phase7_runtime_support(config: ResolvedPositionEncodingConfig) -> None:
+    """Validate that a resolved config is supported by external Phase 7 entry points."""
+    validate_attention_runtime_support(config)
+    if config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED:
+        raise NotImplementedError("absolute_position_encoding=learned_binned is not implemented.")
+    if config.absolute.encoding not in {
+        AbsolutePositionEncoding.NONE,
+        AbsolutePositionEncoding.SINUSOIDAL,
+    }:
+        raise NotImplementedError(
+            f"absolute_position_encoding={config.absolute.encoding.value} is not implemented."
+        )
+
+
 def build_absolute_position_runtime(
     config: ResolvedPositionEncodingConfig,
+    *,
+    learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
+    absolute_position_embedding: nn.Embedding | None = None,
 ) -> AbsolutePositionRuntime:
-    """Build the parameterless absolute-position runtime for a resolved config."""
-    validate_phase7_runtime_support(config)
+    """Build the absolute-position runtime for a resolved config."""
+    validate_model_runtime_support(
+        config,
+        learned_binned_position_layout=learned_binned_position_layout,
+    )
     if config.preset is PositionPreset.LEGACY:
         return ObservedAbsolutePositionRuntime()
     if config.absolute.encoding is AbsolutePositionEncoding.NONE:
@@ -432,6 +667,15 @@ def build_absolute_position_runtime(
             coordinate_scale=config.absolute.coordinate_scale,
             max_wavelength=config.absolute.max_wavelength,
         )
+    if config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED:
+        if absolute_position_embedding is None:
+            raise ValueError("absolute_position_embedding is required for learned_binned.")
+        return LearnedBinnedAbsolutePositionRuntime(
+            embedding=absolute_position_embedding,
+            layout=learned_binned_position_layout,
+            bin_size_bp=config.absolute.bin_size_bp,
+            position_dim=config.absolute.position_dim,
+        )
     raise NotImplementedError(
         f"absolute_position_encoding={config.absolute.encoding.value} is not implemented."
     )
@@ -441,7 +685,7 @@ def build_relative_position_runtime(
     config: ResolvedPositionEncodingConfig,
 ) -> RelativePositionRuntime:
     """Build the parameterless relative-position runtime for a resolved config."""
-    validate_phase7_runtime_support(config)
+    validate_attention_runtime_support(config)
     if config.preset is PositionPreset.LEGACY:
         if config.relative.num_buckets is None or config.relative.max_distance_bp is None:
             raise ValueError("resolved legacy T5 settings are incomplete.")
@@ -488,3 +732,13 @@ def _validate_t5_settings(num_position_buckets: int, max_distance: int) -> None:
         raise ValueError("num_position_buckets must be even.")
     if max_distance <= num_position_buckets // 4:
         raise ValueError("max_distance must be greater than num_position_buckets // 4.")
+
+
+def _is_integer_tensor(value: Tensor) -> bool:
+    return value.dtype in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }
