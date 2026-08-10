@@ -1949,7 +1949,123 @@ Known limitations:
 - Explanation does not yet reconstruct or attribute learned-binned models.
 - Layout-to-live-dataset mapping verification remains deferred.
 
+## Phase 8B3 - Learned-Binned Training and Strict Reconstruction
+
+Goal:
+
+Enable learned-binned absolute position for new training model construction
+and authoritative schema-v2 checkpoint reconstruction, without changing
+explanation or compatibility checkpoint semantics.
+
+Exact files changed:
+
+- `scripts/train.py`
+- `src/models/reconstruction.py`
+- `tests/test_learned_binned_training_reconstruction.py`
+- `tests/test_position_training_phase7.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Training now validates the current training strategy surface with
+  `validate_attention_runtime_support()` during pure resolution, so
+  `absolute_position_encoding=learned_binned` is accepted while unsupported
+  attention-owned RoPE and ALiBi strategies still fail.
+- The serialized learned-binned layout is the sole architecture authority for
+  model construction. Training resolves the config, builds `run_metadata`,
+  reads the exact `run_metadata["position_encoding"]`, parses
+  `position_encoding.absolute.binning`, validates model support with that
+  parsed layout, and only then persists the normalized metadata to
+  `config.yaml`.
+- CV and single-split training reuse the same immutable parsed layout object
+  for every model created in the run. No per-fold or single-split layout is
+  rebuilt from genome/chromosome inputs.
+- `create_model()` and `create_training_model()` now accept
+  `learned_binned_position_layout` and pass it to `SIEVE`; `ChunkedSIEVEModel`
+  itself remains unchanged.
+- Authoritative Case-A reconstruction parses learned-binned layout metadata
+  from the saved `position_encoding.absolute.binning` extension, validates the
+  complete model strategy with `validate_model_runtime_support()`, allocates
+  the exact embedding table shape, and then loads with `strict=True`.
+- Missing or malformed learned-binned `absolute.binning` rejects Case-A
+  reconstruction. Reconstruction does not infer table architecture from
+  checkpoint tensor shape, current genome metadata, observed positions, or
+  defaults.
+- `reconstruct_sieve_from_checkpoint()` now accepts optional
+  `dataset_chrom_index`. For Case-A learned-binned reconstruction, a supplied
+  live dataset mapping must exactly invert the saved
+  `position_encoding.chromosome.mapping`, because learned-bin row identity is
+  chromosome-ID identity. Supplying only `dataset_num_chromosomes` for
+  learned-binned is rejected; pure checkpoint reconstruction with neither live
+  dataset argument remains allowed.
+- No learned-binned checkpoint migration was added. Wrong embedding row count,
+  wrong embedding width, missing learned embedding, or unexpected learned
+  embedding under a non-learned strategy fail through native strict PyTorch
+  state loading.
+
+Runtime behavior:
+
+- New training can construct learned-binned models with supported relative
+  strategies (`none` and `t5_bucket`).
+- Learned-binned training models contain
+  `base_model.absolute_position_embedding.weight` in chunked model state, with
+  shape `(serialized_layout.num_embeddings, resolved.absolute.position_dim)`
+  and zero initialization before training updates.
+- Tiny split-primary forward/backward through a training-created learned-binned
+  model reaches selected embedding rows.
+- Custom `none`, custom `sinusoidal`, explicit legacy, and historical no-config
+  paths keep their existing state surfaces and do not gain learned-binned
+  embedding keys.
+
+Compatibility effects:
+
+- Case A is strict and config-primary. Config/checkpoint metadata conflicts in
+  nested learned-binned binning or chromosome mapping continue to reject before
+  model loading.
+- Cases B and C remain unchanged and state-driven. They do not parse or execute
+  learned-binned metadata as architecture, and the only compatibility migration
+  remains the historical T5 32-row to 33-row position-bias upgrade.
+- Explanation remains deferred. `scripts/explain.py` still passes only
+  `dataset_num_chromosomes`, so learned-binned explanation may fail until the
+  Phase 8B4 caller supplies the live chromosome mapping.
+
+Validation:
+
+- `tests/test_learned_binned_training_reconstruction.py`: 20 passed.
+- Training focused command passed 127 tests.
+- Reconstruction focused command passed 107 tests.
+- Runtime regression command passed 156 tests.
+- Broader focused command passed 389 tests.
+- Full test suite passed 1121 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `scripts/train.py`,
+  `src/models/reconstruction.py`, and
+  `tests/test_learned_binned_training_reconstruction.py`.
+- `git diff --check` passed.
+- New test file `tests/test_learned_binned_training_reconstruction.py` passed
+  Ruff, Black check with Python 3.10 target, and isort.
+
+Baseline static debt:
+
+- Modified production files retained matching Ruff debt: committed baseline
+  and current code both report 20 findings across `scripts/train.py` and
+  `src/models/reconstruction.py`.
+- Modified production files improved isort status from 2 baseline import-order
+  errors to 1 current `scripts/train.py` import-order error.
+- Modified production files improved Black status from 2 baseline files that
+  Black would reformat to 1 current file (`scripts/train.py`). Combined
+  two-file production Black checks hung and were interrupted; per-file checks
+  completed.
+
+Known limitations:
+
+- Learned-binned explanation and content-IG end-to-end integration remain
+  deferred.
+- Live dataset mapping compatibility is enforced only for authoritative
+  schema-v2 learned-binned reconstruction.
+- Training still does not run real datasets in this development environment;
+  coverage uses deterministic unit tensors only.
+
 ## Next planned phase
 
-Phase 8B3 - learned-binned training serialization consumption and strict
-checkpoint reconstruction.
+Phase 8B4 - learned-binned explanation and content-IG end-to-end integration.

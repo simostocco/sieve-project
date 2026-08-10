@@ -23,11 +23,17 @@ import torch
 import torch.nn as nn
 
 from src.encoding.position_config import (
+    AbsolutePositionEncoding,
     ResolvedPositionEncodingConfig,
     resolved_position_encoding_from_dict,
 )
+from src.encoding.position_layout import (
+    LearnedBinnedAbsolutePositionLayout,
+    learned_binned_layout_from_position_encoding_dict,
+    validate_saved_chromosome_mapping_matches_chrom_index,
+)
 from src.models.chunked_sieve import ChunkedSIEVEModel
-from src.models.position_runtime import validate_phase7_runtime_support
+from src.models.position_runtime import validate_model_runtime_support
 from src.models.sieve import SIEVE, load_state_dict_with_legacy_upgrade
 
 
@@ -49,6 +55,7 @@ def reconstruct_sieve_from_checkpoint(
     *,
     num_genes: int,
     dataset_num_chromosomes: int | None = None,
+    dataset_chrom_index: Mapping[str, int] | None = None,
 ) -> ReconstructedSIEVEModel:
     """Reconstruct a SIEVE or ChunkedSIEVEModel from in-memory metadata.
 
@@ -73,6 +80,7 @@ def reconstruct_sieve_from_checkpoint(
             is_chunked=topology == "chunked",
             num_genes=num_genes,
             dataset_num_chromosomes=dataset_num_chromosomes,
+            dataset_chrom_index=dataset_chrom_index,
         )
     return _reconstruct_compatibility_case(
         config,
@@ -156,6 +164,7 @@ def _reconstruct_case_a(
     is_chunked: bool,
     num_genes: int,
     dataset_num_chromosomes: int | None,
+    dataset_chrom_index: Mapping[str, int] | None,
 ) -> ReconstructedSIEVEModel:
     effective_config = _reconcile_case_a_config(config, checkpoint.get("metadata"))
     _require_top_level(effective_config, "config_schema_version")
@@ -170,7 +179,16 @@ def _reconstruct_case_a(
         latent_dim=latent_dim,
         num_heads=num_heads,
     )
-    validate_phase7_runtime_support(resolved)
+    learned_binned_position_layout = _case_a_learned_binned_layout(
+        resolved,
+        position_data,
+        dataset_num_chromosomes=dataset_num_chromosomes,
+        dataset_chrom_index=dataset_chrom_index,
+    )
+    validate_model_runtime_support(
+        resolved,
+        learned_binned_position_layout=learned_binned_position_layout,
+    )
     _validate_case_a_structure(
         effective_config,
         resolved,
@@ -183,6 +201,7 @@ def _reconstruct_case_a(
         num_genes=num_genes,
         num_chromosomes=resolved.chromosome.num_chromosomes,
         position_encoding=resolved,
+        learned_binned_position_layout=learned_binned_position_layout,
     )
     model = _wrap_if_chunked(base_model, effective_config, is_chunked=is_chunked)
     model.load_state_dict(dict(state_dict), strict=True)
@@ -243,6 +262,7 @@ def _build_base_model(
     num_genes: int,
     num_chromosomes: int,
     position_encoding: ResolvedPositionEncodingConfig | None,
+    learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
 ) -> SIEVE:
     return SIEVE(
         input_dim=input_dim,
@@ -260,6 +280,7 @@ def _build_base_model(
         num_chromosomes=num_chromosomes,
         classifier_type=str(config.get("classifier_type", "flatten")),
         position_encoding=position_encoding,
+        learned_binned_position_layout=learned_binned_position_layout,
     )
 
 
@@ -343,6 +364,48 @@ def _merge_mapping_exact(
             target[key] = nested
         elif not _same_scalar_value(existing, value):
             raise ValueError(f"checkpoint metadata conflict at {dotted}")
+
+
+def _case_a_learned_binned_layout(
+    resolved: ResolvedPositionEncodingConfig,
+    position_data: Mapping[str, object],
+    *,
+    dataset_num_chromosomes: int | None,
+    dataset_chrom_index: Mapping[str, int] | None,
+) -> LearnedBinnedAbsolutePositionLayout | None:
+    """Return the authoritative learned-binned layout for schema-v2 execution.
+
+    For learned-binned checkpoints, ``position_encoding.absolute.binning`` is
+    the model architecture contract. Reconstruction must allocate the embedding
+    table from that saved layout before strict state loading; checkpoint tensor
+    shapes are not a source of layout inference or migration.
+    """
+    if resolved.absolute.encoding is not AbsolutePositionEncoding.LEARNED_BINNED:
+        return None
+    chromosome = position_data.get("chromosome")
+    if not isinstance(chromosome, Mapping):
+        raise ValueError("position_encoding.chromosome must be a mapping")
+    chromosome_mapping = chromosome.get("mapping")
+    if not isinstance(chromosome_mapping, Mapping):
+        raise ValueError("position_encoding.chromosome.mapping must be a mapping")
+
+    # Learned-bin row identity is chromosome-ID identity. Cardinality alone
+    # cannot prove that a live dataset maps row 0/1/... to the same chromosomes.
+    if dataset_chrom_index is not None:
+        validate_saved_chromosome_mapping_matches_chrom_index(
+            chromosome_mapping,
+            dataset_chrom_index,
+        )
+    elif dataset_num_chromosomes is not None:
+        raise ValueError(
+            "dataset_chrom_index is required for learned_binned reconstruction "
+            "when dataset_num_chromosomes is supplied"
+        )
+
+    return learned_binned_layout_from_position_encoding_dict(
+        position_data,
+        chromosome_mapping=chromosome_mapping,
+    )
 
 
 def _validate_case_a_structure(

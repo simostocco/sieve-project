@@ -56,10 +56,15 @@ from src.encoding.position_config import (
     resolve_position_encoding_config,
 )
 from src.encoding.position_layout import (
+    LearnedBinnedAbsolutePositionLayout,
     build_learned_binned_absolute_position_layout,
+    learned_binned_layout_from_position_encoding_dict,
 )
 from src.models import SIEVE, ChunkedSIEVEModel
-from src.models.position_runtime import validate_phase7_runtime_support
+from src.models.position_runtime import (
+    validate_attention_runtime_support,
+    validate_model_runtime_support,
+)
 from src.training import (
     SIEVELoss,
     Trainer,
@@ -309,7 +314,7 @@ def prepare_training_position_encoding(
         num_heads=args.num_heads,
         num_chromosomes=num_chromosomes,
     )
-    validate_phase7_runtime_support(resolved)
+    validate_attention_runtime_support(resolved)
 
     if request.preset is PositionPreset.LEGACY:
         historical_input_dim = get_feature_dimension(annotation_level)
@@ -320,6 +325,42 @@ def prepare_training_position_encoding(
             )
 
     return resolved
+
+
+def _training_learned_binned_layout_from_metadata(
+    resolved_position_encoding: ResolvedPositionEncodingConfig,
+    position_encoding_metadata: Mapping[str, object],
+) -> LearnedBinnedAbsolutePositionLayout | None:
+    """Parse the exact serialized learned-bin layout used for training.
+
+    ``serialize_position_encoding_for_training()`` is the only place that
+    builds learned-binned layout metadata from genome/chromosome inputs. Model
+    construction consumes that serialized architecture contract instead of
+    rebuilding a parallel layout that could drift from saved config/checkpoint
+    metadata.
+    """
+    if (
+        resolved_position_encoding.absolute.encoding
+        is not AbsolutePositionEncoding.LEARNED_BINNED
+    ):
+        return None
+    if not isinstance(position_encoding_metadata, Mapping):
+        raise ValueError("position_encoding metadata must be a mapping")
+    chromosome = position_encoding_metadata.get("chromosome")
+    if not isinstance(chromosome, Mapping):
+        raise ValueError("position_encoding.chromosome must be a mapping")
+    chromosome_mapping = chromosome.get("mapping")
+    if not isinstance(chromosome_mapping, Mapping):
+        raise ValueError("position_encoding.chromosome.mapping must be a mapping")
+    layout = learned_binned_layout_from_position_encoding_dict(
+        position_encoding_metadata,
+        chromosome_mapping=chromosome_mapping,
+    )
+    validate_model_runtime_support(
+        resolved_position_encoding,
+        learned_binned_position_layout=layout,
+    )
+    return layout
 
 
 def _canonical_index_items(
@@ -578,6 +619,7 @@ def create_model(
     num_chromosomes: int = 0,
     classifier_type: str = 'flatten',
     position_encoding: ResolvedPositionEncodingConfig | None = None,
+    learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
 ) -> ChunkedSIEVEModel:
     """
     Create Chunked SIEVE model for whole-genome processing.
@@ -597,6 +639,7 @@ def create_model(
         num_chromosomes=num_chromosomes,
         classifier_type=classifier_type,
         position_encoding=position_encoding,
+        learned_binned_position_layout=learned_binned_position_layout,
     )
 
     # Wrap in chunked model for whole-genome coverage
@@ -616,6 +659,7 @@ def create_training_model(
     num_genes: int,
     num_chromosomes: int,
     num_covariates: int,
+    learned_binned_position_layout: LearnedBinnedAbsolutePositionLayout | None = None,
 ) -> ChunkedSIEVEModel:
     """Create the new-schema training model from the resolved positional config."""
     return create_model(
@@ -630,6 +674,7 @@ def create_training_model(
         num_chromosomes=num_chromosomes,
         classifier_type=args.classifier_type,
         position_encoding=resolved_position_encoding,
+        learned_binned_position_layout=learned_binned_position_layout,
     )
 
 
@@ -1025,6 +1070,15 @@ def main():
         chromosome_mapping_sha256=str(dataset_identity["chromosome_mapping_sha256"]),
         training_mode=training_mode,
     )
+    serialized_position_encoding = run_metadata["position_encoding"]
+    learned_binned_position_layout = _training_learned_binned_layout_from_metadata(
+        resolved_position_encoding,
+        serialized_position_encoding,
+    )
+    validate_model_runtime_support(
+        resolved_position_encoding,
+        learned_binned_position_layout=learned_binned_position_layout,
+    )
     _update_saved_config(config_path, **run_metadata)
     print(f"Content dimension: {resolved_position_encoding.content_dim}")
     print(f"Resolved model input dimension: {input_dim}")
@@ -1128,6 +1182,7 @@ def main():
                 num_genes=num_genes,
                 num_covariates=num_covariates,
                 num_chromosomes=dataset.num_chromosomes,
+                learned_binned_position_layout=learned_binned_position_layout,
             )
 
             # Create fold checkpoint directory
@@ -1260,6 +1315,7 @@ def main():
             num_genes=num_genes,
             num_covariates=num_covariates,
             num_chromosomes=dataset.num_chromosomes,
+            learned_binned_position_layout=learned_binned_position_layout,
         )
 
         # Resolve class weighting for this split

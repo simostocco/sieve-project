@@ -146,14 +146,6 @@ def test_non_chromosome_aware_control_resolves_with_zero_chromosomes(absolute):
     [
         [
             "--absolute-position-encoding",
-            "learned_binned",
-            "--relative-position-encoding",
-            "none",
-            "--chromosome-encoding",
-            "none",
-        ],
-        [
-            "--absolute-position-encoding",
             "none",
             "--relative-position-encoding",
             "rope",
