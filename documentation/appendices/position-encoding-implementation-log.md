@@ -2362,6 +2362,91 @@ Known limitations:
   RoPE training, strict reconstruction, explanation, IG, provenance, and
   attention lifecycle validation remains to be completed.
 
+## Phase 9C - RoPE Training, Strict Reconstruction, and Explanation Lifecycle
+
+Goal:
+
+Complete RoPE lifecycle validation across training metadata, strict
+schema-v2 reconstruction, explanation reconstruction, content IG, attention
+analysis, and learned-binned composition without changing production runtime
+code.
+
+Exact files changed:
+
+- `tests/test_rope_lifecycle_phase9.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added deterministic lifecycle tests proving training resolves and serializes
+  RoPE `separate` and `mask` configurations with the expected normalized
+  position metadata and execution metadata.
+- Added tests proving serialized RoPE training metadata round-trips through
+  `resolved_position_encoding_from_dict()` without losing non-default
+  `rope_coordinate_scale`, `rope_base`, cross-chromosome policy, or resolved
+  content/input dimensions.
+- Added training-created model tests for RoPE `separate` and `mask`, including
+  exact relative-position state surfaces, split-primary forward execution, and
+  finite backward propagation for the `separate` path.
+- Added strict schema-v2 reconstruction tests for base SIEVE and chunked SIEVE
+  RoPE checkpoints, including nonzero cross-chromosome bias restoration,
+  multi-layer required-key coverage, corrupt relative-state rejection, and
+  metadata/config conflict rejection before state authority is applied.
+- Added explanation lifecycle tests proving schema-v2 RoPE reconstruction
+  restores state, selects content IG policy with the expected provenance,
+  keeps RoPE position context fixed during content IG, and exposes split-primary
+  attention through `AttentionAnalyzer`.
+- Added a deterministic position-sensitivity regression showing RoPE
+  same-chromosome attention changes when positions change.
+- Added a learned-binned absolute plus RoPE relative lifecycle test proving the
+  strict reconstruction path restores both learned absolute embedding state and
+  RoPE cross-chromosome bias state together.
+
+Runtime behavior:
+
+- No production code changed in this phase.
+- RoPE model behavior remains the Phase 9B implementation: split-primary
+  batches are recomposed into the historical VariantEncoder representation,
+  RoPE rotates Q/K for same-chromosome pairs, and RoPE `separate`
+  cross-chromosome pairs use base scores plus the learned per-head bias.
+- Historical feature semantics and ordering remain preserved.
+- `features` remains the compatibility fallback when split tensors are absent.
+- No training, reconstruction, explanation, attention-analysis, or IG runtime
+  path was modified.
+
+Compatibility effects:
+
+- Schema-v2 RoPE configs are now covered end to end by tests for training
+  metadata, strict reconstruction, explanation reconstruction, content IG, and
+  attention extraction.
+- RoPE `separate` state is protected by exact required-key and forbidden-key
+  tests; RoPE `mask` is protected against accidental relative state.
+- State-dict compatibility remains the mechanism for restoring historical
+  checkpoints; no migration path or checkpoint metadata promotion was added.
+- The Phase 9C prerequisite chromosome row-identity guard remains in force for
+  schema-v2 architectures with chromosome-row-indexed learned state.
+- Learned-binned absolute and RoPE relative state surfaces are covered together
+  without adding chromosome-name identity validation specifically for RoPE-only
+  routing.
+
+Validation:
+
+- `tests/test_rope_lifecycle_phase9.py`: 35 passed.
+- RoPE runtime plus lifecycle command passed 78 tests.
+- Training and reconstruction lifecycle command passed 203 tests.
+- Explanation and attention lifecycle command passed 142 tests.
+- Broader focused command passed 353 tests.
+- Full test suite passed 1207 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+
+Known limitations:
+
+- No real training, dataset generation, checkpoint migration, or production
+  explanation run was executed.
+- Downstream validation scripts beyond the explanation and attention-analysis
+  paths covered by unit tests remain later-roadmap work.
+- ALiBi strategies remain unsupported.
+
 ## Next planned phase
 
-Phase 9C - RoPE training, strict reconstruction, and explanation lifecycle.
+Phase 10 - ALiBi relative positional encoding.
