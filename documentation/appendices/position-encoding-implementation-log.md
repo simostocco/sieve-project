@@ -2289,6 +2289,79 @@ Known limitations:
 - ALiBi strategies remain unsupported.
 - No real training, dataset generation, or checkpoint migration was executed.
 
+## Phase 9C Prerequisite - Schema-v2 Chromosome Row Identity
+
+Goal:
+
+Fix a schema-v2 reconstruction correctness gap discovered by the Phase 9C
+diagnostic before continuing broader RoPE lifecycle validation.
+
+Exact files changed:
+
+- `src/models/reconstruction.py`
+- `tests/test_rope_lifecycle_phase9.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Diagnostic:
+
+- A true schema-v2 model with `relative=rope` and `chromosome=learned`
+  correctly reconstructed when the live dataset mapping matched the saved
+  `position_encoding.chromosome.mapping`, but also reconstructed when live
+  chromosome IDs for chr1/chr2 were swapped.
+- That was unsafe because `chrom_embedding.weight` rows are indexed by
+  `chrom_id`, so row identity is biological architecture metadata, not merely
+  tensor shape.
+
+Implementation:
+
+- Added centralized Case-A chromosome row-identity validation in
+  `src/models/reconstruction.py`.
+- Exact chromosome mapping identity is now required when the resolved
+  schema-v2 architecture has chromosome-row-indexed learned state:
+  `chromosome=learned` or `absolute=learned_binned`.
+- The helper reuses
+  `validate_saved_chromosome_mapping_matches_chrom_index()` from
+  `src.encoding.position_layout`; no parallel comparator was introduced.
+- Authoritative schema-v2 configs with row-indexed chromosome state must carry
+  `position_encoding.chromosome.mapping`. Missing saved mapping now rejects
+  reconstruction.
+- When live `dataset_chrom_index` is supplied, exact inverse mapping equality
+  is required. When only `dataset_num_chromosomes` is supplied, reconstruction
+  rejects because cardinality cannot prove row identity. Pure checkpoint
+  reconstruction without a live dataset remains allowed when saved mapping is
+  complete.
+- `_case_a_learned_binned_layout()` now focuses on learned-bin layout parsing;
+  live mapping compatibility is enforced once by the centralized Case-A
+  identity helper before layout parsing.
+
+Runtime and compatibility effects:
+
+- RoPE-only configurations with `chromosome=none` still do not require exact
+  chromosome-name identity; same/cross routing depends on IDs, but RoPE owns no
+  chromosome-row-indexed parameter.
+- T5 plus `chromosome=learned` is now protected by the same row-identity guard,
+  because the learned chromosome embedding is independent of the relative
+  strategy.
+- Learned-binned exact mapping behavior remains protected after the refactor.
+- Historical Case B and transitional Case C remain state-driven compatibility
+  paths and do not acquire schema-v2 mapping policy.
+- No remapping, migration, checkpoint repair, attention-forward validation, or
+  RoPE-specific mapping check was added.
+
+Validation:
+
+- `tests/test_rope_lifecycle_phase9.py`: 11 passed.
+- Reconstruction-focused command passed 127 tests.
+- Broader positional/explanation regression command passed 317 tests.
+- Full test suite passed 1183 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+
+Known limitations:
+
+- This prerequisite fixes schema-v2 row identity only. The broader Phase 9C
+  RoPE training, strict reconstruction, explanation, IG, provenance, and
+  attention lifecycle validation remains to be completed.
+
 ## Next planned phase
 
 Phase 9C - RoPE training, strict reconstruction, and explanation lifecycle.

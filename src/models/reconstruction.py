@@ -24,6 +24,7 @@ import torch.nn as nn
 
 from src.encoding.position_config import (
     AbsolutePositionEncoding,
+    ChromosomeEncoding,
     ResolvedPositionEncodingConfig,
     resolved_position_encoding_from_dict,
 )
@@ -179,11 +180,15 @@ def _reconstruct_case_a(
         latent_dim=latent_dim,
         num_heads=num_heads,
     )
-    learned_binned_position_layout = _case_a_learned_binned_layout(
+    _validate_case_a_chromosome_row_identity(
         resolved,
         position_data,
         dataset_num_chromosomes=dataset_num_chromosomes,
         dataset_chrom_index=dataset_chrom_index,
+    )
+    learned_binned_position_layout = _case_a_learned_binned_layout(
+        resolved,
+        position_data,
     )
     validate_model_runtime_support(
         resolved,
@@ -369,9 +374,6 @@ def _merge_mapping_exact(
 def _case_a_learned_binned_layout(
     resolved: ResolvedPositionEncodingConfig,
     position_data: Mapping[str, object],
-    *,
-    dataset_num_chromosomes: int | None,
-    dataset_chrom_index: Mapping[str, int] | None,
 ) -> LearnedBinnedAbsolutePositionLayout | None:
     """Return the authoritative learned-binned layout for schema-v2 execution.
 
@@ -382,30 +384,65 @@ def _case_a_learned_binned_layout(
     """
     if resolved.absolute.encoding is not AbsolutePositionEncoding.LEARNED_BINNED:
         return None
+    chromosome_mapping = _case_a_saved_chromosome_mapping(position_data)
+
+    return learned_binned_layout_from_position_encoding_dict(
+        position_data,
+        chromosome_mapping=chromosome_mapping,
+    )
+
+
+def _validate_case_a_chromosome_row_identity(
+    resolved: ResolvedPositionEncodingConfig,
+    position_data: Mapping[str, object],
+    *,
+    dataset_num_chromosomes: int | None,
+    dataset_chrom_index: Mapping[str, int] | None,
+) -> None:
+    """Validate schema-v2 chromosome row identity when model state is row-indexed.
+
+    Learned chromosome embeddings are indexed directly by ``chrom_id``.
+    Learned-binned absolute-position tables are also chromosome-ID dependent.
+    For those strategies, chromosome IDs carry learned row identity and a live
+    dataset must use the same chromosome-name-to-ID mapping as training. RoPE
+    and T5 cross-chromosome routing alone do not require exact chromosome-name
+    identity because they do not own chromosome-row-indexed parameters.
+    """
+    if not _requires_exact_chromosome_mapping(resolved):
+        return
+
+    saved_mapping = _case_a_saved_chromosome_mapping(position_data)
+    if dataset_chrom_index is not None:
+        validate_saved_chromosome_mapping_matches_chrom_index(
+            saved_mapping,
+            dataset_chrom_index,
+        )
+    elif dataset_num_chromosomes is not None:
+        raise ValueError(
+            "dataset_chrom_index is required for schema-v2 reconstruction when "
+            "chromosome row-indexed state is present"
+        )
+
+
+def _requires_exact_chromosome_mapping(
+    resolved: ResolvedPositionEncodingConfig,
+) -> bool:
+    return (
+        resolved.chromosome.encoding is ChromosomeEncoding.LEARNED
+        or resolved.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED
+    )
+
+
+def _case_a_saved_chromosome_mapping(
+    position_data: Mapping[str, object],
+) -> Mapping[str, object]:
     chromosome = position_data.get("chromosome")
     if not isinstance(chromosome, Mapping):
         raise ValueError("position_encoding.chromosome must be a mapping")
     chromosome_mapping = chromosome.get("mapping")
     if not isinstance(chromosome_mapping, Mapping):
         raise ValueError("position_encoding.chromosome.mapping must be a mapping")
-
-    # Learned-bin row identity is chromosome-ID identity. Cardinality alone
-    # cannot prove that a live dataset maps row 0/1/... to the same chromosomes.
-    if dataset_chrom_index is not None:
-        validate_saved_chromosome_mapping_matches_chrom_index(
-            chromosome_mapping,
-            dataset_chrom_index,
-        )
-    elif dataset_num_chromosomes is not None:
-        raise ValueError(
-            "dataset_chrom_index is required for learned_binned reconstruction "
-            "when dataset_num_chromosomes is supplied"
-        )
-
-    return learned_binned_layout_from_position_encoding_dict(
-        position_data,
-        chromosome_mapping=chromosome_mapping,
-    )
+    return chromosome_mapping
 
 
 def _validate_case_a_structure(
