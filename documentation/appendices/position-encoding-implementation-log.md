@@ -2171,6 +2171,124 @@ Known limitations:
   but no real explanation dataset or training run was executed.
 - RoPE and ALiBi remain future positional strategies.
 
+## Phase 9B - RoPE Runtime and Attention State Surface
+
+Goal:
+
+Implement RoPE relative-position execution inside the existing positional
+runtime and attention interfaces while preserving historical T5/none numerics,
+state-dict compatibility for existing strategies, and all training,
+reconstruction, explanation, preprocessing, and checkpoint lifecycle behavior.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `src/models/attention.py`
+- `tests/test_rope_position_runtime.py`
+- `tests/test_position_runtime_phase7_baselines.py`
+- `tests/test_position_training_phase7.py`
+- `tests/test_position_reconstruction_phase7.py`
+- `tests/test_learned_binned_position_runtime.py`
+- `tests/test_learned_binned_training_reconstruction.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `RopeRelativePositionRuntime`, a parameter-free runtime that rotates Q
+  and K using adjacent feature pairs and the standard inverse-frequency formula
+  `rope_base ** (-arange(0, head_dim, 2) / head_dim)`.
+- RoPE uses the raw 1-based positions already present in batches. Padded
+  `position=0` is accepted by the runtime itself because it has no mask; the
+  attention layer validates that real, unmasked RoPE positions are `>= 1`.
+- RoPE rotates only Q/K. V is never rotated.
+- RoPE dtype policy is local to the runtime: float64 Q/K use float64 trig,
+  rotation, and score matmul; every other floating Q/K dtype uses float32 for
+  trig, rotation, and score matmul. Routed scores are cast back to
+  `base_scores.dtype`.
+- RoPE requires `base_scores` to be floating-point before score routing, so
+  rotated scores cannot be silently quantized by an integer compatibility score
+  tensor.
+- Added a `cross_chromosome_bias` argument to the relative runtime API.
+  T5/legacy/none runtimes reject a supplied cross bias so accidental wiring is
+  visible rather than silently ignored.
+- For RoPE with cross-chromosome `separate`, attention registers one learned
+  per-head `cross_chromosome_bias` parameter with shape `(num_heads,)`; no key
+  is registered for RoPE `mask`, T5, none, or legacy paths.
+- RoPE same-chromosome pairs use rotated scores. RoPE separate
+  cross-chromosome pairs use unrotated base scores plus the per-head learned
+  cross bias. RoPE mask cross-chromosome pairs use the unrotated base score and
+  rely on the existing chromosome-aware attention mask to remove them.
+- `build_relative_position_runtime()` now accepts `head_dim` for RoPE runtime
+  construction. Non-RoPE construction keeps its previous defaults and state
+  surfaces.
+- `validate_attention_runtime_support()` now allows RoPE. The older
+  `validate_phase7_runtime_support()` helper explicitly continues to reject
+  RoPE so Phase-7 contract tests remain frozen.
+
+Runtime behavior:
+
+- Historical no-config legacy attention, custom none, and custom T5 retain
+  their existing score mathematics and state-dict keys.
+- RoPE requires chromosome IDs for same/cross-chromosome routing. It does not
+  add learned-binned-style chromosome-name identity validation; exact mapping
+  identity remains required only for strategies with chromosome-row-indexed
+  parameters.
+- RoPE separate introduces only the dedicated
+  `attention.attention_layers.*.cross_chromosome_bias` parameter. RoPE mask
+  introduces no relative-position parameter.
+- Model forward/backward, returned attention weights, padding behavior, learned
+  chromosome embeddings, learned-binned absolute embeddings, and chunked model
+  state-prefix behavior are covered with deterministic unit tensors.
+- A direct split-primary model test covers learned-binned absolute runtime and
+  RoPE relative runtime composing in one forward/backward pass.
+- No training CLI, config serialization, checkpoint reconstruction,
+  explanation, gradients, attention analysis, preprocessing, or dataset
+  implementation changed in this phase.
+
+Compatibility effects:
+
+- Existing state dicts for historical legacy, custom none, custom T5, and
+  learned-binned absolute runtime remain protected by exact key-set tests.
+- The cross-bias parameter exists only when the resolved architecture is
+  `relative=rope` with `cross_chromosome_policy=separate`; there is no
+  zero-sized compatibility parameter or buffer placeholder.
+- Lifecycle helpers that use the attention-runtime support gate may now accept
+  RoPE. Tests that intentionally describe unsupported future strategies now use
+  ALiBi, while the Phase-7-specific gate directly proves RoPE remains rejected
+  there.
+
+Validation:
+
+- `tests/test_rope_position_runtime.py`: 43 passed.
+- RoPE plus Phase-7 runtime/model/config focused command passed 263 tests.
+- Training, reconstruction, and explanation lifecycle command passed 140
+  tests.
+- Learned-binned compatibility command passed 62 tests.
+- Full test suite passed 1172 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `src/models/position_runtime.py`,
+  `src/models/attention.py`, and `tests/test_rope_position_runtime.py`.
+- `git diff --check` passed.
+- New test file `tests/test_rope_position_runtime.py` passed Ruff, Black check
+  with Python 3.10 target, and isort.
+- Modified pre-existing Python files retained matching Ruff debt: committed
+  baseline and current code both report 13 findings across the touched
+  production and test files.
+- Current touched pre-existing Python files passed isort. The committed
+  baseline has import-order findings in those files, so this phase introduced
+  no isort debt.
+- Per-file Black checks match the pre-existing production formatting debt in
+  `src/models/position_runtime.py` and `src/models/attention.py`; touched test
+  files are Black-clean in the current diff.
+
+Known limitations:
+
+- RoPE training, schema-v2 strict reconstruction, checkpoint compatibility
+  policy, explanation/IG policy, and downstream validation script alignment are
+  deferred to the next lifecycle phase.
+- ALiBi strategies remain unsupported.
+- No real training, dataset generation, or checkpoint migration was executed.
+
 ## Next planned phase
 
-Phase 9 - RoPE relative positional encoding.
+Phase 9C - RoPE training, strict reconstruction, and explanation lifecycle.

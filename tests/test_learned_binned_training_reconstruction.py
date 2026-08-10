@@ -190,7 +190,7 @@ def _assert_state_exact(source_state, target_state):
         assert torch.equal(target_state[key], tensor)
 
 
-def test_prepare_training_position_encoding_accepts_learned_binned_and_rejects_rope():
+def test_prepare_training_position_encoding_accepts_learned_binned_with_rope():
     resolved = _resolved_learned()
 
     assert resolved.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED
@@ -203,12 +203,14 @@ def test_prepare_training_position_encoding_accepts_learned_binned_and_rejects_r
         "--rope-base",
         "10000.0",
     )
-    with pytest.raises(NotImplementedError, match="rope"):
-        train.prepare_training_position_encoding(
-            rope_args,
-            AnnotationLevel.L3,
-            num_chromosomes=3,
-        )
+    rope_resolved = train.prepare_training_position_encoding(
+        rope_args,
+        AnnotationLevel.L3,
+        num_chromosomes=3,
+    )
+
+    assert rope_resolved.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED
+    assert rope_resolved.relative.encoding is RelativePositionEncoding.ROPE
 
 
 def test_training_serialized_layout_is_model_construction_authority():

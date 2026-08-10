@@ -329,7 +329,10 @@ def test_deserializer_rejects_bool_input_dim_that_python_would_compare_equal_to_
 
 
 def test_future_strategy_deserializes_but_reconstruction_runtime_gate_rejects():
-    config = _resolve_custom(relative=RelativePositionEncoding.ROPE)
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_FIXED,
+        alibi_distance_scale=10000.0,
+    )
     serialized = _case_a_config(config)
     parsed = resolved_position_encoding_from_dict(
         serialized["position_encoding"],
@@ -338,7 +341,7 @@ def test_future_strategy_deserializes_but_reconstruction_runtime_gate_rejects():
     )
 
     assert parsed == config
-    with pytest.raises(NotImplementedError, match="rope"):
+    with pytest.raises(NotImplementedError, match="alibi_fixed"):
         reconstruct_sieve_from_checkpoint(
             serialized,
             _checkpoint(_old_base_model(input_dim=config.input_dim)),

@@ -626,11 +626,6 @@ def test_phase7_runtime_objects_have_no_registered_or_tensor_state(runtime):
             num_chromosomes=2,
         ),
         _resolve_custom(
-            relative=RelativePositionEncoding.ROPE,
-            rope_coordinate_scale=10000.0,
-            rope_base=10000.0,
-        ),
-        _resolve_custom(
             relative=RelativePositionEncoding.ALIBI_FIXED,
             alibi_distance_scale=10000.0,
         ),
@@ -642,6 +637,17 @@ def test_phase7_runtime_objects_have_no_registered_or_tensor_state(runtime):
 )
 def test_phase7_runtime_support_rejects_unsupported_strategies(config):
     with pytest.raises(NotImplementedError, match="not implemented"):
+        validate_phase7_runtime_support(config)
+
+
+def test_phase7_runtime_support_explicitly_rejects_rope():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ROPE,
+        rope_coordinate_scale=10000.0,
+        rope_base=10000.0,
+    )
+
+    with pytest.raises(NotImplementedError, match="Phase 7"):
         validate_phase7_runtime_support(config)
 
 

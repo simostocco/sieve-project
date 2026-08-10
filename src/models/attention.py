@@ -141,7 +141,10 @@ class PositionAwareSparseAttention(nn.Module):
         else:
             self.num_position_buckets = position_encoding.relative.num_buckets or 0
             self.max_distance = position_encoding.relative.max_distance_bp or 0
-            self._relative_position_runtime = build_relative_position_runtime(position_encoding)
+            self._relative_position_runtime = build_relative_position_runtime(
+                position_encoding,
+                head_dim=self.head_dim,
+            )
 
         # Attention projections
         self.query = nn.Linear(latent_dim, latent_dim)
@@ -160,11 +163,23 @@ class PositionAwareSparseAttention(nn.Module):
             if not isinstance(total_bias_rows, int) or total_bias_rows <= 0:
                 raise ValueError("position_encoding.relative.total_bias_rows must be positive.")
             self.position_bias = nn.Embedding(total_bias_rows, num_heads)
+        elif position_encoding.relative.encoding is RelativePositionEncoding.ROPE:
+            self.position_bias = None
         else:
             raise NotImplementedError(
                 f"relative_position_encoding={position_encoding.relative.encoding.value} "
                 "is not implemented."
             )
+
+        if (
+            position_encoding is not None
+            and position_encoding.relative.encoding is RelativePositionEncoding.ROPE
+            and position_encoding.chromosome.cross_chromosome_policy
+            is CrossChromosomePolicy.SEPARATE
+        ):
+            self.cross_chromosome_bias = nn.Parameter(torch.zeros(num_heads))
+        else:
+            self.cross_chromosome_bias = None
 
         # Optional chromosome embedding added to inputs before computing Q/K/V.
         # Disambiguates variants that share a coordinate on different
@@ -314,6 +329,7 @@ class PositionAwareSparseAttention(nn.Module):
             positions=positions,
             chrom_ids=chrom_ids,
             position_bias=self.position_bias,
+            cross_chromosome_bias=self.cross_chromosome_bias,
         )
 
         if configured_execution:
@@ -388,6 +404,12 @@ class PositionAwareSparseAttention(nn.Module):
                 raise ValueError("mask must be a boolean torch.Tensor in explicit-config mode.")
             if mask.shape != positions.shape:
                 raise ValueError("mask shape must match positions shape in explicit-config mode.")
+        if self.position_encoding.relative.encoding is RelativePositionEncoding.ROPE:
+            if not _is_integer_tensor(positions):
+                raise ValueError("positions must use an integer dtype for RoPE.")
+            real_positions = positions[mask] if mask is not None else positions.reshape(-1)
+            if real_positions.numel() > 0 and torch.any(real_positions < 1):
+                raise ValueError("real RoPE positions must be >= 1.")
 
         requires_chrom_ids = self.position_encoding.chromosome.requires_chrom_ids
         if requires_chrom_ids and chrom_ids is None:
@@ -526,3 +548,13 @@ class MultiLayerAttention(nn.Module):
                 attention_list.append(attn_weights)
 
         return x, attention_list
+
+
+def _is_integer_tensor(value: Tensor) -> bool:
+    return value.dtype in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }

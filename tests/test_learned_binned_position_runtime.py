@@ -158,7 +158,6 @@ def test_attention_validation_accepts_learned_binned_absolute_for_supported_atte
 @pytest.mark.parametrize(
     "relative",
     [
-        RelativePositionEncoding.ROPE,
         RelativePositionEncoding.ALIBI_FIXED,
         RelativePositionEncoding.ALIBI_LEARNED,
     ],
@@ -191,6 +190,28 @@ def test_attention_validation_still_rejects_unimplemented_relative_strategies(re
 
     with pytest.raises(NotImplementedError, match=relative.value):
         validate_attention_runtime_support(config)
+
+
+def test_attention_validation_accepts_learned_binned_with_rope_relative():
+    config = resolve_position_encoding_config(
+        PositionEncodingRequest(
+            preset=PositionPreset.CUSTOM,
+            absolute_position_encoding=AbsolutePositionEncoding.LEARNED_BINNED,
+            relative_position_encoding=RelativePositionEncoding.ROPE,
+            chromosome_encoding=ChromosomeEncoding.NONE,
+            cross_chromosome_policy=CrossChromosomePolicy.SEPARATE,
+            position_dim=4,
+            position_bin_size=10,
+            rope_coordinate_scale=1.0,
+            rope_base=10000.0,
+        ),
+        AnnotationLevel.L3,
+        latent_dim=8,
+        num_heads=2,
+        num_chromosomes=2,
+    )
+
+    validate_attention_runtime_support(config)
 
 
 def test_phase7_external_gate_still_rejects_learned_binned():
