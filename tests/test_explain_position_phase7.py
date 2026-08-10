@@ -131,8 +131,17 @@ def _checkpoint(model):
     return {"model_state_dict": copy.deepcopy(model.state_dict())}
 
 
-def _dataset(*, num_genes=5, num_chromosomes=0):
-    return SimpleNamespace(num_genes=num_genes, num_chromosomes=num_chromosomes)
+def _dataset(*, num_genes=5, num_chromosomes=0, chrom_index=None):
+    if chrom_index is None:
+        chrom_index = {
+            name: idx
+            for idx, name in enumerate(["1", "2", "X", "Y"][:num_chromosomes])
+        }
+    return SimpleNamespace(
+        num_genes=num_genes,
+        num_chromosomes=num_chromosomes,
+        chrom_index=chrom_index,
+    )
 
 
 def _fake_reconstruction(*, config=None, is_new_schema=True, effective_config=None):
@@ -151,7 +160,8 @@ def _fake_reconstruction(*, config=None, is_new_schema=True, effective_config=No
 def test_explain_reconstruction_helper_delegates_without_mutating_config(monkeypatch):
     config = {"level": "L3", "input_dim": 69}
     checkpoint = {"model_state_dict": {}}
-    dataset = _dataset(num_genes=7, num_chromosomes=3)
+    chrom_index = {"1": 0, "2": 1, "X": 2}
+    dataset = _dataset(num_genes=7, num_chromosomes=3, chrom_index=chrom_index)
     original = copy.deepcopy(config)
     captured = {}
     expected = object()
@@ -168,7 +178,11 @@ def test_explain_reconstruction_helper_delegates_without_mutating_config(monkeyp
     assert result is expected
     assert captured == {
         "args": (config, checkpoint),
-        "kwargs": {"num_genes": 7, "dataset_num_chromosomes": 3},
+        "kwargs": {
+            "num_genes": 7,
+            "dataset_num_chromosomes": 3,
+            "dataset_chrom_index": chrom_index,
+        },
     }
     assert config == original
 

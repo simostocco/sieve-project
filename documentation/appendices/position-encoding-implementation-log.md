@@ -2066,6 +2066,111 @@ Known limitations:
 - Training still does not run real datasets in this development environment;
   coverage uses deterministic unit tensors only.
 
+## Phase 8B4 - Learned-Binned Explanation and Content-IG Integration
+
+Goal:
+
+Enable schema-v2 learned-binned models to reconstruct through the explanation
+entry point and prove content-mode Integrated Gradients and attention analysis
+use the learned-binned runtime path without changing training, preprocessing,
+model runtime, reconstruction internals, or attribution internals.
+
+Exact files changed:
+
+- `scripts/explain.py`
+- `tests/test_explain_position_phase7.py`
+- `tests/test_explain_learned_binned_phase8.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- `_reconstruct_model_for_explanation()` now forwards the live
+  `dataset.chrom_index` into `reconstruct_sieve_from_checkpoint()`.
+- Explanation reconstruction remains config/checkpoint-primary. For
+  schema-v2 learned-binned models, the saved resolved positional metadata and
+  strict state dict define the architecture, while the live chromosome mapping
+  is used only to verify identity compatibility with the saved mapping.
+- Added end-to-end learned-binned explanation tests that build schema-v2
+  metadata through the training serializer, reconstruct through the explanation
+  helper, and verify nonzero `absolute_position_embedding.weight` values are
+  restored exactly.
+- Added tests proving live chromosome mapping name or ID mismatches reject
+  learned-binned explanation reconstruction.
+- Added tests proving `auto` and explicit `content` IG resolve to content mode
+  for learned-binned schema-v2 custom models, while legacy IG is rejected for
+  custom positional execution.
+- Added tests proving content IG differentiates only `content_features`, reports
+  `content_dim` attribution width, preserves the learned embedding as fixed
+  model context, and ignores the observed historical
+  `absolute_position_features` compatibility tensor for learned-binned absolute
+  execution.
+- Added tests proving attention analysis works on split-primary learned-binned
+  inputs and ignores observed historical absolute-position feature values.
+- Added tests proving learned-binned absolute position can reconstruct for
+  explanation with T5 relative bias and learned chromosome embedding.
+- Added regression coverage showing non-learned Case-A and historical
+  Case-B/C explanation reconstruction remain unchanged.
+
+Runtime behavior:
+
+- Learned-binned schema-v2 explanation reconstruction can now succeed when the
+  live dataset supplies a chromosome mapping that exactly matches the saved
+  mapping.
+- Content-mode IG remains the comparable attribution path: position stays active
+  in the model through the learned embedding, but only content features are
+  integrated.
+- Historical `features` remain a compatibility fallback for old callers and
+  historical explanation paths. Split-primary learned-binned explanation uses
+  content features plus model-side positional runtime lookup.
+- No training, preprocessing, model construction, attention implementation,
+  reconstruction implementation, gradient implementation, or IG policy
+  implementation changed.
+
+Compatibility effects:
+
+- Old-schema and transitional explanation reconstruction continue to use their
+  historical compatibility paths.
+- Schema-v2 learned-binned explanation rejects incompatible live chromosome
+  mappings rather than remapping IDs or inferring padding rows.
+- `src/explain/gradients.py`, `src/explain/ig_mode.py`,
+  `src/explain/attention_analysis.py`, model runtime files, reconstruction, and
+  training remained unchanged in this phase.
+
+Validation:
+
+- `tests/test_explain_learned_binned_phase8.py`: 9 passed.
+- New plus existing explanation reconstruction helper command passed 28 tests.
+- Explanation-focused command passed 140 tests.
+- Learned-binned lifecycle command passed 81 tests.
+- Phase-7 explanation/reconstruction command passed 126 tests with 1 existing
+  deprecation warning.
+- Broader focused command passed 319 tests with 1 existing deprecation warning.
+- Full test suite passed 1130 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for `scripts/explain.py` and
+  `tests/test_explain_learned_binned_phase8.py`.
+- `git diff --check` passed.
+- New test file `tests/test_explain_learned_binned_phase8.py` passed Ruff,
+  Black check with Python 3.10 target, and isort.
+
+Baseline static debt:
+
+- Modified legacy files retained matching Ruff debt: committed baseline and
+  current code both report 19 findings across `scripts/explain.py` and
+  `tests/test_explain_position_phase7.py`.
+- Modified legacy files retained matching Black formatting debt: committed
+  baseline and current code both have 2 files that Black would reformat.
+- Modified legacy files improved isort status from 2 baseline import-order
+  errors to 1 current import-order error in `scripts/explain.py`.
+
+Known limitations:
+
+- Learned-binned explanation depends on exact live chromosome mapping identity
+  for schema-v2 reconstruction; no remapping or repair path is provided.
+- Learned-binned content IG is now covered through deterministic unit tensors,
+  but no real explanation dataset or training run was executed.
+- RoPE and ALiBi remain future positional strategies.
+
 ## Next planned phase
 
-Phase 8B4 - learned-binned explanation and content-IG end-to-end integration.
+Phase 9 - RoPE relative positional encoding.

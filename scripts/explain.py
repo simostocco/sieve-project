@@ -555,6 +555,7 @@ def _reconstruct_model_for_explanation(
         checkpoint,
         num_genes=dataset.num_genes,
         dataset_num_chromosomes=dataset.num_chromosomes,
+        dataset_chrom_index=dataset.chrom_index,
     )
 
 
