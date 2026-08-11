@@ -2664,6 +2664,118 @@ Known limitations:
 - No real training, dataset generation, checkpoint migration, or production
   explanation run was executed.
 
+## Phase 10C - ALiBi Training, Strict Reconstruction, and Explanation Lifecycle
+
+Goal:
+
+Complete end-to-end lifecycle validation for fixed and learned ALiBi without
+changing production code, ALiBi mathematics, checkpoint state semantics,
+training code, reconstruction code, or explanation code.
+
+Exact files changed:
+
+- `tests/test_alibi_lifecycle_phase10.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added a focused Phase 10C lifecycle test module covering ALiBi training
+  resolution, metadata serialization, strict reconstruction, explanation,
+  content IG, attention analysis, mapping identity, and learned-binned
+  composition.
+- Used real `train.prepare_training_position_encoding()` for fixed and learned
+  ALiBi with `separate` and `mask` cross-chromosome policies.
+- Used real `train.build_training_run_metadata()` and verified non-default
+  `alibi_distance_function=linear` and `alibi_distance_scale=23456.0` serialize
+  and round-trip through `resolved_position_encoding_from_dict()`.
+- Verified execution metadata records the applied relative strategy, no
+  T5-style `position_bias_rows`, and the selected cross-chromosome policy.
+- Constructed training-created models through the real training model factory
+  and locked exact state surfaces:
+  - fixed + mask: no relative state;
+  - fixed + separate: `cross_chromosome_bias`;
+  - learned + mask: raw `alibi_slope_logits`;
+  - learned + separate: raw `alibi_slope_logits` plus `cross_chromosome_bias`.
+- Proved training-created forward/backward execution for all four fixed/learned
+  and separate/mask combinations, including finite content gradients and
+  nonzero learned raw-logit/cross-bias gradients where those parameters exist.
+- Added strict schema-v2 base and chunked reconstruction round trips for fixed
+  and learned ALiBi `separate`, including exact tensor-state equality.
+- Verified learned ALiBi restores raw `alibi_slope_logits` exactly from
+  checkpoint state; tests do not compare only effective softplus outputs.
+- Added strict corrupt-state rejection for fixed separate, fixed mask, learned
+  separate, and learned mask checkpoints.
+- Added a two-layer learned-ALiBi state ownership regression proving per-layer
+  raw logits and cross-bias tensors are independent and required.
+- Added config/checkpoint metadata conflict tests for ALiBi distance function
+  and scale before checkpoint tensor state is accepted as architecture
+  authority.
+- Verified historical Case B and transitional Case C remain historical and do
+  not infer ALiBi state from aspirational metadata.
+- Proved ALiBi-only reconstruction does not require exact chromosome-name
+  identity because ALiBi state is indexed by attention head, not chromosome.
+- Proved the existing chromosome-row identity guard remains active when learned
+  chromosome embeddings or learned-binned absolute embeddings are present.
+- Used `explain._reconstruct_model_for_explanation()` for fixed and learned
+  ALiBi schema-v2 checkpoints and verified strategy/function/scale plus ALiBi
+  state restoration.
+- Verified `auto` and `content` IG policy resolves to content mode for custom
+  schema-v2 ALiBi, while legacy IG remains rejected through the existing generic
+  custom positional execution policy.
+- Exercised content-only Integrated Gradients for fixed and learned ALiBi with
+  zero-width absolute-position features for `absolute=none`; attributions have
+  content width, finite values, and preserved positions/chromosomes/masks.
+- Verified learned ALiBi raw logits and cross-bias parameters remain exactly
+  stable through content IG.
+- Added post-reconstruction distance-sensitivity tests proving fixed and learned
+  ALiBi attention weights change when same-chromosome relative distances change.
+- Exercised `AttentionAnalyzer` on fixed and learned ALiBi `separate`, and
+  fixed ALiBi `mask`, including exact zero cross-chromosome attention
+  probability for a valid masked cross-chromosome pair.
+- Verified IG provenance records the reconstructed resolved config as metadata
+  source, content attribution space, content width, and the correct ALiBi
+  relative strategy without serializing ALiBi distance matrices or slope
+  tensors.
+- Added learned-binned absolute plus fixed/learned ALiBi strict lifecycle
+  coverage, including exact learned absolute table restoration, ALiBi state
+  restoration, matching chromosome mapping success, and swapped mapping
+  rejection through the existing learned-binned row-identity guard.
+
+Runtime behavior:
+
+- No production code changed.
+- Fixed and learned ALiBi mathematics remain the Phase 10B1/10B2
+  implementation: exact int64 distance subtraction before floating transform
+  math, fixed deterministic slopes or learned raw logits with softplus
+  effective slopes, no Q/K/V transformation, no T5 `position_bias`, and
+  existing separate/mask cross-chromosome routing.
+
+Compatibility effects:
+
+- Existing training, reconstruction, explanation, IG, attention-analysis,
+  learned-binned, RoPE, and historical compatibility paths are exercised by
+  tests but not modified.
+- Checkpoint tensor state remains authoritative for learned raw
+  `alibi_slope_logits`.
+- ALiBi adds no chromosome-name identity rule on its own; existing row-identity
+  policy remains tied to chromosome-row-indexed learned state.
+
+Validation:
+
+- `tests/test_alibi_lifecycle_phase10.py`: 52 passed.
+- ALiBi focused command passed 134 tests.
+- Training/reconstruction command passed 221 tests.
+- Explanation command passed 159 tests.
+- Cross-strategy regression command passed 369 tests.
+- Full test suite passed 1342 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+
+Known limitations:
+
+- No real training, dataset generation, checkpoint migration, or production
+  explanation run was executed.
+- Downstream validation and benchmark scripts remain later-roadmap work.
+
 ## Next planned phase
 
-Phase 10C - ALiBi Training, Strict Reconstruction, and Explanation Lifecycle
+Phase 12 - Downstream validation and benchmark scripts
