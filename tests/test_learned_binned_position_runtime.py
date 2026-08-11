@@ -151,48 +151,13 @@ def _batch(config):
         RelativePositionEncoding.NONE,
         RelativePositionEncoding.T5_BUCKET,
         RelativePositionEncoding.ALIBI_FIXED,
+        RelativePositionEncoding.ALIBI_LEARNED,
     ],
 )
 def test_attention_validation_accepts_learned_binned_absolute_for_supported_attention(relative):
     config = _resolve_learned(relative=relative)
 
     validate_attention_runtime_support(config)
-
-
-@pytest.mark.parametrize(
-    "relative",
-    [
-        RelativePositionEncoding.ALIBI_LEARNED,
-    ],
-)
-def test_attention_validation_still_rejects_unimplemented_relative_strategies(relative):
-    kwargs = {}
-    if relative is RelativePositionEncoding.ROPE:
-        kwargs = {"rope_coordinate_scale": 1.0, "rope_base": 10000.0}
-    elif relative in {
-        RelativePositionEncoding.ALIBI_FIXED,
-        RelativePositionEncoding.ALIBI_LEARNED,
-    }:
-        kwargs = {"alibi_distance_scale": 1.0}
-    config = resolve_position_encoding_config(
-        PositionEncodingRequest(
-            preset=PositionPreset.CUSTOM,
-            absolute_position_encoding=AbsolutePositionEncoding.LEARNED_BINNED,
-            relative_position_encoding=relative,
-            chromosome_encoding=ChromosomeEncoding.NONE,
-            cross_chromosome_policy=CrossChromosomePolicy.SEPARATE,
-            position_dim=4,
-            position_bin_size=10,
-            **kwargs,
-        ),
-        AnnotationLevel.L3,
-        latent_dim=8,
-        num_heads=2,
-        num_chromosomes=2,
-    )
-
-    with pytest.raises(NotImplementedError, match=relative.value):
-        validate_attention_runtime_support(config)
 
 
 def test_attention_validation_accepts_learned_binned_with_rope_relative():

@@ -352,12 +352,18 @@ def test_fixed_alibi_deserializes_and_reconstructs_exact_state():
     _assert_state_exact(source.state_dict(), result.model.state_dict())
 
 
-def test_learned_alibi_deserializes_but_reconstruction_runtime_gate_rejects():
+def test_learned_alibi_deserializes_and_reconstructs_exact_state():
     config = _resolve_custom(
         relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=CrossChromosomePolicy.SEPARATE,
         alibi_distance_scale=10000.0,
     )
     serialized = _case_a_config(config)
+    source = _base_model(config)
+    layer = source.attention.attention_layers[0]
+    with torch.no_grad():
+        layer.alibi_slope_logits.copy_(torch.tensor([-3.0, -1.5]))
+        layer.cross_chromosome_bias.copy_(torch.tensor([0.25, -0.5]))
     parsed = resolved_position_encoding_from_dict(
         serialized["position_encoding"],
         latent_dim=MODEL_KWARGS["latent_dim"],
@@ -365,12 +371,22 @@ def test_learned_alibi_deserializes_but_reconstruction_runtime_gate_rejects():
     )
 
     assert parsed == config
-    with pytest.raises(NotImplementedError, match="alibi_learned"):
-        reconstruct_sieve_from_checkpoint(
-            serialized,
-            _checkpoint(_old_base_model(input_dim=config.input_dim)),
-            num_genes=5,
-        )
+    result = reconstruct_sieve_from_checkpoint(
+        serialized,
+        _checkpoint(source),
+        num_genes=5,
+    )
+
+    assert result.resolved_position_encoding == config
+    _assert_state_exact(source.state_dict(), result.model.state_dict())
+    torch.testing.assert_close(
+        result.model.attention.attention_layers[0].alibi_slope_logits,
+        layer.alibi_slope_logits,
+    )
+    torch.testing.assert_close(
+        result.model.attention.attention_layers[0].cross_chromosome_bias,
+        layer.cross_chromosome_bias,
+    )
 
 
 @pytest.mark.parametrize(

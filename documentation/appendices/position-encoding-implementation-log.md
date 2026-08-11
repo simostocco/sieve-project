@@ -2556,6 +2556,114 @@ Known limitations:
 - No real training, dataset generation, checkpoint migration, or production
   explanation run was executed.
 
+## Phase 10B2 - Learned ALiBi Slopes and State Surface
+
+Goal:
+
+Implement learned ALiBi relative-position execution and attention-owned
+checkpoint state without adding the full training, reconstruction, explanation,
+or IG lifecycle matrix deferred to Phase 10C.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `src/models/attention.py`
+- `tests/test_alibi_position_runtime.py`
+- `tests/test_position_training_phase7.py`
+- `tests/test_position_reconstruction_phase7.py`
+- `tests/test_learned_binned_position_runtime.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `build_alibi_initial_slope_logits(num_heads)`, a deterministic pure
+  helper that computes raw learned-ALiBi initialization logits from the fixed
+  ALiBi schedule using inverse softplus, `log(expm1(slope))`.
+- Added `LearnedAlibiRelativePositionRuntime`, a frozen plain dataclass that
+  owns no tensor, parameter, buffer, or state-dict key.
+- Extended the relative runtime API with `alibi_slope_logits`; non-learned
+  runtimes reject accidental non-`None` logits instead of silently ignoring
+  incorrectly wired learned state.
+- Added attention-owned `alibi_slope_logits` as the exact checkpoint parameter
+  name for `relative_position_encoding=alibi_learned`.
+- Kept raw logits distinct from physical slopes. The runtime computes effective
+  slopes as `softplus(alibi_slope_logits)` at execution time. Mathematically
+  softplus is strictly positive; in finite precision, sufficiently negative
+  logits may underflow to exactly zero. The enforced semantic invariant is that
+  effective slopes cannot become negative and therefore cannot turn genomic
+  distance into a reward.
+- Initialized learned effective slopes to match the fixed ALiBi schedule.
+- Shared fixed and learned ALiBi score adjustment through one implementation
+  path: positions are promoted to int64, pairwise subtraction and absolute
+  base-pair distance are computed exactly as integers, and only the resulting
+  distance enters float32 or float64 transform math.
+- Fixed ALiBi constructs its deterministic slope tensor directly in the selected
+  ALiBi compute dtype, preserving Phase 10B1 float64 fixed-slope precision.
+- Reused the existing per-head `cross_chromosome_bias` parameter for learned
+  ALiBi with `cross_chromosome_policy=separate`; `mask` uses no cross-bias
+  parameter.
+- Kept both ALiBi variants `position_bias=None`; no T5-style bias rows are
+  allocated for fixed or learned ALiBi.
+- Generalized configured numeric relative-position validation to RoPE, fixed
+  ALiBi, and learned ALiBi: real variants require integer positions `>= 1`,
+  while padded rows may carry position `0`.
+- Enabled `validate_attention_runtime_support()` and model construction for
+  `ALIBI_LEARNED`.
+- Kept `validate_phase7_runtime_support()` frozen; it still explicitly rejects
+  RoPE, fixed ALiBi, and learned ALiBi.
+
+Runtime behavior:
+
+- Learned ALiBi is score-bias-only. It does not rotate Q/K, transform V, or
+  compute an additional QK product.
+- Same-chromosome scores use
+  `base_score - softplus(alibi_slope_logits[h]) * transformed_distance`.
+- With `cross_chromosome_policy=separate`, cross-chromosome scores use
+  `base_score + cross_chromosome_bias[h]`; no cross-chromosome genomic distance
+  penalty is applied.
+- With `cross_chromosome_policy=mask`, cross-chromosome pairs remain base
+  scores inside the runtime and are masked by the existing outer configured
+  attention mask.
+- Learned ALiBi inherits the Phase 10B1 exact-distance policy for large genomic
+  coordinates, including the float32 score path.
+
+Compatibility effects:
+
+- Fixed ALiBi behavior remains covered by the existing exact schedule,
+  no-slope-state, query/key-independence, mask/separate state, and
+  large-coordinate one-base-pair regressions.
+- Learned ALiBi state surfaces per attention layer are now:
+  - mask: `alibi_slope_logits`;
+  - separate: `alibi_slope_logits` plus `cross_chromosome_bias`.
+- Chunked models naturally prefix learned ALiBi state with `base_model.`.
+- Learned chromosome embeddings and learned-binned absolute embeddings remain
+  independent state surfaces that compose with learned ALiBi.
+- Learned ALiBi slope state is indexed by attention head, not chromosome, so it
+  adds no chromosome-name identity requirement. Existing schema-v2 mapping
+  guards remain limited to chromosome-row-indexed learned state.
+- Generic schema-v2 strict reconstruction now round-trips learned ALiBi model
+  state, including deterministic non-default raw logits and cross bias, without
+  changing reconstruction production code.
+- Training preparation and model construction now accept learned ALiBi, but the
+  full Phase 10C lifecycle remains deferred.
+
+Validation:
+
+- `tests/test_alibi_position_runtime.py`: 82 passed.
+- Position runtime/model focused command passed 322 tests.
+- Training/reconstruction support regression command passed 177 tests.
+- Broader focused command passed 532 tests.
+- Full test suite passed 1290 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+
+Known limitations:
+
+- Full learned-ALiBi training, strict reconstruction, explanation, Integrated
+  Gradients, attention-analysis, and corrupt-checkpoint lifecycle coverage is
+  deferred to Phase 10C.
+- No real training, dataset generation, checkpoint migration, or production
+  explanation run was executed.
+
 ## Next planned phase
 
-Phase 10B2 - Learned ALiBi Slopes and State Surface.
+Phase 10C - ALiBi Training, Strict Reconstruction, and Explanation Lifecycle

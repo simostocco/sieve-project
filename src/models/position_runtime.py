@@ -307,6 +307,7 @@ class RelativePositionRuntime(Protocol):
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """
         Return attention scores after relative-position adjustment.
@@ -330,10 +331,13 @@ class NoRelativePositionRuntime:
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """Return the exact base score tensor object unchanged."""
         if cross_chromosome_bias is not None:
             raise ValueError("cross_chromosome_bias is not used for relative_position_encoding=none.")
+        if alibi_slope_logits is not None:
+            raise ValueError("alibi_slope_logits is not used for relative_position_encoding=none.")
         return base_scores
 
 
@@ -389,10 +393,13 @@ class LegacyT5RelativePositionRuntime:
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """Add historical T5-style relative bias to precomputed QK scores."""
         if cross_chromosome_bias is not None:
             raise ValueError("cross_chromosome_bias is not used for legacy T5 bias.")
+        if alibi_slope_logits is not None:
+            raise ValueError("alibi_slope_logits is not used for legacy T5 bias.")
         bias = self.compute_bias(
             positions,
             positions,
@@ -470,10 +477,13 @@ class T5RelativePositionRuntime:
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """Add custom T5-style relative bias to precomputed QK scores."""
         if cross_chromosome_bias is not None:
             raise ValueError("cross_chromosome_bias is not used for T5 bias.")
+        if alibi_slope_logits is not None:
+            raise ValueError("alibi_slope_logits is not used for T5 bias.")
         bias = self.compute_bias(
             positions,
             positions,
@@ -547,10 +557,13 @@ class RopeRelativePositionRuntime:
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """Route same-chromosome RoPE scores and cross-chromosome policy scores."""
         if position_bias is not None:
             raise ValueError("position_bias must be None for relative_position_encoding=rope.")
+        if alibi_slope_logits is not None:
+            raise ValueError("alibi_slope_logits is not used for relative_position_encoding=rope.")
         self._validate_score_inputs(base_scores, query, key, positions, chrom_ids)
         if chrom_ids is None:
             raise ValueError("chrom_ids are required for relative_position_encoding=rope.")
@@ -671,6 +684,156 @@ def build_alibi_fixed_slopes(num_heads: int) -> tuple[float, ...]:
     return base_slopes + extra_slopes[: num_heads - closest_power_of_two]
 
 
+def build_alibi_initial_slope_logits(num_heads: int) -> tuple[float, ...]:
+    """Return raw learned-ALiBi logits whose softplus equals the fixed slopes.
+
+    The returned values are intentionally raw parameters, not physical ALiBi
+    slopes. Attention registers them as ``alibi_slope_logits``; the runtime
+    applies ``softplus`` at execution time so effective slopes stay positive.
+    """
+    return tuple(math.log(math.expm1(slope)) for slope in build_alibi_fixed_slopes(num_heads))
+
+
+def _alibi_compute_dtype(base_scores: Tensor) -> torch.dtype:
+    return torch.float64 if base_scores.dtype is torch.float64 else torch.float32
+
+
+def _transformed_alibi_distance(
+    positions: Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    distance_scale: float,
+    distance_function: AlibiDistanceFunction,
+) -> Tensor:
+    positions_int64 = positions.to(device=device, dtype=torch.int64)
+    distance_bp = torch.abs(positions_int64[:, :, None] - positions_int64[:, None, :])
+    distance_compute = distance_bp.to(dtype=dtype)
+    scaled_distance = distance_compute / distance_scale
+    if distance_function is AlibiDistanceFunction.LINEAR:
+        return scaled_distance
+    if distance_function is AlibiDistanceFunction.LOG1P:
+        return torch.log1p(scaled_distance)
+    raise ValueError(f"unsupported ALiBi distance function: {distance_function!r}")
+
+
+def _validate_alibi_score_inputs(
+    *,
+    num_heads: int,
+    base_scores: Tensor,
+    positions: Tensor,
+    chrom_ids: Tensor | None,
+    strategy_name: str,
+) -> None:
+    if not isinstance(base_scores, Tensor):
+        raise ValueError("base_scores must be a torch.Tensor.")
+    if base_scores.ndim != 4:
+        raise ValueError("base_scores must have shape [batch, heads, queries, keys].")
+    if not base_scores.dtype.is_floating_point:
+        raise ValueError("base_scores must use a floating dtype.")
+    if base_scores.shape[1] != num_heads:
+        raise ValueError("base_scores head dimension must match num_heads.")
+    if base_scores.shape[2] != base_scores.shape[3]:
+        raise ValueError("base_scores query/key dimensions must be square for ALiBi.")
+    if not isinstance(positions, Tensor):
+        raise ValueError("positions must be a torch.Tensor.")
+    if positions.ndim != 2:
+        raise ValueError("positions must have shape [batch, variants].")
+    expected_positions = (base_scores.shape[0], base_scores.shape[2])
+    if tuple(positions.shape) != expected_positions:
+        raise ValueError("positions shape must match base_scores batch and variant dimensions.")
+    if not _is_integer_tensor(positions):
+        raise ValueError("positions must use an integer dtype.")
+    if chrom_ids is None:
+        raise ValueError(f"chrom_ids are required for relative_position_encoding={strategy_name}.")
+    if not isinstance(chrom_ids, Tensor):
+        raise ValueError("chrom_ids must be a torch.Tensor.")
+    if chrom_ids.ndim != 2:
+        raise ValueError("chrom_ids must have shape [batch, variants].")
+    if chrom_ids.shape != positions.shape:
+        raise ValueError("chrom_ids shape must match positions shape.")
+    if not _is_integer_tensor(chrom_ids):
+        raise ValueError("chrom_ids must use an integer dtype.")
+
+
+def _validate_alibi_cross_chromosome_bias(
+    cross_chromosome_bias: Tensor | None,
+    base_scores: Tensor,
+    *,
+    strategy_name: str,
+) -> None:
+    if cross_chromosome_bias is None:
+        raise ValueError(
+            f"cross_chromosome_bias is required for relative_position_encoding={strategy_name} "
+            "with cross_chromosome_policy=separate."
+        )
+    if not isinstance(cross_chromosome_bias, Tensor):
+        raise ValueError("cross_chromosome_bias must be a torch.Tensor.")
+    if cross_chromosome_bias.shape != (base_scores.shape[1],):
+        raise ValueError("cross_chromosome_bias shape must equal (num_heads,).")
+    if not cross_chromosome_bias.dtype.is_floating_point:
+        raise ValueError("cross_chromosome_bias must use a floating dtype.")
+
+
+def _apply_alibi_scores(
+    *,
+    base_scores: Tensor,
+    positions: Tensor,
+    chrom_ids: Tensor,
+    effective_slopes: Tensor,
+    distance_function: AlibiDistanceFunction,
+    distance_scale: float,
+    cross_chromosome_policy: CrossChromosomePolicy,
+    cross_chromosome_bias: Tensor | None,
+    strategy_name: str,
+) -> Tensor:
+    compute_dtype = _alibi_compute_dtype(base_scores)
+    base_scores_compute = base_scores.to(dtype=compute_dtype)
+    transformed_distance = _transformed_alibi_distance(
+        positions,
+        device=base_scores.device,
+        dtype=compute_dtype,
+        distance_scale=distance_scale,
+        distance_function=distance_function,
+    )
+    slopes = effective_slopes.to(device=base_scores.device, dtype=compute_dtype).view(
+        1,
+        base_scores.shape[1],
+        1,
+        1,
+    )
+    same_chromosome_scores = base_scores_compute - slopes * transformed_distance.unsqueeze(1)
+    same_chromosome = build_same_chromosome_pair_mask(chrom_ids).to(device=base_scores.device)
+
+    if cross_chromosome_policy is CrossChromosomePolicy.SEPARATE:
+        _validate_alibi_cross_chromosome_bias(
+            cross_chromosome_bias,
+            base_scores,
+            strategy_name=strategy_name,
+        )
+        bias = cross_chromosome_bias.to(device=base_scores.device, dtype=compute_dtype)
+        cross_chromosome_scores = base_scores_compute + bias.view(1, base_scores.shape[1], 1, 1)
+        routed = torch.where(
+            same_chromosome.unsqueeze(1),
+            same_chromosome_scores,
+            cross_chromosome_scores,
+        )
+    elif cross_chromosome_policy is CrossChromosomePolicy.MASK:
+        if cross_chromosome_bias is not None:
+            raise ValueError("cross_chromosome_bias must be None for cross_chromosome_policy=mask.")
+        routed = torch.where(
+            same_chromosome.unsqueeze(1),
+            same_chromosome_scores,
+            base_scores_compute,
+        )
+    else:
+        raise ValueError(f"unsupported cross_chromosome_policy: {cross_chromosome_policy!r}")
+
+    if routed.dtype != base_scores.dtype:
+        routed = routed.to(dtype=base_scores.dtype)
+    return routed
+
+
 @dataclass(frozen=True)
 class FixedAlibiRelativePositionRuntime:
     """Parameterless fixed ALiBi runtime for chromosome-local score penalties.
@@ -708,123 +871,118 @@ class FixedAlibiRelativePositionRuntime:
         chrom_ids: Tensor | None,
         position_bias: nn.Embedding | None,
         cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
     ) -> Tensor:
         """Apply fixed ALiBi to same-chromosome pairs and route cross pairs."""
         del query, key
         if position_bias is not None:
             raise ValueError("position_bias must be None for relative_position_encoding=alibi_fixed.")
-        self._validate_score_inputs(base_scores, positions, chrom_ids)
-
-        compute_dtype = torch.float64 if base_scores.dtype is torch.float64 else torch.float32
-        base_scores_compute = base_scores.to(dtype=compute_dtype)
-        transformed_distance = self._transformed_distance(
-            positions,
-            device=base_scores.device,
-            dtype=compute_dtype,
+        if alibi_slope_logits is not None:
+            raise ValueError(
+                "alibi_slope_logits is not used for relative_position_encoding=alibi_fixed."
+            )
+        _validate_alibi_score_inputs(
+            num_heads=self.num_heads,
+            base_scores=base_scores,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            strategy_name="alibi_fixed",
         )
-        slopes = torch.tensor(
+        compute_dtype = _alibi_compute_dtype(base_scores)
+        effective_slopes = torch.tensor(
             self.fixed_slopes,
             device=base_scores.device,
             dtype=compute_dtype,
-        ).view(1, self.num_heads, 1, 1)
-        same_chromosome_scores = base_scores_compute - slopes * transformed_distance.unsqueeze(1)
-        same_chromosome = build_same_chromosome_pair_mask(chrom_ids).to(device=base_scores.device)
+        )
+        return _apply_alibi_scores(
+            base_scores=base_scores,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            effective_slopes=effective_slopes,
+            distance_function=self.distance_function,
+            distance_scale=self.distance_scale,
+            cross_chromosome_policy=self.cross_chromosome_policy,
+            cross_chromosome_bias=cross_chromosome_bias,
+            strategy_name="alibi_fixed",
+        )
 
-        if self.cross_chromosome_policy is CrossChromosomePolicy.SEPARATE:
-            self._validate_cross_chromosome_bias(cross_chromosome_bias, base_scores)
-            bias = cross_chromosome_bias.to(device=base_scores.device, dtype=compute_dtype)
-            cross_chromosome_scores = base_scores_compute + bias.view(1, self.num_heads, 1, 1)
-            routed = torch.where(
-                same_chromosome.unsqueeze(1),
-                same_chromosome_scores,
-                cross_chromosome_scores,
-            )
-        elif self.cross_chromosome_policy is CrossChromosomePolicy.MASK:
-            if cross_chromosome_bias is not None:
-                raise ValueError(
-                    "cross_chromosome_bias must be None for cross_chromosome_policy=mask."
-                )
-            routed = torch.where(
-                same_chromosome.unsqueeze(1),
-                same_chromosome_scores,
-                base_scores_compute,
-            )
-        else:
-            raise ValueError(f"unsupported cross_chromosome_policy: {self.cross_chromosome_policy!r}")
 
-        if routed.dtype != base_scores.dtype:
-            routed = routed.to(dtype=base_scores.dtype)
-        return routed
+@dataclass(frozen=True)
+class LearnedAlibiRelativePositionRuntime:
+    """Parameterless learned ALiBi runtime for non-negative score slopes.
 
-    def _transformed_distance(
-        self,
-        positions: Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        positions_int64 = positions.to(device=device, dtype=torch.int64)
-        distance_bp = torch.abs(positions_int64[:, :, None] - positions_int64[:, None, :])
-        distance_compute = distance_bp.to(dtype=dtype)
-        scaled_distance = distance_compute / self.distance_scale
-        if self.distance_function is AlibiDistanceFunction.LINEAR:
-            return scaled_distance
-        if self.distance_function is AlibiDistanceFunction.LOG1P:
-            return torch.log1p(scaled_distance)
-        raise ValueError(f"unsupported ALiBi distance function: {self.distance_function!r}")
+    Attention owns the raw ``alibi_slope_logits`` parameter. This runtime
+    converts those logits to effective physical slopes with ``softplus`` during
+    execution, keeping the checkpoint state raw. Mathematically softplus is
+    strictly positive; in finite precision, very negative logits can underflow
+    to zero, but effective slopes cannot become negative and turn genomic
+    distance into a reward.
+    """
 
-    def _validate_score_inputs(
+    num_heads: int
+    distance_function: AlibiDistanceFunction
+    distance_scale: float
+    cross_chromosome_policy: CrossChromosomePolicy
+
+    def __post_init__(self) -> None:
+        """Validate direct construction outside the pure resolver."""
+        _validate_positive_int("num_heads", self.num_heads)
+        if not isinstance(self.distance_function, AlibiDistanceFunction):
+            raise ValueError("distance_function must be an AlibiDistanceFunction enum.")
+        _validate_positive_finite_number("distance_scale", self.distance_scale)
+        if not isinstance(self.cross_chromosome_policy, CrossChromosomePolicy):
+            raise ValueError("cross_chromosome_policy must be a CrossChromosomePolicy enum.")
+
+    def adjust_attention_scores(
         self,
         base_scores: Tensor,
+        query: Tensor,
+        key: Tensor,
         positions: Tensor,
         chrom_ids: Tensor | None,
-    ) -> None:
-        if not isinstance(base_scores, Tensor):
-            raise ValueError("base_scores must be a torch.Tensor.")
-        if base_scores.ndim != 4:
-            raise ValueError("base_scores must have shape [batch, heads, queries, keys].")
-        if not base_scores.dtype.is_floating_point:
-            raise ValueError("base_scores must use a floating dtype.")
-        if base_scores.shape[1] != self.num_heads:
-            raise ValueError("base_scores head dimension must match num_heads.")
-        if base_scores.shape[2] != base_scores.shape[3]:
-            raise ValueError("base_scores query/key dimensions must be square for ALiBi.")
-        if not isinstance(positions, Tensor):
-            raise ValueError("positions must be a torch.Tensor.")
-        if positions.ndim != 2:
-            raise ValueError("positions must have shape [batch, variants].")
-        expected_positions = (base_scores.shape[0], base_scores.shape[2])
-        if tuple(positions.shape) != expected_positions:
-            raise ValueError("positions shape must match base_scores batch and variant dimensions.")
-        if not _is_integer_tensor(positions):
-            raise ValueError("positions must use an integer dtype.")
-        if chrom_ids is None:
-            raise ValueError("chrom_ids are required for relative_position_encoding=alibi_fixed.")
-        if not isinstance(chrom_ids, Tensor):
-            raise ValueError("chrom_ids must be a torch.Tensor.")
-        if chrom_ids.ndim != 2:
-            raise ValueError("chrom_ids must have shape [batch, variants].")
-        if chrom_ids.shape != positions.shape:
-            raise ValueError("chrom_ids shape must match positions shape.")
-        if not _is_integer_tensor(chrom_ids):
-            raise ValueError("chrom_ids must use an integer dtype.")
+        position_bias: nn.Embedding | None,
+        cross_chromosome_bias: Tensor | None = None,
+        alibi_slope_logits: Tensor | None = None,
+    ) -> Tensor:
+        """Apply learned positive ALiBi slopes and route cross-chromosome pairs."""
+        del query, key
+        if position_bias is not None:
+            raise ValueError("position_bias must be None for relative_position_encoding=alibi_learned.")
+        _validate_alibi_score_inputs(
+            num_heads=self.num_heads,
+            base_scores=base_scores,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            strategy_name="alibi_learned",
+        )
+        self._validate_alibi_slope_logits(alibi_slope_logits)
+        compute_dtype = _alibi_compute_dtype(base_scores)
+        effective_slopes = torch.nn.functional.softplus(
+            alibi_slope_logits.to(device=base_scores.device, dtype=compute_dtype)
+        )
+        return _apply_alibi_scores(
+            base_scores=base_scores,
+            positions=positions,
+            chrom_ids=chrom_ids,
+            effective_slopes=effective_slopes,
+            distance_function=self.distance_function,
+            distance_scale=self.distance_scale,
+            cross_chromosome_policy=self.cross_chromosome_policy,
+            cross_chromosome_bias=cross_chromosome_bias,
+            strategy_name="alibi_learned",
+        )
 
-    def _validate_cross_chromosome_bias(
-        self,
-        cross_chromosome_bias: Tensor | None,
-        base_scores: Tensor,
-    ) -> None:
-        if cross_chromosome_bias is None:
+    def _validate_alibi_slope_logits(self, alibi_slope_logits: Tensor | None) -> None:
+        if alibi_slope_logits is None:
             raise ValueError(
-                "cross_chromosome_bias is required for relative_position_encoding=alibi_fixed "
-                "with cross_chromosome_policy=separate."
+                "alibi_slope_logits are required for relative_position_encoding=alibi_learned."
             )
-        if not isinstance(cross_chromosome_bias, Tensor):
-            raise ValueError("cross_chromosome_bias must be a torch.Tensor.")
-        if cross_chromosome_bias.shape != (base_scores.shape[1],):
-            raise ValueError("cross_chromosome_bias shape must equal (num_heads,).")
-        if not cross_chromosome_bias.dtype.is_floating_point:
-            raise ValueError("cross_chromosome_bias must use a floating dtype.")
+        if not isinstance(alibi_slope_logits, Tensor):
+            raise ValueError("alibi_slope_logits must be a torch.Tensor.")
+        if alibi_slope_logits.shape != (self.num_heads,):
+            raise ValueError("alibi_slope_logits shape must equal (num_heads,).")
+        if not alibi_slope_logits.dtype.is_floating_point:
+            raise ValueError("alibi_slope_logits must use a floating dtype.")
 
 
 def build_same_chromosome_pair_mask(chrom_ids: Tensor) -> Tensor:
@@ -851,15 +1009,12 @@ def validate_attention_runtime_support(config: ResolvedPositionEncodingConfig) -
         raise ValueError("config must be a ResolvedPositionEncodingConfig.")
     if config.preset not in {PositionPreset.LEGACY, PositionPreset.CUSTOM}:
         raise NotImplementedError(f"position preset {config.preset!r} is not supported.")
-    if config.relative.encoding is RelativePositionEncoding.ALIBI_LEARNED:
-        raise NotImplementedError(
-            f"relative_position_encoding={config.relative.encoding.value} is not implemented."
-        )
     if config.relative.encoding not in {
         RelativePositionEncoding.NONE,
         RelativePositionEncoding.T5_BUCKET,
         RelativePositionEncoding.ROPE,
         RelativePositionEncoding.ALIBI_FIXED,
+        RelativePositionEncoding.ALIBI_LEARNED,
     }:
         raise NotImplementedError(
             f"relative_position_encoding={config.relative.encoding.value} is not implemented."
@@ -984,6 +1139,7 @@ def validate_phase7_runtime_support(config: ResolvedPositionEncodingConfig) -> N
     if config.relative.encoding in {
         RelativePositionEncoding.ROPE,
         RelativePositionEncoding.ALIBI_FIXED,
+        RelativePositionEncoding.ALIBI_LEARNED,
     }:
         raise NotImplementedError(
             f"relative_position_encoding={config.relative.encoding.value} "
@@ -1086,6 +1242,20 @@ def build_relative_position_runtime(
         ):
             raise ValueError("resolved fixed ALiBi settings are incomplete.")
         return FixedAlibiRelativePositionRuntime(
+            num_heads=num_heads,
+            distance_function=config.relative.alibi_distance_function,
+            distance_scale=config.relative.alibi_distance_scale,
+            cross_chromosome_policy=config.chromosome.cross_chromosome_policy,
+        )
+    if config.relative.encoding is RelativePositionEncoding.ALIBI_LEARNED:
+        if num_heads is None:
+            raise ValueError("num_heads is required for relative_position_encoding=alibi_learned.")
+        if (
+            config.relative.alibi_distance_function is None
+            or config.relative.alibi_distance_scale is None
+        ):
+            raise ValueError("resolved learned ALiBi settings are incomplete.")
+        return LearnedAlibiRelativePositionRuntime(
             num_heads=num_heads,
             distance_function=config.relative.alibi_distance_function,
             distance_scale=config.relative.alibi_distance_scale,

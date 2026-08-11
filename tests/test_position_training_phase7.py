@@ -142,33 +142,17 @@ def test_non_chromosome_aware_control_resolves_with_zero_chromosomes(absolute):
 
 
 @pytest.mark.parametrize(
-    "extra",
-    [
-        [
-            "--absolute-position-encoding",
-            "none",
-            "--relative-position-encoding",
-            "alibi_learned",
-            "--chromosome-encoding",
-            "none",
-        ],
-    ],
+    "relative",
+    [RelativePositionEncoding.ALIBI_FIXED, RelativePositionEncoding.ALIBI_LEARNED],
 )
-def test_unsupported_future_strategies_fail_before_model_construction(extra):
-    args = _args("--position-preset", "custom", *extra)
-
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        _resolve(args, num_chromosomes=3)
-
-
-def test_fixed_alibi_training_position_encoding_is_supported():
+def test_alibi_training_position_encoding_is_supported(relative):
     args = _args(
         "--position-preset",
         "custom",
         "--absolute-position-encoding",
         "none",
         "--relative-position-encoding",
-        "alibi_fixed",
+        relative.value,
         "--chromosome-encoding",
         "none",
         "--cross-chromosome-policy",
@@ -181,9 +165,26 @@ def test_fixed_alibi_training_position_encoding_is_supported():
 
     resolved = _resolve(args, num_chromosomes=3)
 
-    assert resolved.relative.encoding is RelativePositionEncoding.ALIBI_FIXED
+    assert resolved.relative.encoding is relative
     assert resolved.relative.alibi_distance_scale == 25.0
     assert resolved.chromosome.cross_chromosome_parameter == "learned_bias"
+
+    model = train.create_model(
+        input_dim=resolved.input_dim,
+        num_genes=5,
+        latent_dim=8,
+        num_heads=2,
+        num_attention_layers=1,
+        hidden_dim=10,
+        num_chromosomes=resolved.chromosome.num_chromosomes,
+        position_encoding=resolved,
+    )
+    layer = model.base_model.attention.attention_layers[0]
+    if relative is RelativePositionEncoding.ALIBI_LEARNED:
+        assert layer.alibi_slope_logits.shape == (2,)
+        assert layer.alibi_slope_logits.requires_grad is True
+    else:
+        assert layer.alibi_slope_logits is None
 
 
 def test_input_dim_authority_comes_from_resolved_config():

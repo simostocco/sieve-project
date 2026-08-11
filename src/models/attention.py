@@ -30,6 +30,7 @@ from src.encoding.position_config import (
 
 from .position_runtime import (
     LegacyT5RelativePositionRuntime,
+    build_alibi_initial_slope_logits,
     build_relative_position_runtime,
     build_same_chromosome_pair_mask,
     validate_attention_runtime_support,
@@ -167,6 +168,7 @@ class PositionAwareSparseAttention(nn.Module):
         elif position_encoding.relative.encoding in {
             RelativePositionEncoding.ROPE,
             RelativePositionEncoding.ALIBI_FIXED,
+            RelativePositionEncoding.ALIBI_LEARNED,
         }:
             self.position_bias = None
         else:
@@ -181,6 +183,7 @@ class PositionAwareSparseAttention(nn.Module):
             in {
                 RelativePositionEncoding.ROPE,
                 RelativePositionEncoding.ALIBI_FIXED,
+                RelativePositionEncoding.ALIBI_LEARNED,
             }
             and position_encoding.chromosome.cross_chromosome_policy
             is CrossChromosomePolicy.SEPARATE
@@ -188,6 +191,19 @@ class PositionAwareSparseAttention(nn.Module):
             self.cross_chromosome_bias = nn.Parameter(torch.zeros(num_heads))
         else:
             self.cross_chromosome_bias = None
+
+        if (
+            position_encoding is not None
+            and position_encoding.relative.encoding is RelativePositionEncoding.ALIBI_LEARNED
+        ):
+            # These are raw logits, not physical slopes. The runtime applies
+            # softplus so effective slopes stay positive while initially
+            # matching the fixed ALiBi schedule.
+            self.alibi_slope_logits = nn.Parameter(
+                torch.tensor(build_alibi_initial_slope_logits(num_heads), dtype=torch.float32)
+            )
+        else:
+            self.alibi_slope_logits = None
 
         # Optional chromosome embedding added to inputs before computing Q/K/V.
         # Disambiguates variants that share a coordinate on different
@@ -338,6 +354,7 @@ class PositionAwareSparseAttention(nn.Module):
             chrom_ids=chrom_ids,
             position_bias=self.position_bias,
             cross_chromosome_bias=self.cross_chromosome_bias,
+            alibi_slope_logits=self.alibi_slope_logits,
         )
 
         if configured_execution:
@@ -415,6 +432,7 @@ class PositionAwareSparseAttention(nn.Module):
         if self.position_encoding.relative.encoding in {
             RelativePositionEncoding.ROPE,
             RelativePositionEncoding.ALIBI_FIXED,
+            RelativePositionEncoding.ALIBI_LEARNED,
         }:
             if not _is_integer_tensor(positions):
                 raise ValueError(

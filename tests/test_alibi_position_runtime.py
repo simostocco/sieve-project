@@ -24,7 +24,9 @@ from src.encoding.position_layout import LearnedBinnedAbsolutePositionLayout
 from src.models.chunked_sieve import ChunkedSIEVEModel
 from src.models.position_runtime import (
     FixedAlibiRelativePositionRuntime,
+    LearnedAlibiRelativePositionRuntime,
     build_alibi_fixed_slopes,
+    build_alibi_initial_slope_logits,
     build_relative_position_runtime,
     validate_attention_runtime_support,
     validate_phase7_runtime_support,
@@ -56,7 +58,10 @@ def _resolve_custom(
     alibi_distance_scale: float = 10.0,
 ):
     request_kwargs = {}
-    if relative is RelativePositionEncoding.ALIBI_FIXED:
+    if relative in {
+        RelativePositionEncoding.ALIBI_FIXED,
+        RelativePositionEncoding.ALIBI_LEARNED,
+    }:
         request_kwargs.update(
             {
                 "alibi_distance_function": alibi_distance_function,
@@ -136,7 +141,7 @@ def _batch(config):
     return content, absolute, positions, gene_ids, mask, chrom_ids
 
 
-def _runtime(
+def _fixed_runtime(
     *,
     num_heads: int = 2,
     distance_function: AlibiDistanceFunction = AlibiDistanceFunction.LINEAR,
@@ -149,6 +154,29 @@ def _runtime(
         distance_scale=distance_scale,
         cross_chromosome_policy=cross_policy,
     )
+
+
+def _learned_runtime(
+    *,
+    num_heads: int = 2,
+    distance_function: AlibiDistanceFunction = AlibiDistanceFunction.LINEAR,
+    distance_scale: float = 10.0,
+    cross_policy: CrossChromosomePolicy = CrossChromosomePolicy.SEPARATE,
+) -> LearnedAlibiRelativePositionRuntime:
+    return LearnedAlibiRelativePositionRuntime(
+        num_heads=num_heads,
+        distance_function=distance_function,
+        distance_scale=distance_scale,
+        cross_chromosome_policy=cross_policy,
+    )
+
+
+def _runtime(**kwargs) -> FixedAlibiRelativePositionRuntime:
+    return _fixed_runtime(**kwargs)
+
+
+def _initial_logits(num_heads: int = 2, dtype=torch.float64) -> torch.Tensor:
+    return torch.tensor(build_alibi_initial_slope_logits(num_heads), dtype=dtype)
 
 
 def _base_scores(dtype=torch.float64) -> torch.Tensor:
@@ -170,12 +198,13 @@ def _unused_query_key(dtype=torch.float64) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _adjust(
-    runtime: FixedAlibiRelativePositionRuntime,
+    runtime: FixedAlibiRelativePositionRuntime | LearnedAlibiRelativePositionRuntime,
     base_scores: torch.Tensor,
     *,
     positions: torch.Tensor | None = None,
     chrom_ids: torch.Tensor | None = None,
     cross_chromosome_bias: torch.Tensor | None = None,
+    alibi_slope_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query_key_dtype = base_scores.dtype if base_scores.dtype.is_floating_point else torch.float32
     query, key = _unused_query_key(query_key_dtype)
@@ -189,6 +218,7 @@ def _adjust(
         chrom_ids=(torch.tensor([[0, 0, 0]], dtype=torch.long) if chrom_ids is None else chrom_ids),
         position_bias=None,
         cross_chromosome_bias=cross_chromosome_bias,
+        alibi_slope_logits=alibi_slope_logits,
     )
 
 
@@ -225,10 +255,34 @@ def test_fixed_alibi_slope_schedule_is_exact(num_heads, expected):
     assert build_alibi_fixed_slopes(num_heads) == expected
 
 
+@pytest.mark.parametrize(
+    ("num_heads", "expected"),
+    [
+        (1, (0.00390625,)),
+        (2, (0.0625, 0.00390625)),
+        (4, (0.25, 0.0625, 0.015625, 0.00390625)),
+        (6, (0.25, 0.0625, 0.015625, 0.00390625, 0.5, 0.125)),
+    ],
+)
+def test_learned_alibi_initial_logits_softplus_to_fixed_schedule(num_heads, expected):
+    raw_logits = torch.tensor(build_alibi_initial_slope_logits(num_heads), dtype=torch.float64)
+
+    torch.testing.assert_close(
+        torch.nn.functional.softplus(raw_logits),
+        torch.tensor(expected, dtype=torch.float64),
+    )
+
+
 @pytest.mark.parametrize("num_heads", [True, 0, -1])
 def test_fixed_alibi_slope_schedule_rejects_invalid_head_counts(num_heads):
     with pytest.raises(ValueError, match="num_heads"):
         build_alibi_fixed_slopes(num_heads)
+
+
+@pytest.mark.parametrize("num_heads", [True, 0, -1])
+def test_learned_alibi_initial_logits_reject_invalid_head_counts(num_heads):
+    with pytest.raises(ValueError, match="num_heads"):
+        build_alibi_initial_slope_logits(num_heads)
 
 
 def test_fixed_alibi_runtime_is_plain_and_stores_only_python_slope_tuple():
@@ -284,6 +338,77 @@ def test_factory_builds_fixed_alibi_runtime_with_resolved_settings():
     assert runtime.distance_function is AlibiDistanceFunction.LOG1P
     assert runtime.distance_scale == 25.0
     assert runtime.cross_chromosome_policy is CrossChromosomePolicy.SEPARATE
+
+
+def test_factory_builds_learned_alibi_runtime_with_resolved_settings():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        alibi_distance_function=AlibiDistanceFunction.LOG1P,
+        alibi_distance_scale=25.0,
+    )
+
+    with pytest.raises(ValueError, match="num_heads"):
+        build_relative_position_runtime(config)
+    runtime = build_relative_position_runtime(config, num_heads=2)
+
+    assert isinstance(runtime, LearnedAlibiRelativePositionRuntime)
+    assert runtime.distance_function is AlibiDistanceFunction.LOG1P
+    assert runtime.distance_scale == 25.0
+    assert runtime.cross_chromosome_policy is CrossChromosomePolicy.SEPARATE
+    _assert_parameterless_plain_runtime(runtime)
+
+
+def test_learned_alibi_initialization_matches_fixed_alibi_scores():
+    fixed = _fixed_runtime(
+        num_heads=2,
+        distance_function=AlibiDistanceFunction.LOG1P,
+        distance_scale=25.0,
+    )
+    learned = _learned_runtime(
+        num_heads=2,
+        distance_function=AlibiDistanceFunction.LOG1P,
+        distance_scale=25.0,
+    )
+    base_scores = _base_scores()
+    positions = torch.tensor([[10, 30, 50]], dtype=torch.long)
+    chrom_ids = torch.tensor([[0, 1, 0]], dtype=torch.long)
+    cross_bias = torch.zeros(2, dtype=torch.float64)
+
+    fixed_scores = _adjust(
+        fixed,
+        base_scores,
+        positions=positions,
+        chrom_ids=chrom_ids,
+        cross_chromosome_bias=cross_bias,
+    )
+    learned_scores = _adjust(
+        learned,
+        base_scores,
+        positions=positions,
+        chrom_ids=chrom_ids,
+        cross_chromosome_bias=cross_bias,
+        alibi_slope_logits=_initial_logits(),
+    )
+
+    torch.testing.assert_close(learned_scores, fixed_scores, rtol=1e-12, atol=1e-12)
+
+
+def test_learned_alibi_effective_slopes_remain_positive_from_negative_raw_logits():
+    runtime = _learned_runtime(num_heads=2, distance_function=AlibiDistanceFunction.LINEAR)
+    raw_logits = torch.tensor([-10.0, -2.0], dtype=torch.float64)
+    effective = torch.nn.functional.softplus(raw_logits)
+    adjusted = _adjust(
+        runtime,
+        torch.zeros(1, 2, 2, 2, dtype=torch.float64),
+        positions=torch.tensor([[10, 20]], dtype=torch.long),
+        chrom_ids=torch.tensor([[0, 0]], dtype=torch.long),
+        cross_chromosome_bias=torch.zeros(2, dtype=torch.float64),
+        alibi_slope_logits=raw_logits,
+    )
+
+    assert torch.all(effective > 0)
+    assert adjusted[0, 0, 0, 1] < 0
+    assert adjusted[0, 1, 0, 1] < 0
 
 
 def test_fixed_alibi_linear_zero_distance_and_symmetry_are_exact():
@@ -480,6 +605,44 @@ def test_fixed_alibi_preserves_one_bp_distance_for_large_float32_coordinates():
     torch.testing.assert_close(adjusted[0, 1, 1, 0], torch.tensor(-0.00390625))
 
 
+def test_fixed_alibi_preserves_float64_slope_precision_without_float32_rounding():
+    adjusted = _adjust(
+        _runtime(
+            num_heads=16,
+            distance_function=AlibiDistanceFunction.LINEAR,
+            distance_scale=1.0,
+        ),
+        torch.zeros(1, 16, 2, 2, dtype=torch.float64),
+        positions=torch.tensor([[10, 11]], dtype=torch.long),
+        chrom_ids=torch.tensor([[0, 0]], dtype=torch.long),
+        cross_chromosome_bias=torch.zeros(16, dtype=torch.float64),
+    )
+    expected = torch.tensor(-0.7071067811865476, dtype=torch.float64)
+
+    assert torch.equal(adjusted[0, 0, 0, 1], expected)
+    assert torch.equal(adjusted[0, 0, 1, 0], expected)
+
+
+def test_learned_alibi_preserves_one_bp_distance_for_large_float32_coordinates():
+    adjusted = _adjust(
+        _learned_runtime(
+            num_heads=2,
+            distance_function=AlibiDistanceFunction.LINEAR,
+            distance_scale=1.0,
+        ),
+        torch.zeros(1, 2, 2, 2, dtype=torch.float32),
+        positions=torch.tensor([[250_000_001, 250_000_002]], dtype=torch.long),
+        chrom_ids=torch.tensor([[0, 0]], dtype=torch.long),
+        cross_chromosome_bias=torch.zeros(2, dtype=torch.float32),
+        alibi_slope_logits=_initial_logits(dtype=torch.float32),
+    )
+
+    torch.testing.assert_close(adjusted[0, 0, 0, 1], torch.tensor(-0.0625))
+    torch.testing.assert_close(adjusted[0, 0, 1, 0], torch.tensor(-0.0625))
+    torch.testing.assert_close(adjusted[0, 1, 0, 1], torch.tensor(-0.00390625))
+    torch.testing.assert_close(adjusted[0, 1, 1, 0], torch.tensor(-0.00390625))
+
+
 def test_fixed_alibi_runtime_allows_padded_zero_because_it_has_no_mask():
     runtime = _runtime(num_heads=2, distance_function=AlibiDistanceFunction.LINEAR)
 
@@ -539,6 +702,39 @@ def test_fixed_alibi_output_does_not_depend_on_query_or_key_when_base_scores_are
     torch.testing.assert_close(adjusted_a, adjusted_b)
 
 
+def test_learned_alibi_output_does_not_depend_on_query_or_key_when_base_scores_are_fixed():
+    runtime = _learned_runtime(num_heads=2, distance_function=AlibiDistanceFunction.LINEAR)
+    base_scores = _base_scores()
+    positions = torch.tensor([[10, 30, 50]], dtype=torch.long)
+    chrom_ids = torch.tensor([[0, 0, 0]], dtype=torch.long)
+    query_a, key_a = _unused_query_key()
+    query_b = query_a + 1000.0
+    key_b = key_a - 1000.0
+
+    adjusted_a = runtime.adjust_attention_scores(
+        base_scores,
+        query=query_a,
+        key=key_a,
+        positions=positions,
+        chrom_ids=chrom_ids,
+        position_bias=None,
+        cross_chromosome_bias=torch.zeros(2, dtype=torch.float64),
+        alibi_slope_logits=_initial_logits(),
+    )
+    adjusted_b = runtime.adjust_attention_scores(
+        base_scores,
+        query=query_b,
+        key=key_b,
+        positions=positions,
+        chrom_ids=chrom_ids,
+        position_bias=None,
+        cross_chromosome_bias=torch.zeros(2, dtype=torch.float64),
+        alibi_slope_logits=_initial_logits(),
+    )
+
+    torch.testing.assert_close(adjusted_a, adjusted_b)
+
+
 def test_fixed_alibi_rejects_position_bias_embedding():
     with pytest.raises(ValueError, match="position_bias"):
         _runtime().adjust_attention_scores(
@@ -549,6 +745,34 @@ def test_fixed_alibi_rejects_position_bias_embedding():
             chrom_ids=torch.tensor([[0, 0, 0]], dtype=torch.long),
             position_bias=nn.Embedding(2, 2),
             cross_chromosome_bias=torch.zeros(2),
+        )
+
+
+@pytest.mark.parametrize(
+    ("alibi_slope_logits", "message"),
+    [
+        (None, "alibi_slope_logits"),
+        (torch.zeros(3), "shape"),
+        (torch.zeros(2, dtype=torch.long), "floating"),
+    ],
+)
+def test_learned_alibi_requires_valid_raw_slope_logits(alibi_slope_logits, message):
+    with pytest.raises(ValueError, match=message):
+        _adjust(
+            _learned_runtime(),
+            _base_scores(),
+            cross_chromosome_bias=torch.zeros(2),
+            alibi_slope_logits=alibi_slope_logits,
+        )
+
+
+def test_fixed_alibi_rejects_accidental_raw_slope_logits():
+    with pytest.raises(ValueError, match="alibi_slope_logits"):
+        _adjust(
+            _fixed_runtime(),
+            _base_scores(),
+            cross_chromosome_bias=torch.zeros(2),
+            alibi_slope_logits=torch.zeros(2),
         )
 
 
@@ -582,6 +806,53 @@ def test_fixed_alibi_state_key_sets_are_exact_for_mask_and_separate(
         assert layer.cross_chromosome_bias is None
 
 
+@pytest.mark.parametrize(
+    ("cross_policy", "expected_keys"),
+    [
+        (
+            CrossChromosomePolicy.MASK,
+            {"attention.attention_layers.0.alibi_slope_logits"},
+        ),
+        (
+            CrossChromosomePolicy.SEPARATE,
+            {
+                "attention.attention_layers.0.alibi_slope_logits",
+                "attention.attention_layers.0.cross_chromosome_bias",
+            },
+        ),
+    ],
+)
+def test_learned_alibi_state_key_sets_are_exact_for_mask_and_separate(
+    cross_policy,
+    expected_keys,
+):
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=cross_policy,
+    )
+    model = _model(config)
+    layer = model.attention.attention_layers[0]
+
+    assert layer.position_bias is None
+    assert _positional_state_keys(model) == expected_keys
+    assert layer.alibi_slope_logits.shape == (MODEL_KWARGS["num_heads"],)
+    assert layer.alibi_slope_logits.dtype.is_floating_point
+    assert layer.alibi_slope_logits.requires_grad is True
+    assert torch.isfinite(layer.alibi_slope_logits).all()
+    torch.testing.assert_close(
+        torch.nn.functional.softplus(layer.alibi_slope_logits.detach()),
+        torch.tensor((0.0625, 0.00390625), dtype=layer.alibi_slope_logits.dtype),
+    )
+    if cross_policy is CrossChromosomePolicy.SEPARATE:
+        assert layer.cross_chromosome_bias.shape == (MODEL_KWARGS["num_heads"],)
+        assert torch.equal(
+            layer.cross_chromosome_bias,
+            torch.zeros_like(layer.cross_chromosome_bias),
+        )
+    else:
+        assert layer.cross_chromosome_bias is None
+
+
 def test_fixed_alibi_chromosome_embedding_and_learned_binned_state_surfaces_are_independent():
     config = _resolve_custom(
         absolute=AbsolutePositionEncoding.LEARNED_BINNED,
@@ -603,6 +874,19 @@ def test_chunked_fixed_alibi_state_keys_use_base_model_prefix_naturally():
 
     assert _positional_state_keys(chunked) == {
         "base_model.attention.attention_layers.0.cross_chromosome_bias"
+    }
+
+
+def test_chunked_learned_alibi_state_keys_use_base_model_prefix_naturally():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=CrossChromosomePolicy.SEPARATE,
+    )
+    chunked = ChunkedSIEVEModel(_model(config))
+
+    assert _positional_state_keys(chunked) == {
+        "base_model.attention.attention_layers.0.alibi_slope_logits",
+        "base_model.attention.attention_layers.0.cross_chromosome_bias",
     }
 
 
@@ -668,8 +952,80 @@ def test_fixed_alibi_cross_bias_receives_gradient_with_cross_chromosome_pairs():
     assert torch.any(grad != 0)
 
 
+@pytest.mark.parametrize(
+    "cross_policy",
+    [CrossChromosomePolicy.SEPARATE, CrossChromosomePolicy.MASK],
+)
+def test_learned_alibi_model_forward_backward_and_gradients(cross_policy):
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=cross_policy,
+    )
+    model = _model(config)
+    content, absolute, positions, gene_ids, mask, chrom_ids = _batch(config)
+    positions = torch.tensor([[1, 6, 11, 0]], dtype=torch.long)
+    chrom_ids = torch.tensor([[0, 0, 1, 0]], dtype=torch.long)
+    content = content.clone().requires_grad_(True)
+
+    logits, intermediates = model(
+        None,
+        positions,
+        gene_ids,
+        mask,
+        chrom_ids=chrom_ids,
+        return_attention=True,
+        content_features=content,
+        absolute_position_features=absolute,
+    )
+    logits.sum().backward()
+
+    layer = model.attention.attention_layers[0]
+    assert logits.shape == (1, 1)
+    assert torch.isfinite(logits).all()
+    assert torch.isfinite(content.grad).all()
+    assert layer.alibi_slope_logits.grad is not None
+    assert torch.isfinite(layer.alibi_slope_logits.grad).all()
+    assert torch.any(layer.alibi_slope_logits.grad != 0)
+    if cross_policy is CrossChromosomePolicy.SEPARATE:
+        assert layer.cross_chromosome_bias.grad is not None
+        assert torch.isfinite(layer.cross_chromosome_bias.grad).all()
+        assert torch.any(layer.cross_chromosome_bias.grad != 0)
+    else:
+        assert layer.cross_chromosome_bias is None
+        attention = intermediates["attention_weights"][0]
+        assert torch.all(attention[0, :, 0, 2] == 0)
+
+
 def test_fixed_alibi_rejects_real_position_zero_but_allows_masked_zero():
     config = _resolve_custom(cross_policy=CrossChromosomePolicy.SEPARATE)
+    model = _model(config)
+    content, absolute, positions, gene_ids, mask, chrom_ids = _batch(config)
+
+    model(
+        None,
+        positions,
+        gene_ids,
+        mask,
+        chrom_ids=chrom_ids,
+        content_features=content,
+        absolute_position_features=absolute,
+    )
+    bad_positions = positions.clone()
+    bad_positions[0, 1] = 0
+    with pytest.raises(ValueError, match="ALiBi positions"):
+        model(
+            None,
+            bad_positions,
+            gene_ids,
+            mask,
+            chrom_ids=chrom_ids,
+            content_features=content,
+            absolute_position_features=absolute,
+        )
+
+
+def test_learned_alibi_rejects_real_position_zero_but_allows_masked_zero():
+    config = _resolve_custom(relative=RelativePositionEncoding.ALIBI_LEARNED)
     model = _model(config)
     content, absolute, positions, gene_ids, mask, chrom_ids = _batch(config)
 
@@ -712,6 +1068,25 @@ def test_fixed_alibi_requires_chrom_ids_in_model_even_without_chromosome_embeddi
         )
 
 
+def test_learned_alibi_requires_chrom_ids_in_model_even_without_chromosome_embedding():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        chromosome=ChromosomeEncoding.NONE,
+    )
+    model = _model(config)
+    content, absolute, positions, gene_ids, mask, _chrom_ids = _batch(config)
+
+    with pytest.raises(ValueError, match="chrom_ids"):
+        model(
+            None,
+            positions,
+            gene_ids,
+            mask,
+            content_features=content,
+            absolute_position_features=absolute,
+        )
+
+
 def test_fixed_alibi_position_sensitivity_changes_same_chromosome_attention():
     config = _resolve_custom(cross_policy=CrossChromosomePolicy.SEPARATE)
     model = _model(config)
@@ -719,6 +1094,44 @@ def test_fixed_alibi_position_sensitivity_changes_same_chromosome_attention():
     same_chrom_ids = torch.tensor([[0, 0, 0, 0]], dtype=torch.long)
     positions_b = positions.clone()
     positions_b[0, 1] = 30
+
+    _, intermediates_a = model(
+        None,
+        positions,
+        gene_ids,
+        mask,
+        chrom_ids=same_chrom_ids,
+        return_attention=True,
+        content_features=content,
+        absolute_position_features=absolute,
+    )
+    _, intermediates_b = model(
+        None,
+        positions_b,
+        gene_ids,
+        mask,
+        chrom_ids=same_chrom_ids,
+        return_attention=True,
+        content_features=content,
+        absolute_position_features=absolute,
+    )
+
+    assert not torch.equal(
+        intermediates_a["attention_weights"][0],
+        intermediates_b["attention_weights"][0],
+    )
+
+
+def test_learned_alibi_position_sensitivity_changes_same_chromosome_attention():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=CrossChromosomePolicy.SEPARATE,
+    )
+    model = _model(config)
+    content, absolute, positions, gene_ids, mask, _chrom_ids = _batch(config)
+    same_chrom_ids = torch.tensor([[0, 0, 0, 0]], dtype=torch.long)
+    positions_b = positions.clone()
+    positions_b[0, 1] = 35
 
     _, intermediates_a = model(
         None,
@@ -774,17 +1187,58 @@ def test_fixed_alibi_with_learned_binned_absolute_forward_backward_succeeds():
     assert torch.isfinite(model.attention.attention_layers[0].cross_chromosome_bias.grad).all()
 
 
-def test_attention_runtime_support_allows_fixed_alibi_but_not_learned_alibi():
+@pytest.mark.parametrize(
+    "cross_policy",
+    [CrossChromosomePolicy.SEPARATE, CrossChromosomePolicy.MASK],
+)
+def test_learned_alibi_with_learned_binned_absolute_forward_backward_succeeds(cross_policy):
+    config = _resolve_custom(
+        absolute=AbsolutePositionEncoding.LEARNED_BINNED,
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
+        cross_policy=cross_policy,
+    )
+    model = _model(config, layout=_layout())
+    content, absolute, positions, gene_ids, mask, chrom_ids = _batch(config)
+    content = content.clone().requires_grad_(True)
+
+    logits, _ = model(
+        None,
+        positions,
+        gene_ids,
+        mask,
+        chrom_ids=chrom_ids,
+        content_features=content,
+        absolute_position_features=absolute,
+    )
+    logits.sum().backward()
+
+    layer = model.attention.attention_layers[0]
+    assert logits.shape == (1, 1)
+    assert torch.isfinite(logits).all()
+    assert model.absolute_position_embedding is not None
+    assert torch.isfinite(content.grad).all()
+    assert torch.isfinite(layer.alibi_slope_logits.grad).all()
+    if cross_policy is CrossChromosomePolicy.SEPARATE:
+        assert layer.cross_chromosome_bias is not None
+        assert torch.isfinite(layer.cross_chromosome_bias.grad).all()
+    else:
+        assert layer.cross_chromosome_bias is None
+
+
+def test_attention_runtime_support_allows_fixed_and_learned_alibi():
     fixed = _resolve_custom(relative=RelativePositionEncoding.ALIBI_FIXED)
     learned = _resolve_custom(relative=RelativePositionEncoding.ALIBI_LEARNED)
 
     validate_attention_runtime_support(fixed)
-    with pytest.raises(NotImplementedError, match="alibi_learned"):
-        validate_attention_runtime_support(learned)
+    validate_attention_runtime_support(learned)
 
 
-def test_phase7_gate_still_rejects_fixed_alibi_after_attention_support_exists():
-    config = _resolve_custom(relative=RelativePositionEncoding.ALIBI_FIXED)
+@pytest.mark.parametrize(
+    "relative",
+    [RelativePositionEncoding.ALIBI_FIXED, RelativePositionEncoding.ALIBI_LEARNED],
+)
+def test_phase7_gate_still_rejects_alibi_after_attention_support_exists(relative):
+    config = _resolve_custom(relative=relative)
 
-    with pytest.raises(NotImplementedError, match="alibi_fixed"):
+    with pytest.raises(NotImplementedError, match=relative.value):
         validate_phase7_runtime_support(config)
