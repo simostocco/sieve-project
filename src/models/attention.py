@@ -144,6 +144,7 @@ class PositionAwareSparseAttention(nn.Module):
             self._relative_position_runtime = build_relative_position_runtime(
                 position_encoding,
                 head_dim=self.head_dim,
+                num_heads=self.num_heads,
             )
 
         # Attention projections
@@ -163,7 +164,10 @@ class PositionAwareSparseAttention(nn.Module):
             if not isinstance(total_bias_rows, int) or total_bias_rows <= 0:
                 raise ValueError("position_encoding.relative.total_bias_rows must be positive.")
             self.position_bias = nn.Embedding(total_bias_rows, num_heads)
-        elif position_encoding.relative.encoding is RelativePositionEncoding.ROPE:
+        elif position_encoding.relative.encoding in {
+            RelativePositionEncoding.ROPE,
+            RelativePositionEncoding.ALIBI_FIXED,
+        }:
             self.position_bias = None
         else:
             raise NotImplementedError(
@@ -173,7 +177,11 @@ class PositionAwareSparseAttention(nn.Module):
 
         if (
             position_encoding is not None
-            and position_encoding.relative.encoding is RelativePositionEncoding.ROPE
+            and position_encoding.relative.encoding
+            in {
+                RelativePositionEncoding.ROPE,
+                RelativePositionEncoding.ALIBI_FIXED,
+            }
             and position_encoding.chromosome.cross_chromosome_policy
             is CrossChromosomePolicy.SEPARATE
         ):
@@ -404,12 +412,17 @@ class PositionAwareSparseAttention(nn.Module):
                 raise ValueError("mask must be a boolean torch.Tensor in explicit-config mode.")
             if mask.shape != positions.shape:
                 raise ValueError("mask shape must match positions shape in explicit-config mode.")
-        if self.position_encoding.relative.encoding is RelativePositionEncoding.ROPE:
+        if self.position_encoding.relative.encoding in {
+            RelativePositionEncoding.ROPE,
+            RelativePositionEncoding.ALIBI_FIXED,
+        }:
             if not _is_integer_tensor(positions):
-                raise ValueError("positions must use an integer dtype for RoPE.")
+                raise ValueError(
+                    "positions must use an integer dtype for numeric relative position."
+                )
             real_positions = positions[mask] if mask is not None else positions.reshape(-1)
             if real_positions.numel() > 0 and torch.any(real_positions < 1):
-                raise ValueError("real RoPE positions must be >= 1.")
+                raise ValueError("real RoPE positions and ALiBi positions must be >= 1.")
 
         requires_chrom_ids = self.position_encoding.chromosome.requires_chrom_ids
         if requires_chrom_ids and chrom_ids is None:

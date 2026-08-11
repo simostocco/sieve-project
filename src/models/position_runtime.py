@@ -7,7 +7,7 @@ same ``position_bias`` and ``chrom_embedding`` keys on the attention modules.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import torch
@@ -17,6 +17,7 @@ from torch import Tensor
 from src.encoding import relative_position_bucket
 from src.encoding.position_config import (
     AbsolutePositionEncoding,
+    AlibiDistanceFunction,
     ChromosomeEncoding,
     CrossChromosomePolicy,
     PositionPreset,
@@ -652,6 +653,180 @@ class RopeRelativePositionRuntime:
             raise ValueError("cross_chromosome_bias must use a floating dtype.")
 
 
+def build_alibi_fixed_slopes(num_heads: int) -> tuple[float, ...]:
+    """Return the deterministic standard ALiBi slope schedule for attention heads."""
+    _validate_positive_int("num_heads", num_heads)
+
+    def slopes_power_of_two(head_count: int) -> tuple[float, ...]:
+        start = 2 ** (-(2 ** -(math.log2(head_count) - 3)))
+        ratio = start
+        return tuple(start * (ratio**idx) for idx in range(head_count))
+
+    if math.log2(num_heads).is_integer():
+        return slopes_power_of_two(num_heads)
+
+    closest_power_of_two = 2 ** math.floor(math.log2(num_heads))
+    base_slopes = slopes_power_of_two(closest_power_of_two)
+    extra_slopes = slopes_power_of_two(2 * closest_power_of_two)[0::2]
+    return base_slopes + extra_slopes[: num_heads - closest_power_of_two]
+
+
+@dataclass(frozen=True)
+class FixedAlibiRelativePositionRuntime:
+    """Parameterless fixed ALiBi runtime for chromosome-local score penalties.
+
+    The fixed head slopes are deterministic architecture math. They are stored
+    as Python floats on this plain runtime so no parameter, buffer, or
+    state-dict key is introduced for fixed ALiBi.
+    """
+
+    num_heads: int
+    distance_function: AlibiDistanceFunction
+    distance_scale: float
+    cross_chromosome_policy: CrossChromosomePolicy
+    fixed_slopes: tuple[float, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Validate direct construction outside the pure resolver."""
+        _validate_positive_int("num_heads", self.num_heads)
+        if not isinstance(self.distance_function, AlibiDistanceFunction):
+            raise ValueError("distance_function must be an AlibiDistanceFunction enum.")
+        _validate_positive_finite_number("distance_scale", self.distance_scale)
+        if not isinstance(self.cross_chromosome_policy, CrossChromosomePolicy):
+            raise ValueError("cross_chromosome_policy must be a CrossChromosomePolicy enum.")
+        fixed_slopes = build_alibi_fixed_slopes(self.num_heads)
+        if len(fixed_slopes) != self.num_heads:
+            raise ValueError("fixed ALiBi slope count must equal num_heads.")
+        object.__setattr__(self, "fixed_slopes", fixed_slopes)
+
+    def adjust_attention_scores(
+        self,
+        base_scores: Tensor,
+        query: Tensor,
+        key: Tensor,
+        positions: Tensor,
+        chrom_ids: Tensor | None,
+        position_bias: nn.Embedding | None,
+        cross_chromosome_bias: Tensor | None = None,
+    ) -> Tensor:
+        """Apply fixed ALiBi to same-chromosome pairs and route cross pairs."""
+        del query, key
+        if position_bias is not None:
+            raise ValueError("position_bias must be None for relative_position_encoding=alibi_fixed.")
+        self._validate_score_inputs(base_scores, positions, chrom_ids)
+
+        compute_dtype = torch.float64 if base_scores.dtype is torch.float64 else torch.float32
+        base_scores_compute = base_scores.to(dtype=compute_dtype)
+        transformed_distance = self._transformed_distance(
+            positions,
+            device=base_scores.device,
+            dtype=compute_dtype,
+        )
+        slopes = torch.tensor(
+            self.fixed_slopes,
+            device=base_scores.device,
+            dtype=compute_dtype,
+        ).view(1, self.num_heads, 1, 1)
+        same_chromosome_scores = base_scores_compute - slopes * transformed_distance.unsqueeze(1)
+        same_chromosome = build_same_chromosome_pair_mask(chrom_ids).to(device=base_scores.device)
+
+        if self.cross_chromosome_policy is CrossChromosomePolicy.SEPARATE:
+            self._validate_cross_chromosome_bias(cross_chromosome_bias, base_scores)
+            bias = cross_chromosome_bias.to(device=base_scores.device, dtype=compute_dtype)
+            cross_chromosome_scores = base_scores_compute + bias.view(1, self.num_heads, 1, 1)
+            routed = torch.where(
+                same_chromosome.unsqueeze(1),
+                same_chromosome_scores,
+                cross_chromosome_scores,
+            )
+        elif self.cross_chromosome_policy is CrossChromosomePolicy.MASK:
+            if cross_chromosome_bias is not None:
+                raise ValueError(
+                    "cross_chromosome_bias must be None for cross_chromosome_policy=mask."
+                )
+            routed = torch.where(
+                same_chromosome.unsqueeze(1),
+                same_chromosome_scores,
+                base_scores_compute,
+            )
+        else:
+            raise ValueError(f"unsupported cross_chromosome_policy: {self.cross_chromosome_policy!r}")
+
+        if routed.dtype != base_scores.dtype:
+            routed = routed.to(dtype=base_scores.dtype)
+        return routed
+
+    def _transformed_distance(
+        self,
+        positions: Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        positions_int64 = positions.to(device=device, dtype=torch.int64)
+        distance_bp = torch.abs(positions_int64[:, :, None] - positions_int64[:, None, :])
+        distance_compute = distance_bp.to(dtype=dtype)
+        scaled_distance = distance_compute / self.distance_scale
+        if self.distance_function is AlibiDistanceFunction.LINEAR:
+            return scaled_distance
+        if self.distance_function is AlibiDistanceFunction.LOG1P:
+            return torch.log1p(scaled_distance)
+        raise ValueError(f"unsupported ALiBi distance function: {self.distance_function!r}")
+
+    def _validate_score_inputs(
+        self,
+        base_scores: Tensor,
+        positions: Tensor,
+        chrom_ids: Tensor | None,
+    ) -> None:
+        if not isinstance(base_scores, Tensor):
+            raise ValueError("base_scores must be a torch.Tensor.")
+        if base_scores.ndim != 4:
+            raise ValueError("base_scores must have shape [batch, heads, queries, keys].")
+        if not base_scores.dtype.is_floating_point:
+            raise ValueError("base_scores must use a floating dtype.")
+        if base_scores.shape[1] != self.num_heads:
+            raise ValueError("base_scores head dimension must match num_heads.")
+        if base_scores.shape[2] != base_scores.shape[3]:
+            raise ValueError("base_scores query/key dimensions must be square for ALiBi.")
+        if not isinstance(positions, Tensor):
+            raise ValueError("positions must be a torch.Tensor.")
+        if positions.ndim != 2:
+            raise ValueError("positions must have shape [batch, variants].")
+        expected_positions = (base_scores.shape[0], base_scores.shape[2])
+        if tuple(positions.shape) != expected_positions:
+            raise ValueError("positions shape must match base_scores batch and variant dimensions.")
+        if not _is_integer_tensor(positions):
+            raise ValueError("positions must use an integer dtype.")
+        if chrom_ids is None:
+            raise ValueError("chrom_ids are required for relative_position_encoding=alibi_fixed.")
+        if not isinstance(chrom_ids, Tensor):
+            raise ValueError("chrom_ids must be a torch.Tensor.")
+        if chrom_ids.ndim != 2:
+            raise ValueError("chrom_ids must have shape [batch, variants].")
+        if chrom_ids.shape != positions.shape:
+            raise ValueError("chrom_ids shape must match positions shape.")
+        if not _is_integer_tensor(chrom_ids):
+            raise ValueError("chrom_ids must use an integer dtype.")
+
+    def _validate_cross_chromosome_bias(
+        self,
+        cross_chromosome_bias: Tensor | None,
+        base_scores: Tensor,
+    ) -> None:
+        if cross_chromosome_bias is None:
+            raise ValueError(
+                "cross_chromosome_bias is required for relative_position_encoding=alibi_fixed "
+                "with cross_chromosome_policy=separate."
+            )
+        if not isinstance(cross_chromosome_bias, Tensor):
+            raise ValueError("cross_chromosome_bias must be a torch.Tensor.")
+        if cross_chromosome_bias.shape != (base_scores.shape[1],):
+            raise ValueError("cross_chromosome_bias shape must equal (num_heads,).")
+        if not cross_chromosome_bias.dtype.is_floating_point:
+            raise ValueError("cross_chromosome_bias must use a floating dtype.")
+
+
 def build_same_chromosome_pair_mask(chrom_ids: Tensor) -> Tensor:
     """
     Build a chromosome-routing mask without applying padding or attention logic.
@@ -676,10 +851,7 @@ def validate_attention_runtime_support(config: ResolvedPositionEncodingConfig) -
         raise ValueError("config must be a ResolvedPositionEncodingConfig.")
     if config.preset not in {PositionPreset.LEGACY, PositionPreset.CUSTOM}:
         raise NotImplementedError(f"position preset {config.preset!r} is not supported.")
-    if config.relative.encoding in {
-        RelativePositionEncoding.ALIBI_FIXED,
-        RelativePositionEncoding.ALIBI_LEARNED,
-    }:
+    if config.relative.encoding is RelativePositionEncoding.ALIBI_LEARNED:
         raise NotImplementedError(
             f"relative_position_encoding={config.relative.encoding.value} is not implemented."
         )
@@ -687,6 +859,7 @@ def validate_attention_runtime_support(config: ResolvedPositionEncodingConfig) -
         RelativePositionEncoding.NONE,
         RelativePositionEncoding.T5_BUCKET,
         RelativePositionEncoding.ROPE,
+        RelativePositionEncoding.ALIBI_FIXED,
     }:
         raise NotImplementedError(
             f"relative_position_encoding={config.relative.encoding.value} is not implemented."
@@ -808,8 +981,14 @@ def validate_model_runtime_support(
 def validate_phase7_runtime_support(config: ResolvedPositionEncodingConfig) -> None:
     """Validate that a resolved config is supported by external Phase 7 entry points."""
     validate_attention_runtime_support(config)
-    if config.relative.encoding is RelativePositionEncoding.ROPE:
-        raise NotImplementedError("relative_position_encoding=rope is not supported by Phase 7.")
+    if config.relative.encoding in {
+        RelativePositionEncoding.ROPE,
+        RelativePositionEncoding.ALIBI_FIXED,
+    }:
+        raise NotImplementedError(
+            f"relative_position_encoding={config.relative.encoding.value} "
+            "is not implemented by Phase 7."
+        )
     if config.absolute.encoding is AbsolutePositionEncoding.LEARNED_BINNED:
         raise NotImplementedError("absolute_position_encoding=learned_binned is not implemented.")
     if config.absolute.encoding not in {
@@ -866,6 +1045,7 @@ def build_relative_position_runtime(
     config: ResolvedPositionEncodingConfig,
     *,
     head_dim: int | None = None,
+    num_heads: int | None = None,
 ) -> RelativePositionRuntime:
     """Build the parameterless relative-position runtime for a resolved config."""
     validate_attention_runtime_support(config)
@@ -895,6 +1075,20 @@ def build_relative_position_runtime(
             head_dim=head_dim,
             coordinate_scale=config.relative.rope_coordinate_scale,
             rope_base=config.relative.rope_base,
+            cross_chromosome_policy=config.chromosome.cross_chromosome_policy,
+        )
+    if config.relative.encoding is RelativePositionEncoding.ALIBI_FIXED:
+        if num_heads is None:
+            raise ValueError("num_heads is required for relative_position_encoding=alibi_fixed.")
+        if (
+            config.relative.alibi_distance_function is None
+            or config.relative.alibi_distance_scale is None
+        ):
+            raise ValueError("resolved fixed ALiBi settings are incomplete.")
+        return FixedAlibiRelativePositionRuntime(
+            num_heads=num_heads,
+            distance_function=config.relative.alibi_distance_function,
+            distance_scale=config.relative.alibi_distance_scale,
             cross_chromosome_policy=config.chromosome.cross_chromosome_policy,
         )
     raise NotImplementedError(

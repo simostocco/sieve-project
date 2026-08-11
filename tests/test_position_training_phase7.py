@@ -148,14 +148,6 @@ def test_non_chromosome_aware_control_resolves_with_zero_chromosomes(absolute):
             "--absolute-position-encoding",
             "none",
             "--relative-position-encoding",
-            "alibi_fixed",
-            "--chromosome-encoding",
-            "none",
-        ],
-        [
-            "--absolute-position-encoding",
-            "none",
-            "--relative-position-encoding",
             "alibi_learned",
             "--chromosome-encoding",
             "none",
@@ -167,6 +159,31 @@ def test_unsupported_future_strategies_fail_before_model_construction(extra):
 
     with pytest.raises(NotImplementedError, match="not implemented"):
         _resolve(args, num_chromosomes=3)
+
+
+def test_fixed_alibi_training_position_encoding_is_supported():
+    args = _args(
+        "--position-preset",
+        "custom",
+        "--absolute-position-encoding",
+        "none",
+        "--relative-position-encoding",
+        "alibi_fixed",
+        "--chromosome-encoding",
+        "none",
+        "--cross-chromosome-policy",
+        "separate",
+        "--alibi-distance-function",
+        "linear",
+        "--alibi-distance-scale",
+        "25.0",
+    )
+
+    resolved = _resolve(args, num_chromosomes=3)
+
+    assert resolved.relative.encoding is RelativePositionEncoding.ALIBI_FIXED
+    assert resolved.relative.alibi_distance_scale == 25.0
+    assert resolved.chromosome.cross_chromosome_parameter == "learned_bias"
 
 
 def test_input_dim_authority_comes_from_resolved_config():

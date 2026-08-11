@@ -2447,6 +2447,115 @@ Known limitations:
   paths covered by unit tests remain later-roadmap work.
 - ALiBi strategies remain unsupported.
 
+## Phase 10B1 - Fixed ALiBi Runtime and Attention State Surface
+
+Goal:
+
+Implement fixed ALiBi relative-position execution while preserving historical,
+T5, RoPE, learned-binned absolute, reconstruction, training, and explanation
+behavior outside the newly supported fixed-ALiBi strategy.
+
+Exact files changed:
+
+- `src/models/position_runtime.py`
+- `src/models/attention.py`
+- `tests/test_alibi_position_runtime.py`
+- `tests/test_position_training_phase7.py`
+- `tests/test_position_reconstruction_phase7.py`
+- `tests/test_learned_binned_position_runtime.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added `build_alibi_fixed_slopes(num_heads)`, the deterministic standard
+  ALiBi head-slope schedule. The exact locked schedules are:
+  - 1 head: `(0.00390625,)`
+  - 2 heads: `(0.0625, 0.00390625)`
+  - 4 heads: `(0.25, 0.0625, 0.015625, 0.00390625)`
+  - 6 heads: `(0.25, 0.0625, 0.015625, 0.00390625, 0.5, 0.125)`
+- Added `FixedAlibiRelativePositionRuntime`, a frozen plain dataclass that
+  stores fixed slopes as a Python tuple and owns no `nn.Parameter`, buffer,
+  tensor field, or state-dict key.
+- Implemented chromosome-local bidirectional genomic distance:
+  `abs(position_i_bp - position_j_bp)`.
+- Implemented scale placement as `distance_bp / alibi_distance_scale`, with
+  `linear` using the scaled value and `log1p` using
+  `log1p(distance_bp / alibi_distance_scale)`.
+- Implemented the same-chromosome score penalty:
+  `base_score - fixed_slope[h] * transformed_distance`.
+- Reused the existing attention-owned `cross_chromosome_bias` parameter for
+  fixed ALiBi with `cross_chromosome_policy=separate`; it has shape
+  `(num_heads,)` and zero initialization.
+- Kept fixed ALiBi `position_bias=None`; no fake T5 embedding row is allocated.
+- Kept the runtime API unchanged for Phase 10B1. Learned slope arguments are
+  deferred until learned ALiBi exists in Phase 10B2.
+- Extended `build_relative_position_runtime()` with an optional `num_heads`
+  keyword required only for fixed ALiBi. Existing none/T5/legacy callers remain
+  compatible, and RoPE retains its `head_dim` requirement.
+- Extended configured attention's mask-aware real-position validation from RoPE
+  to RoPE plus fixed ALiBi: real variants must have integer positions `>= 1`,
+  while padded rows may still carry position `0`.
+- Enabled `validate_attention_runtime_support()` for `ALIBI_FIXED` only.
+  `ALIBI_LEARNED` remains unsupported.
+- Kept `validate_phase7_runtime_support()` frozen for historical Phase-7 entry
+  points; it now explicitly rejects fixed ALiBi after attention support accepts
+  it.
+
+Runtime behavior:
+
+- Fixed ALiBi is score-bias-only. It does not rotate Q, K, or V, does not
+  inspect V, and does not perform a second QK matmul.
+- The runtime mathematically depends only on `base_scores`, `positions`,
+  `chrom_ids`, fixed slopes, and optional cross-chromosome bias. Tests prove
+  changing Q/K while holding `base_scores` fixed does not change the output.
+- For `cross_chromosome_policy=separate`, same-chromosome pairs receive the
+  ALiBi penalty and cross-chromosome pairs receive `base_score +
+  cross_chromosome_bias[h]`. No cross-chromosome genomic distance penalty is
+  applied.
+- For `cross_chromosome_policy=mask`, same-chromosome pairs receive the ALiBi
+  penalty and cross-chromosome pairs are left as base scores inside the
+  runtime; the existing outer attention mask sets those pairs to `-inf`.
+- Positions are promoted to int64 before subtraction, and exact integer
+  base-pair distance is computed before float32 or float64 transform math.
+- Distance and bias transform math uses float64 when `base_scores` is float64;
+  otherwise it uses float32 locally and casts the routed result back to
+  `base_scores.dtype`.
+
+Compatibility effects:
+
+- Historical/no-config, custom none, custom T5, and RoPE relative-position
+  state surfaces remain covered by existing regression tests.
+- Fixed ALiBi `mask` creates no relative-position state key.
+- Fixed ALiBi `separate` creates only
+  `attention.attention_layers.<N>.cross_chromosome_bias`.
+- Learned chromosome embeddings and learned-binned absolute embeddings remain
+  independent state surfaces that compose with fixed ALiBi.
+- Schema-v2 strict reconstruction now supports fixed ALiBi through ordinary
+  resolved-config model construction and strict state loading.
+- No checkpoint migration, explanation logic, training serialization logic, or
+  preprocessing/data path changed.
+- `ALIBI_LEARNED` remains unsupported and is still rejected before model
+  execution.
+
+Validation:
+
+- `tests/test_alibi_position_runtime.py`: 54 passed.
+- Position runtime/model focused command passed 294 tests.
+- Training/reconstruction support regression command passed 177 tests.
+- Broader focused command passed 504 tests.
+- Full test suite passed 1262 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+
+Known limitations:
+
+- Learned ALiBi slopes and their state surface are deferred.
+- Fixed ALiBi lifecycle coverage is limited to direct runtime/model tests and
+  existing training/reconstruction support regressions; full training,
+  strict-reconstruction, explanation, IG, and attention-analysis lifecycle tests
+  analogous to RoPE remain for a later lifecycle phase.
+- No real training, dataset generation, checkpoint migration, or production
+  explanation run was executed.
+
 ## Next planned phase
 
-Phase 10 - ALiBi relative positional encoding.
+Phase 10B2 - Learned ALiBi Slopes and State Surface.

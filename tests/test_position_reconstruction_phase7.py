@@ -328,9 +328,33 @@ def test_deserializer_rejects_bool_input_dim_that_python_would_compare_equal_to_
         )
 
 
-def test_future_strategy_deserializes_but_reconstruction_runtime_gate_rejects():
+def test_fixed_alibi_deserializes_and_reconstructs_exact_state():
     config = _resolve_custom(
         relative=RelativePositionEncoding.ALIBI_FIXED,
+        alibi_distance_scale=10000.0,
+    )
+    serialized = _case_a_config(config)
+    source = _base_model(config)
+    parsed = resolved_position_encoding_from_dict(
+        serialized["position_encoding"],
+        latent_dim=MODEL_KWARGS["latent_dim"],
+        num_heads=MODEL_KWARGS["num_heads"],
+    )
+
+    assert parsed == config
+    result = reconstruct_sieve_from_checkpoint(
+        serialized,
+        _checkpoint(source),
+        num_genes=5,
+    )
+
+    assert result.resolved_position_encoding == config
+    _assert_state_exact(source.state_dict(), result.model.state_dict())
+
+
+def test_learned_alibi_deserializes_but_reconstruction_runtime_gate_rejects():
+    config = _resolve_custom(
+        relative=RelativePositionEncoding.ALIBI_LEARNED,
         alibi_distance_scale=10000.0,
     )
     serialized = _case_a_config(config)
@@ -341,7 +365,7 @@ def test_future_strategy_deserializes_but_reconstruction_runtime_gate_rejects():
     )
 
     assert parsed == config
-    with pytest.raises(NotImplementedError, match="alibi_fixed"):
+    with pytest.raises(NotImplementedError, match="alibi_learned"):
         reconstruct_sieve_from_checkpoint(
             serialized,
             _checkpoint(_old_base_model(input_dim=config.input_dim)),

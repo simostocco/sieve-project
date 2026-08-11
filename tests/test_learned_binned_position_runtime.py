@@ -147,7 +147,11 @@ def _batch(config):
 
 @pytest.mark.parametrize(
     "relative",
-    [RelativePositionEncoding.NONE, RelativePositionEncoding.T5_BUCKET],
+    [
+        RelativePositionEncoding.NONE,
+        RelativePositionEncoding.T5_BUCKET,
+        RelativePositionEncoding.ALIBI_FIXED,
+    ],
 )
 def test_attention_validation_accepts_learned_binned_absolute_for_supported_attention(relative):
     config = _resolve_learned(relative=relative)
@@ -158,7 +162,6 @@ def test_attention_validation_accepts_learned_binned_absolute_for_supported_atte
 @pytest.mark.parametrize(
     "relative",
     [
-        RelativePositionEncoding.ALIBI_FIXED,
         RelativePositionEncoding.ALIBI_LEARNED,
     ],
 )
