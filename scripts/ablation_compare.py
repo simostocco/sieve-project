@@ -35,6 +35,19 @@ from typing import Any, Dict, Iterable, List
 
 import yaml
 
+if __package__ in (None, ""):
+    from position_benchmark_metadata import (
+        extract_comparison_context,
+        position_strategy_identity,
+        require_compatible_contexts,
+    )
+else:
+    from .position_benchmark_metadata import (
+        extract_comparison_context,
+        position_strategy_identity,
+        require_compatible_contexts,
+    )
+
 
 AUC_KEYS = (
     "auc",
@@ -103,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Parent directory with standard layout "
             "ablation_L{0..3}/ sub-directories"
+        ),
+    )
+    parser.add_argument(
+        "--comparison-axis",
+        choices=["level", "position"],
+        default="level",
+        help=(
+            "Comparison axis. 'level' preserves historical annotation-ablation "
+            "behavior; 'position' compares explicit runs by positional strategy."
         ),
     )
     parser.add_argument(
@@ -300,15 +322,40 @@ def _discover_run_dirs(results_dir: pathlib.Path) -> List[pathlib.Path]:
     return found
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _results_yaml_path(run_dir: pathlib.Path) -> pathlib.Path:
+    """Return the results file path using the historical preference order."""
+    results_yaml = run_dir / "results.yaml"
+    if not results_yaml.exists():
+        results_yaml = run_dir / "cv_results.yaml"
+    return results_yaml
 
 
-def main() -> int:
-    """Entry point for the ablation performance comparison."""
-    args = parse_args()
+def _extract_metrics(results_data: dict[str, Any]) -> dict[str, float]:
+    """Extract predictive metrics using the existing flexible key aliases."""
+    flat_results = flatten_dict(results_data)
+    return {
+        "auc": pick_metric(flat_results, AUC_KEYS),
+        "std_auc": pick_metric(flat_results, STD_AUC_KEYS),
+        "accuracy": pick_metric(flat_results, ACC_KEYS),
+        "loss": pick_metric(flat_results, LOSS_KEYS),
+    }
 
+
+def _rank_performance_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort rows by the historical performance priority."""
+    return sorted(
+        rows,
+        key=lambda row: (
+            metric_rank_value(row["auc"], maximize=True),
+            metric_rank_value(row["accuracy"], maximize=True),
+            metric_rank_value(row["loss"], maximize=False),
+            row["run_id"],
+        ),
+    )
+
+
+def _run_level_comparison(args: argparse.Namespace) -> int:
+    """Run the historical annotation-level ablation comparison."""
     # Resolve run directories
     if args.results_dir:
         results_dir = pathlib.Path(args.results_dir).resolve()
@@ -322,7 +369,7 @@ def main() -> int:
     else:
         run_dirs = [pathlib.Path(d).resolve() for d in args.run_dirs]
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for run_dir in run_dirs:
         if not run_dir.exists() or not run_dir.is_dir():
@@ -333,12 +380,7 @@ def main() -> int:
             continue
 
         run_id = run_dir.name
-
-        # Try results.yaml first, then cv_results.yaml
-        results_yaml = run_dir / "results.yaml"
-        if not results_yaml.exists():
-            results_yaml = run_dir / "cv_results.yaml"
-
+        results_yaml = _results_yaml_path(run_dir)
         config_yaml = run_dir / "config.yaml"
 
         try:
@@ -356,16 +398,12 @@ def main() -> int:
             # Config is optional, infer level from directory name
             config_data = {}
 
-        flat_results = flatten_dict(results_data)
-
+        metrics = _extract_metrics(results_data)
         rows.append(
             {
                 "run_id": run_id,
                 "level": resolve_level(run_id, config_data),
-                "auc": pick_metric(flat_results, AUC_KEYS),
-                "std_auc": pick_metric(flat_results, STD_AUC_KEYS),
-                "accuracy": pick_metric(flat_results, ACC_KEYS),
-                "loss": pick_metric(flat_results, LOSS_KEYS),
+                **metrics,
                 "results_yaml": str(results_yaml),
             }
         )
@@ -457,6 +495,187 @@ def main() -> int:
     print(f"Summary TSV: {args.out_summary_tsv}", file=sys.stderr)
     print(f"Summary YAML: {args.out_summary_yaml}", file=sys.stderr)
     return 0
+
+
+def _strategy_column(identity, section: str, key: str) -> object:
+    return identity.payload[section][key]
+
+
+def _run_position_comparison(args: argparse.Namespace) -> int:
+    """Run positional-strategy predictive performance comparison."""
+    if args.results_dir is not None:
+        print(
+            "ERROR: --comparison-axis position requires explicit --run-dir inputs; "
+            "--results-dir discovery is level-mode only.",
+            file=sys.stderr,
+        )
+        return 1
+    if not args.run_dirs:
+        print("ERROR: --comparison-axis position requires at least one --run-dir", file=sys.stderr)
+        return 1
+
+    rows: list[dict[str, Any]] = []
+    contexts = []
+
+    for run_dir_arg in args.run_dirs:
+        run_dir = pathlib.Path(run_dir_arg).resolve()
+        if not run_dir.exists() or not run_dir.is_dir():
+            print(f"ERROR: Run directory not found: {run_dir}", file=sys.stderr)
+            return 1
+
+        run_id = run_dir.name
+        config_path = run_dir / "config.yaml"
+        results_yaml = _results_yaml_path(run_dir)
+
+        try:
+            config_data = load_yaml(config_path)
+            results_data = load_yaml(results_yaml)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: Failed to load {run_dir}: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            identity = position_strategy_identity(config_data)
+            context = extract_comparison_context(config_data, run_id=run_id)
+        except ValueError as exc:
+            print(
+                f"ERROR: Invalid position benchmark metadata in {run_dir}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        metrics = _extract_metrics(results_data)
+        rows.append(
+            {
+                "position_strategy_id": identity.strategy_id,
+                "position_strategy_name": identity.name,
+                "position_strategy_hash": identity.hash,
+                "run_id": run_id,
+                "level": config_data["level"],
+                "preset": identity.payload["preset"],
+                "absolute_position_encoding": _strategy_column(identity, "absolute", "type"),
+                "relative_position_encoding": _strategy_column(identity, "relative", "type"),
+                "chromosome_encoding": _strategy_column(identity, "chromosome", "encoding"),
+                "cross_chromosome_policy": _strategy_column(
+                    identity,
+                    "chromosome",
+                    "cross_chromosome_policy",
+                ),
+                **metrics,
+                "config_path": str(config_path),
+                "results_yaml": str(results_yaml),
+                "position_strategy": identity.payload,
+            }
+        )
+        contexts.append(context)
+
+    try:
+        compatibility = require_compatible_contexts(contexts)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    rows_sorted = sorted(rows, key=lambda row: (row["position_strategy_id"], row["run_id"]))
+    best = _rank_performance_rows(rows)[0]
+
+    tsv_columns = [
+        "position_strategy_id",
+        "position_strategy_name",
+        "position_strategy_hash",
+        "run_id",
+        "level",
+        "preset",
+        "absolute_position_encoding",
+        "relative_position_encoding",
+        "chromosome_encoding",
+        "cross_chromosome_policy",
+        "auc",
+        "std_auc",
+        "accuracy",
+        "loss",
+        "config_path",
+        "results_yaml",
+    ]
+    tsv_path = pathlib.Path(args.out_summary_tsv)
+    tsv_path.parent.mkdir(parents=True, exist_ok=True)
+    with tsv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tsv_columns, delimiter="\t")
+        writer.writeheader()
+        for row in rows_sorted:
+            writer.writerow(
+                {
+                    column: (
+                        ""
+                        if isinstance(row[column], float) and math.isnan(row[column])
+                        else row[column]
+                    )
+                    for column in tsv_columns
+                }
+            )
+
+    yaml_summary: dict[str, Any] = {
+        "comparison_axis": "position",
+        "ranking_metric_priority": ["auc", "accuracy", "loss"],
+        "best_position_strategy_id": best["position_strategy_id"],
+        "best_run_id": best["run_id"],
+        "compatibility": compatibility.to_dict(),
+        "runs": [
+            {
+                "run_id": row["run_id"],
+                "position_strategy_id": row["position_strategy_id"],
+                "position_strategy_name": row["position_strategy_name"],
+                "position_strategy_hash": row["position_strategy_hash"],
+                "position_strategy": row["position_strategy"],
+                "metrics": {
+                    "auc": None if math.isnan(row["auc"]) else row["auc"],
+                    "std_auc": None if math.isnan(row["std_auc"]) else row["std_auc"],
+                    "accuracy": None if math.isnan(row["accuracy"]) else row["accuracy"],
+                    "loss": None if math.isnan(row["loss"]) else row["loss"],
+                },
+                "paths": {
+                    "config": row["config_path"],
+                    "results": row["results_yaml"],
+                },
+            }
+            for row in rows_sorted
+        ],
+    }
+    yaml_path = pathlib.Path(args.out_summary_yaml)
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_yaml(yaml_summary, yaml_path)
+
+    print("Position Strategy Performance Summary", file=sys.stderr)
+    print(f"{'='*60}", file=sys.stderr)
+    for row in rows_sorted:
+        auc_str = f"{row['auc']:.4f}" if not math.isnan(row["auc"]) else "N/A"
+        std_str = f" +/- {row['std_auc']:.4f}" if not math.isnan(row["std_auc"]) else ""
+        acc_str = f"{row['accuracy']:.4f}" if not math.isnan(row["accuracy"]) else "N/A"
+        loss_str = f"{row['loss']:.4f}" if not math.isnan(row["loss"]) else "N/A"
+        print(
+            f"  {row['position_strategy_id']}  AUC={auc_str}{std_str}  "
+            f"Acc={acc_str}  Loss={loss_str}",
+            file=sys.stderr,
+        )
+    print(
+        f"\nBest position strategy: {best['position_strategy_id']} ({best['run_id']})",
+        file=sys.stderr,
+    )
+    print(f"Summary TSV: {args.out_summary_tsv}", file=sys.stderr)
+    print(f"Summary YAML: {args.out_summary_yaml}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    """Entry point for the ablation performance comparison."""
+    args = parse_args()
+    if args.comparison_axis == "position":
+        return _run_position_comparison(args)
+    return _run_level_comparison(args)
 
 
 if __name__ == "__main__":

@@ -2776,6 +2776,141 @@ Known limitations:
   explanation run was executed.
 - Downstream validation and benchmark scripts remain later-roadmap work.
 
+## Phase 12B1 - Positional Strategy Identity and Predictive Performance
+
+Goal:
+
+Implement the first downstream benchmark layer without changing training,
+explanation, model, reconstruction, encoding, data, null-baseline, ranking, or
+attribution production paths.
+
+Exact files changed:
+
+- `scripts/position_benchmark_metadata.py`
+- `scripts/ablation_compare.py`
+- `tests/test_position_benchmark_metadata.py`
+- `tests/test_position_benchmark_performance.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Implementation:
+
+- Added pure, read-only positional benchmark metadata helpers. The new module
+  imports no Torch code, loads no checkpoints, constructs no models, and reads
+  only saved YAML/config dictionaries supplied by callers.
+- Separated position strategy identity from predictive comparison context.
+  Strategy identity describes only the configured positional architecture;
+  comparison context describes non-positional training and dataset conditions
+  that must match before predictive metrics can be interpreted as a positional
+  comparison.
+- Defined a canonical strategy payload with `strategy_schema_version=1`,
+  `preset`, whitelisted `absolute`, whitelisted `relative`, and whitelisted
+  `chromosome` sections.
+- Used committed serialized field names in the canonical payload, including
+  `absolute.dim`, `absolute.coordinate_scale`, `absolute.max_wavelength`,
+  `absolute.bin_size_bp`, `relative.num_buckets`,
+  `relative.max_distance_bp`, `relative.rope_coordinate_scale`,
+  `relative.rope_base`, `relative.alibi_distance_function`, and
+  `relative.alibi_distance_scale`.
+- Ignored legitimate non-strategy serialized extensions such as
+  `chromosome.mapping` and `absolute.binning` when computing strategy identity.
+- Added deterministic canonical JSON serialization with `sort_keys=True`,
+  compact separators, and `allow_nan=False`, then SHA-256 hashing over UTF-8.
+- Exposed a human-readable strategy name and stable strategy ID of the form
+  `<readable-name>__<first-12-hex-of-full-hash>`, while preserving the full
+  hash separately.
+- Required authoritative new-schema position metadata for position benchmark
+  mode: `position_encoding` must be present and
+  `position_encoding_execution.resolved_config_applied_to_model` must be true
+  with the resolved-config execution source.
+- Added predictive comparison-context extraction with required fields for
+  annotation level, content width, dataset mapping identity, randomization,
+  split protocol, non-positional model settings, training settings, chunking,
+  and recorded data/covariate provenance.
+- Made missing required comparison-context fields compatibility failures rather
+  than silently skipping them. Required fields now reject on absence even when
+  every compared run omits the same field; explicit `None` remains a legitimate
+  saved value.
+- Added lightweight pure-Python type/domain validation for required canonical
+  strategy values before hashing, including preset, absolute/relative strategy
+  types, chromosome encoding, cross-chromosome policy, positive integer
+  strategy widths/distances, positive finite numeric scales, and ALiBi distance
+  functions.
+- Rejected duplicate run IDs before comparison because run IDs key the
+  compatibility diagnostics.
+- Allowed `input_dim` to differ across strategies because positional width may
+  differ; required `content_dim` to match.
+- Preserved parent-run class-weighting scope by comparing the requested
+  `class_weighting` policy only. Fold-specific `class_weighting_applied` and
+  `class_weighting_pos_weight` validation remains later work.
+- Generalized `scripts/ablation_compare.py` with
+  `--comparison-axis {level,position}`. The default `level` path preserves the
+  historical annotation-ablation behavior and does not require positional
+  metadata.
+- Preserved the documented direct CLI invocation
+  `python scripts/ablation_compare.py ...` as well as package import usage.
+- Added explicit `position` mode for strategy-aware predictive performance
+  comparison over explicit `--run-dir` inputs only. It rejects `--results-dir`
+  discovery to avoid hidden inference from directory names.
+- Position mode reuses existing AUC, accuracy, loss, and std-AUC metric
+  extraction semantics for `results.yaml` and `cv_results.yaml`.
+- Position-mode TSV output is tidy, one row per run, and includes strategy ID,
+  readable name, full hash, strategy type columns, metrics, config path, and
+  results path.
+- Position-mode YAML output records `comparison_axis: position`, metric
+  priority, best strategy/run, compatibility report, canonical strategy
+  payloads, metrics, and paths.
+
+Runtime behavior:
+
+- Historical level-mode `ablation_compare.py` commands remain the default and
+  keep the original TSV header, YAML keys (`best_level`, `best_run_id`,
+  `ranking_metric_priority`, `levels`), level sorting, metric priority, and
+  permissive config handling.
+- Position mode performs no statistical testing, no confidence intervals, no
+  ranking-stability analysis, and no attribution-stability analysis.
+- No training, explanation, data generation, checkpoint loading, model
+  construction, or positional runtime code changed.
+
+Compatibility effects:
+
+- A historical/legacy reference for the new positional benchmark must come from
+  a new-schema resolved legacy run. Position mode does not infer a strategy
+  from raw CLI flags, directory names, checkpoint state, or incomplete old
+  metadata.
+- Dataset mapping hashes are compared, but they identify gene/chromosome
+  mappings only. They do not cryptographically identify the sample cohort,
+  phenotype contents, VCF contents, or preprocessed-data contents. Phase 12B1
+  therefore also compares the available data-source and covariate provenance
+  paths, while leaving stronger cohort hashing to later work.
+- L3 is the operational rich-content primary benchmark level. L0 is the
+  dosage-only sensitivity analysis level. L4 remains a compatibility
+  placeholder identical to L3 and is not a preferred primary benchmark level.
+
+Validation:
+
+- New Phase 12B1 benchmark tests passed 45 tests.
+- Explicit direct CLI smoke test `scripts/ablation_compare.py --help` passed.
+- Relevant existing training/config focused command passed 192 tests.
+- Full test suite passed 1387 tests, 1 skipped, with 6 existing non-failing
+  warnings.
+- `compileall` passed for the changed benchmark script/module/test files.
+- Ruff, Black, and isort passed on the new Python files.
+- `scripts/ablation_compare.py` was compared against its committed baseline:
+  Ruff current count is lower than baseline, isort now passes on the current
+  file, and remaining Black findings match pre-existing legacy formatting
+  debt.
+- Forbidden training, explanation, model, reconstruction, encoding, data,
+  null-baseline, ranking, and attribution production paths were not modified.
+
+Known limitations:
+
+- Ranking stability and attribution stability remain unimplemented.
+- Null-baseline positional config propagation remains a later phase.
+- Fold-specific applied class-weighting compatibility is not validated in this
+  phase.
+- Existing dataset metadata does not prove identical cohorts beyond the
+  recorded mapping hashes and data-source/covariate provenance.
+
 ## Next planned phase
 
-Phase 12 - Downstream validation and benchmark scripts
+Phase 12B2 - Position-Encoding Ranking Stability
