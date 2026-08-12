@@ -1,17 +1,21 @@
 """
 Unit tests for Phase 3 explainability components.
 """
-import pytest
-import torch
-import numpy as np
+import hashlib
 from pathlib import Path
 
-from src.encoding import VariantDataset, collate_samples, AnnotationLevel
-from src.models.sieve import create_sieve_model, load_state_dict_with_legacy_upgrade
-from src.explain.gradients import IntegratedGradientsExplainer
+import numpy as np
+import pytest
+import torch
+import yaml
+
+from scripts import explain
+from src.encoding import AnnotationLevel, VariantDataset, collate_samples
 from src.explain.attention_analysis import AttentionAnalyzer
-from src.explain.variant_ranking import VariantRanker
+from src.explain.gradients import IntegratedGradientsExplainer
 from src.explain.shap_epistasis import SHAPEpistasisDetector
+from src.explain.variant_ranking import VariantRanker
+from src.models.sieve import create_sieve_model, load_state_dict_with_legacy_upgrade
 
 
 @pytest.fixture
@@ -62,6 +66,294 @@ def test_model(test_checkpoint, test_dataset):
     load_state_dict_with_legacy_upgrade(model, test_checkpoint['model_state_dict'])
     model.eval()
     return model
+
+
+def _minimum_explain_argv(tmp_path, *extra):
+    return [
+        "--experiment-dir",
+        str(tmp_path / "experiment"),
+        "--preprocessed-data",
+        str(tmp_path / "preprocessed.pt"),
+        "--output-dir",
+        str(tmp_path / "out"),
+        *extra,
+    ]
+
+
+def _write_config(path: Path) -> None:
+    path.write_text(yaml.safe_dump({"level": "L3"}), encoding="utf-8")
+
+
+def _write_checkpoint(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _write_cv_results(path: Path, aucs) -> None:
+    path.write_text(
+        yaml.safe_dump({"fold_results": [{"auc": auc} for auc in aucs]}),
+        encoding="utf-8",
+    )
+
+
+def _patch_torch_load(monkeypatch):
+    calls = []
+
+    def fake_load(path, *args, **kwargs):
+        calls.append(Path(path))
+        return {"model_state_dict": {}}
+
+    monkeypatch.setattr(explain.torch, "load", fake_load)
+    return calls
+
+
+def _experiment_dir(tmp_path, *, aucs=None, checkpoint_payloads=None):
+    exp_dir = tmp_path / "experiment"
+    exp_dir.mkdir()
+    _write_config(exp_dir / "config.yaml")
+    if aucs is None:
+        _write_checkpoint(exp_dir / "best_model.pt", b"single-run")
+    else:
+        _write_cv_results(exp_dir / "cv_results.yaml", aucs)
+        checkpoint_payloads = checkpoint_payloads or [
+            f"fold-{i}".encode() for i in range(len(aucs))
+        ]
+        for i, payload in enumerate(checkpoint_payloads):
+            _write_checkpoint(exp_dir / f"fold_{i}" / "best_model.pt", payload)
+    return exp_dir
+
+
+def test_parse_args_accepts_fold_index_with_experiment_dir(tmp_path):
+    args = explain.parse_args(_minimum_explain_argv(tmp_path, "--fold-index", "1"))
+
+    assert args.fold_index == 1
+
+
+def test_parse_args_rejects_fold_index_with_checkpoint(tmp_path):
+    with pytest.raises(SystemExit):
+        explain.parse_args(
+            [
+                "--checkpoint",
+                str(tmp_path / "model.pt"),
+                "--config",
+                str(tmp_path / "config.yaml"),
+                "--preprocessed-data",
+                str(tmp_path / "preprocessed.pt"),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--fold-index",
+                "1",
+            ]
+        )
+
+
+def test_parse_args_rejects_negative_fold_index(tmp_path):
+    with pytest.raises(SystemExit):
+        explain.parse_args(_minimum_explain_argv(tmp_path, "--fold-index", "-1"))
+
+
+def test_sha256_file_uses_exact_checkpoint_bytes(tmp_path):
+    checkpoint_path = tmp_path / "model.pt"
+    checkpoint_path.write_bytes(b"checkpoint-a")
+
+    assert explain._sha256_file(checkpoint_path) == hashlib.sha256(
+        b"checkpoint-a"
+    ).hexdigest()
+
+    checkpoint_path.write_bytes(b"checkpoint-b")
+    assert explain._sha256_file(checkpoint_path) == hashlib.sha256(
+        b"checkpoint-b"
+    ).hexdigest()
+
+
+def test_load_model_explicit_cv_fold_records_selected_checkpoint(monkeypatch, tmp_path):
+    exp_dir = _experiment_dir(
+        tmp_path,
+        aucs=[0.91, 0.73, 0.99],
+        checkpoint_payloads=[b"fold0", b"fold1-selected", b"fold2-best"],
+    )
+    calls = _patch_torch_load(monkeypatch)
+    args = explain.parse_args(
+        [
+            "--experiment-dir",
+            str(exp_dir),
+            "--preprocessed-data",
+            str(tmp_path / "preprocessed.pt"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--fold-index",
+            "1",
+        ]
+    )
+
+    result = explain.load_model_and_config(args)
+    provenance = result.model_provenance
+    selected_checkpoint = (exp_dir / "fold_1" / "best_model.pt").resolve()
+
+    assert calls == [selected_checkpoint]
+    assert provenance["checkpoint_selection_mode"] == "cv_explicit_fold"
+    assert provenance["selected_fold"] == 1
+    assert provenance["selected_fold_auc"] == 0.73
+    assert provenance["checkpoint_path"] == str(selected_checkpoint)
+    assert provenance["checkpoint_sha256"] == hashlib.sha256(
+        b"fold1-selected"
+    ).hexdigest()
+    assert provenance["config_path"] == str((exp_dir / "config.yaml").resolve())
+    assert provenance["cv_results_path"] == str((exp_dir / "cv_results.yaml").resolve())
+
+
+def test_load_model_preserves_historical_cv_best_fold_selection(monkeypatch, tmp_path):
+    exp_dir = _experiment_dir(tmp_path, aucs=[0.71, 0.95, 0.82])
+    calls = _patch_torch_load(monkeypatch)
+    args = explain.parse_args(_minimum_explain_argv(tmp_path))
+
+    result = explain.load_model_and_config(args)
+    provenance = result.model_provenance
+    selected_checkpoint = (exp_dir / "fold_1" / "best_model.pt").resolve()
+
+    assert calls == [selected_checkpoint]
+    assert provenance["checkpoint_selection_mode"] == "cv_best_fold"
+    assert provenance["selected_fold"] == 1
+    assert provenance["selected_fold_auc"] == 0.95
+
+
+def test_load_model_single_run_records_best_model(monkeypatch, tmp_path):
+    exp_dir = _experiment_dir(tmp_path, aucs=None)
+    calls = _patch_torch_load(monkeypatch)
+    args = explain.parse_args(_minimum_explain_argv(tmp_path))
+
+    result = explain.load_model_and_config(args)
+    provenance = result.model_provenance
+    selected_checkpoint = (exp_dir / "best_model.pt").resolve()
+
+    assert calls == [selected_checkpoint]
+    assert provenance["checkpoint_selection_mode"] == "single_run_best_model"
+    assert provenance["selected_fold"] is None
+    assert provenance["selected_fold_auc"] is None
+    assert provenance["cv_results_path"] is None
+
+
+def test_load_model_explicit_checkpoint_records_supplied_paths(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    checkpoint_path = tmp_path / "model.pt"
+    _write_config(config_path)
+    checkpoint_path.write_bytes(b"explicit")
+    calls = _patch_torch_load(monkeypatch)
+    args = explain.parse_args(
+        [
+            "--checkpoint",
+            str(checkpoint_path),
+            "--config",
+            str(config_path),
+            "--preprocessed-data",
+            str(tmp_path / "preprocessed.pt"),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    result = explain.load_model_and_config(args)
+    provenance = result.model_provenance
+
+    assert calls == [checkpoint_path.resolve()]
+    assert provenance["checkpoint_selection_mode"] == "explicit_checkpoint"
+    assert provenance["checkpoint_path"] == str(checkpoint_path.resolve())
+    assert provenance["config_path"] == str(config_path.resolve())
+    assert provenance["selected_fold"] is None
+    assert provenance["selected_fold_auc"] is None
+    assert provenance["cv_results_path"] is None
+
+
+def test_load_model_rejects_fold_index_out_of_range(monkeypatch, tmp_path):
+    _experiment_dir(tmp_path, aucs=[0.1])
+    _patch_torch_load(monkeypatch)
+    args = explain.parse_args(
+        _minimum_explain_argv(tmp_path, "--fold-index", "2")
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        explain.load_model_and_config(args)
+
+
+def test_load_model_rejects_fold_index_without_cv_results(monkeypatch, tmp_path):
+    _experiment_dir(tmp_path, aucs=None)
+    _patch_torch_load(monkeypatch)
+    args = explain.parse_args(
+        _minimum_explain_argv(tmp_path, "--fold-index", "0")
+    )
+
+    with pytest.raises(ValueError, match="cv_results.yaml"):
+        explain.load_model_and_config(args)
+
+
+@pytest.mark.parametrize(
+    "payload, match",
+    [
+        ([], "mapping"),
+        ({"fold_results": []}, "non-empty fold_results"),
+        ({"fold_results": ["bad"]}, "fold_results\\[0\\] must be a mapping"),
+        ({"fold_results": [{}]}, "must contain 'auc'"),
+        ({"fold_results": [{"auc": "bad"}]}, "finite number"),
+        ({"fold_results": [{"auc": float("nan")}]}, "finite number"),
+        ({"fold_results": [{"auc": float("inf")}]}, "finite number"),
+    ],
+)
+def test_load_model_rejects_malformed_cv_results(monkeypatch, tmp_path, payload, match):
+    exp_dir = tmp_path / "experiment"
+    exp_dir.mkdir()
+    _write_config(exp_dir / "config.yaml")
+    (exp_dir / "cv_results.yaml").write_text(
+        yaml.safe_dump(payload),
+        encoding="utf-8",
+    )
+    _patch_torch_load(monkeypatch)
+    args = explain.parse_args(_minimum_explain_argv(tmp_path))
+
+    with pytest.raises(ValueError, match=match):
+        explain.load_model_and_config(args)
+
+
+def test_load_model_rejects_missing_selected_checkpoint(monkeypatch, tmp_path):
+    exp_dir = tmp_path / "experiment"
+    exp_dir.mkdir()
+    _write_config(exp_dir / "config.yaml")
+    _write_cv_results(exp_dir / "cv_results.yaml", [0.9])
+    _patch_torch_load(monkeypatch)
+    args = explain.parse_args(_minimum_explain_argv(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match=str(exp_dir / "fold_0" / "best_model.pt")):
+        explain.load_model_and_config(args)
+
+
+def test_load_model_rejects_missing_explicit_checkpoint(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    missing_checkpoint = tmp_path / "missing.pt"
+    _write_config(config_path)
+    _patch_torch_load(monkeypatch)
+    args = explain.parse_args(
+        [
+            "--checkpoint",
+            str(missing_checkpoint),
+            "--config",
+            str(config_path),
+            "--preprocessed-data",
+            str(tmp_path / "preprocessed.pt"),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    with pytest.raises(FileNotFoundError, match=str(missing_checkpoint.resolve())):
+        explain.load_model_and_config(args)
+
+
+def test_analysis_metadata_writes_top_level_model_provenance_for_all_ig_modes():
+    source = Path("scripts/explain.py").read_text(encoding="utf-8")
+    metadata_section = source.split("# === SAVE ANALYSIS METADATA ===", maxsplit=1)[1]
+
+    assert "'model_provenance': model_load.model_provenance" in metadata_section
+    assert "'integrated_gradients': integrated_gradients_metadata" in metadata_section
+    assert "_npz_scalar_metadata" not in metadata_section
 
 
 class TestIntegratedGradients:

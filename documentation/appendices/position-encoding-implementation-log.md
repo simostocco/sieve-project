@@ -3039,6 +3039,127 @@ Known limitations:
 - Regression coverage was completed in four shards because the prior
   monolithic full-suite run did not complete within the bounded window.
 
+## Phase 12B3A - Explanation Checkpoint and Fold Provenance
+
+Goal:
+
+- Record the exact model checkpoint and fold-selection decision that generated
+  future explanation artifacts.
+- Add a controlled `--fold-index` override so attribution-stability comparisons
+  can explain the same CV fold index across positional strategies.
+- Leave attribution-stability comparison itself unimplemented.
+
+Files changed:
+
+- `scripts/explain.py`
+- `tests/test_phase3_explain.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Added `--fold-index` to `scripts/explain.py` for `--experiment-dir` CV
+  explanations only. It is rejected with `--checkpoint` and when the experiment
+  directory has no `cv_results.yaml`.
+- Preserved historical model selection when `--fold-index` is omitted:
+  experiment directories with `cv_results.yaml` still select the maximum-AUC
+  fold, experiment directories without CV results still load `best_model.pt`,
+  and `--checkpoint --config` still uses the supplied checkpoint/config.
+- Added explicit CV metadata validation before fold selection. `cv_results.yaml`
+  must be a mapping with a non-empty `fold_results` list; each selected or
+  candidate fold entry must be a mapping with a finite numeric `auc`.
+- Required the selected checkpoint path to exist and be a file before
+  `torch.load` for CV explicit fold, CV best fold, single-run best model, and
+  explicit-checkpoint modes.
+- Added a `ResolvedModelLoad` result so `main()` receives config, checkpoint,
+  and resolved model provenance without hidden global state.
+- Added a streaming checkpoint SHA-256 helper so provenance records the exact
+  checkpoint file bytes rather than an in-memory state-dict representation.
+- Serialized top-level `analysis_metadata.model_provenance` for both IG and
+  `--skip-ig` runs. The model provenance is independent of whether
+  attribution executes.
+
+Runtime behavior:
+
+- New `model_provenance` schema:
+  - `schema_version: 1`
+  - `checkpoint_selection_mode`
+  - `checkpoint_path`
+  - `checkpoint_sha256`
+  - `config_path`
+  - `selected_fold`
+  - `selected_fold_auc`
+  - `cv_results_path`
+- Allowed `checkpoint_selection_mode` values are `cv_explicit_fold`,
+  `cv_best_fold`, `single_run_best_model`, and `explicit_checkpoint`.
+- Provenance paths are serialized as resolved absolute paths.
+- `checkpoint_sha256` is a 64-character lowercase SHA-256 hex digest computed
+  from the selected checkpoint file.
+- `analysis_metadata["experiment_dir"]` remains unchanged for backward
+  compatibility.
+
+Compatibility effects:
+
+- Existing explanation commands without `--fold-index` preserve their previous
+  checkpoint-selection behavior.
+- No attribution artifact schema changed: `attributions.npz`, per-sample NPZ
+  files, ranking CSVs, and IG scalar metadata are unchanged.
+- Phase 12B2 ranking comparison still consumes the existing analysis metadata
+  fields; the new model provenance is additive.
+- The Phase 12B3 attribution comparator remains unimplemented.
+
+Validation:
+
+- Repository gate passed at HEAD
+  `205a1072d2ec124737c87538060727e2dcbc61e3`; local HEAD matched
+  `origin/simostocco/position-encoding-benchmark`, and the worktree/index were
+  clean before editing.
+- Focused modified explain test file passed 40 tests with 1 existing
+  deprecation warning.
+- Relevant reconstruction/explanation focused commands passed:
+  - `tests/test_explain_ig_mode.py`, `tests/test_explain_position_phase7.py`,
+    `tests/test_ig_content_mode.py`, and
+    `tests/test_ig_sampling_reproducibility.py`: 129 passed.
+  - `tests/test_position_reconstruction_phase7.py`,
+    `tests/test_learned_binned_training_reconstruction.py`,
+    `tests/test_rope_lifecycle_phase9.py`, and
+    `tests/test_alibi_lifecycle_phase10.py`: 195 passed.
+- Phase 12B2 ranking regressions passed 82 tests:
+  `tests/test_compare_ablation_rankings.py` and
+  `tests/test_position_benchmark_rankings.py`.
+- Direct CLI help command passed and displayed `--fold-index`.
+- Full-suite regression coverage completed via four non-overlapping test-file
+  shards, not a monolithic full-suite run:
+  - shard 1: 293 passed, 5 warnings.
+  - shard 2: 264 passed.
+  - shard 3: 353 passed, 1 skipped, 1 warning.
+  - shard 4: 564 passed.
+  - summed shard coverage: 1474 passed, 1 skipped, 6 warnings.
+- `compileall` passed for `scripts/explain.py` and
+  `tests/test_phase3_explain.py`.
+- `git diff --check` passed.
+- Static checks on modified legacy Python files:
+  - Ruff current findings decreased from 26 baseline findings to 24 current
+    findings.
+  - isort baseline failed on both modified files; current isort passed.
+  - Black baseline and current both reported the same two legacy files would be
+    reformatted. Both checks were run under a 60-second timeout and reported
+    the would-reformat files before timing out.
+- Forbidden production paths remained unchanged:
+  `scripts/train.py`, `scripts/compare_attributions.py`,
+  `scripts/compare_ablation_rankings.py`,
+  `scripts/bootstrap_null_calibration.py`,
+  `scripts/run_null_baseline_analysis.sh`, `src/models`, `src/encoding`, and
+  `src/data`.
+
+Known limitations:
+
+- Attribution-stability metrics and `compare_position_attributions.py` remain
+  unimplemented.
+- Existing explanation artifacts created before this phase still lack
+  checkpoint/fold provenance.
+- The provenance records selected checkpoint bytes and fold metadata, but it
+  does not alter or validate downstream attribution-stability inputs yet.
+
 ## Next planned phase
 
-Phase 12B3 - Position-Encoding Attribution Stability
+Phase 12B3B - Position-Encoding Attribution Stability Comparison

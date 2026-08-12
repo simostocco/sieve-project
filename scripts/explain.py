@@ -39,31 +39,35 @@ Author: Francesco Lescai
 
 import argparse
 import gc
+import hashlib
+import math
 import shutil
 from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-import yaml
-import torch
-from torch.utils.data import DataLoader
+
 import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader
 
 from src.data.covariates import attach_pc_covariates_to_samples, load_pc_map
 from src.encoding import (
+    AnnotationLevel,
     ChunkedVariantDataset,
     collate_chunks,
     get_content_feature_dimension,
-    AnnotationLevel
 )
 from src.encoding.position_config import PositionPreset, ResolvedIGMode
+from src.explain.attention_analysis import AttentionAnalyzer
+from src.explain.gradients import IntegratedGradientsExplainer
+from src.explain.ig_mode import RequestedIGMode, resolve_ig_mode
+from src.explain.variant_ranking import VariantRanker
 from src.models.reconstruction import (
     ReconstructedSIEVEModel,
     reconstruct_sieve_from_checkpoint,
 )
-from src.explain.gradients import IntegratedGradientsExplainer
-from src.explain.ig_mode import RequestedIGMode, resolve_ig_mode
-from src.explain.attention_analysis import AttentionAnalyzer
-from src.explain.variant_ranking import VariantRanker
-
 
 ATTRIBUTION_SCHEMA_VERSION = 1
 VARIANT_SCORE_AGGREGATION = 'l2'
@@ -73,6 +77,26 @@ LEGACY_COMPARABILITY_WARNING = (
     "attribution magnitudes are not directly comparable with content-only "
     "benchmark attribution."
 )
+
+
+@dataclass(frozen=True)
+class ResolvedModelLoad:
+    """Loaded explanation inputs and exact model-selection provenance."""
+
+    config: dict
+    checkpoint: dict
+    model_provenance: dict[str, object]
+
+
+def _non_negative_int(value: str) -> int:
+    """Parse a non-negative integer for fixed CV fold selection."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--fold-index must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("--fold-index must be a non-negative integer")
+    return parsed
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -91,6 +115,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument('--config', type=str,
                         help='Path to config.yaml (required if using --checkpoint)')
+    parser.add_argument(
+        '--fold-index',
+        type=_non_negative_int,
+        default=None,
+        help=(
+            'Optional zero-based CV fold index to explain from --experiment-dir. '
+            'When omitted, the historical best-AUC fold selection is preserved.'
+        ),
+    )
 
     # Data input
     parser.add_argument('--preprocessed-data', type=str, required=True,
@@ -176,14 +209,104 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
-    return build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.fold_index is not None and args.checkpoint:
+        parser.error("--fold-index is only valid with --experiment-dir")
+    return args
 
 
-def load_model_and_config(args):
-    """Load model and configuration."""
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Return the SHA-256 hash of *path* using bounded memory."""
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_checkpoint_file(path: Path) -> None:
+    """Require the selected checkpoint path to exist before torch loading."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+
+
+def _finite_auc(value, *, fold_index: int) -> float:
+    """Validate a finite numeric AUC from cv_results.yaml."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"fold_results[{fold_index}]['auc'] must be a finite number")
+    auc = float(value)
+    if not math.isfinite(auc):
+        raise ValueError(f"fold_results[{fold_index}]['auc'] must be a finite number")
+    return auc
+
+
+def _load_cv_results(path: Path) -> dict:
+    """Load and validate the cv_results.yaml structure used for fold selection."""
+    with open(path) as f:
+        cv_results = yaml.safe_load(f)
+    if not isinstance(cv_results, Mapping):
+        raise ValueError("cv_results.yaml must contain a mapping")
+    fold_results = cv_results.get('fold_results')
+    if not isinstance(fold_results, list) or not fold_results:
+        raise ValueError("cv_results.yaml must contain a non-empty fold_results list")
+    for fold_index, result in enumerate(fold_results):
+        if not isinstance(result, Mapping):
+            raise ValueError(f"fold_results[{fold_index}] must be a mapping")
+        if 'auc' not in result:
+            raise ValueError(f"fold_results[{fold_index}] must contain 'auc'")
+        _finite_auc(result['auc'], fold_index=fold_index)
+    return dict(cv_results)
+
+
+def _select_best_fold(cv_results: Mapping[str, object]) -> tuple[int, float]:
+    """Select the first fold with the maximum finite AUC, matching old ties."""
+    fold_results = cv_results['fold_results']
+    best_fold = 0
+    best_auc = _finite_auc(fold_results[0]['auc'], fold_index=0)
+    for i, result in enumerate(fold_results[1:], start=1):
+        auc = _finite_auc(result['auc'], fold_index=i)
+        if auc > best_auc:
+            best_auc = auc
+            best_fold = i
+    return best_fold, best_auc
+
+
+def _build_model_provenance(
+    *,
+    checkpoint_selection_mode: str,
+    checkpoint_path: Path,
+    config_path: Path,
+    selected_fold: int | None,
+    selected_fold_auc: float | None,
+    cv_results_path: Path | None,
+) -> dict[str, object]:
+    """Build top-level analysis metadata for exact model provenance.
+
+    Attribution stability comparisons need to know which checkpoint generated
+    each explanation; paths identify the selection and the hash identifies the
+    immutable file bytes.
+    """
+    checkpoint_path = checkpoint_path.resolve()
+    config_path = config_path.resolve()
+    cv_results_path = cv_results_path.resolve() if cv_results_path is not None else None
+    return {
+        'schema_version': 1,
+        'checkpoint_selection_mode': checkpoint_selection_mode,
+        'checkpoint_path': str(checkpoint_path),
+        'checkpoint_sha256': _sha256_file(checkpoint_path),
+        'config_path': str(config_path),
+        'selected_fold': selected_fold,
+        'selected_fold_auc': selected_fold_auc,
+        'cv_results_path': str(cv_results_path) if cv_results_path is not None else None,
+    }
+
+
+def load_model_and_config(args) -> ResolvedModelLoad:
+    """Load model/config and return exact checkpoint-selection provenance."""
     if args.experiment_dir:
         # Load from experiment directory
-        exp_dir = Path(args.experiment_dir)
+        exp_dir = Path(args.experiment_dir).resolve()
 
         # Load config
         config_path = exp_dir / 'config.yaml'
@@ -193,41 +316,73 @@ def load_model_and_config(args):
         # Find best fold (highest AUC in CV results)
         cv_results_path = exp_dir / 'cv_results.yaml'
         if cv_results_path.exists():
-            with open(cv_results_path) as f:
-                cv_results = yaml.safe_load(f)
+            cv_results = _load_cv_results(cv_results_path)
+            fold_results = cv_results['fold_results']
+            if args.fold_index is not None:
+                if args.fold_index >= len(fold_results):
+                    raise ValueError(
+                        f"--fold-index {args.fold_index} is out of range for "
+                        f"{len(fold_results)} fold_results entries"
+                    )
+                selected_fold = args.fold_index
+                selected_fold_auc = _finite_auc(
+                    fold_results[selected_fold]['auc'],
+                    fold_index=selected_fold,
+                )
+                checkpoint_selection_mode = 'cv_explicit_fold'
+            else:
+                selected_fold, selected_fold_auc = _select_best_fold(cv_results)
+                checkpoint_selection_mode = 'cv_best_fold'
 
-            # Find best fold
-            best_fold = 0
-            best_auc = 0
-            for i, result in enumerate(cv_results['fold_results']):
-                if result['auc'] > best_auc:
-                    best_auc = result['auc']
-                    best_fold = i
-
-            checkpoint_path = exp_dir / f'fold_{best_fold}' / 'best_model.pt'
-            print(f"Using fold {best_fold} (AUC: {best_auc:.4f})")
+            checkpoint_path = exp_dir / f'fold_{selected_fold}' / 'best_model.pt'
+            _require_checkpoint_file(checkpoint_path)
+            print(f"Using fold {selected_fold} (AUC: {selected_fold_auc:.4f})")
         else:
+            if args.fold_index is not None:
+                raise ValueError("--fold-index requires an experiment with cv_results.yaml")
             # Single run - use best_model.pt directly
             checkpoint_path = exp_dir / 'best_model.pt'
+            _require_checkpoint_file(checkpoint_path)
+            checkpoint_selection_mode = 'single_run_best_model'
+            selected_fold = None
+            selected_fold_auc = None
+            cv_results_path = None
             print("Using single run model")
 
     else:
         # Load specific checkpoint
-        checkpoint_path = Path(args.checkpoint)
+        checkpoint_path = Path(args.checkpoint).resolve()
         if not args.config:
             raise ValueError("--config required when using --checkpoint")
 
-        config_path = Path(args.config)
+        config_path = Path(args.config).resolve()
         with open(config_path) as f:
             config = yaml.safe_load(f)
+        _require_checkpoint_file(checkpoint_path)
+        checkpoint_selection_mode = 'explicit_checkpoint'
+        selected_fold = None
+        selected_fold_auc = None
+        cv_results_path = None
 
     print(f"Loading model from {checkpoint_path}")
+    model_provenance = _build_model_provenance(
+        checkpoint_selection_mode=checkpoint_selection_mode,
+        checkpoint_path=checkpoint_path,
+        config_path=config_path,
+        selected_fold=selected_fold,
+        selected_fold_auc=selected_fold_auc,
+        cv_results_path=cv_results_path,
+    )
 
     # Load checkpoint
     # Note: weights_only=False is safe here since these are our own trusted checkpoints
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    return config, checkpoint
+    return ResolvedModelLoad(
+        config=config,
+        checkpoint=checkpoint,
+        model_provenance=model_provenance,
+    )
 
 
 def _validate_config_content_dim(config: dict, annotation_level: AnnotationLevel) -> int:
@@ -571,7 +726,9 @@ def main():
     print("="*60)
 
     # Load model and config
-    config, checkpoint = load_model_and_config(args)
+    model_load = load_model_and_config(args)
+    config = model_load.config
+    checkpoint = model_load.checkpoint
 
     # Load data
     print("\nLoading data...")
@@ -1179,6 +1336,7 @@ def main():
         'aggregation_method': args.aggregation_method,
         'skip_attention': args.skip_attention,
         'skip_ig': args.skip_ig,
+        'model_provenance': model_load.model_provenance,
         'integrated_gradients': integrated_gradients_metadata,
         'attention_threshold_mode': args.attention_threshold_mode,
         'attention_threshold': args.attention_threshold,
