@@ -3160,6 +3160,146 @@ Known limitations:
 - The provenance records selected checkpoint bytes and fold metadata, but it
   does not alter or validate downstream attribution-stability inputs yet.
 
+## Phase 12B3B - Position-Encoding Attribution Stability Comparison
+
+Goal:
+
+- Add a downstream, read-only comparator for raw content Integrated-Gradients
+  attribution stability across completed positional-strategy explanation runs.
+- Require exact checkpoint/fold provenance, training-context compatibility,
+  explanation-context compatibility, sample alignment, and per-sample variant
+  alignment before computing any attribution metrics.
+
+Files changed:
+
+- `scripts/compare_position_attributions.py`
+- `tests/test_position_benchmark_attributions.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Added a new explicit five-token input contract:
+  `--position-run RUN_ID CONFIG_YAML ANALYSIS_METADATA_YAML ATTRIBUTIONS_NPZ
+  ATTRIBUTIONS_PER_SAMPLE_DIR`. Run IDs must be non-empty and unique; all
+  paths are explicit and pre-existing, and no strategy is inferred from a
+  directory name.
+- Kept positional strategy identity exclusively config-derived through the
+  Phase 12B1 `position_strategy_identity()` helper. Explanation metadata is
+  cross-validated against that identity but cannot override it.
+- Reused Phase 12B1 training context extraction and compatibility checks, and
+  directly reused the centralized Phase 12B2
+  `require_compatible_explanation_contexts()` helper for explanation metadata
+  compatibility.
+- Required Phase 12B3A `model_provenance` with checkpoint byte SHA-256
+  verification and config-path identity validation. The comparator does not
+  call `torch.load`.
+- For CV comparisons, required every run to use `cv_explicit_fold` and the
+  same selected fold. `cv_best_fold` is rejected for primary attribution
+  stability even when it would select the same fold. Fold AUC may differ and
+  remains run-level provenance, not a compatibility key.
+- For `single_split`, required null fold fields and a common
+  `single_run_best_model` or `explicit_checkpoint` selection mode.
+- Required executed content IG with fixed observed absolute position:
+  `resolved_ig_mode=content`, `attribution_feature_space=content`,
+  `baseline_policy=zero_content_observed_absolute_position`,
+  `comparability_warning=null`, and
+  `position_encoding_metadata_source=reconstructed_resolved_config`.
+- Fixed content feature names by annotation level: L0/L1 dosage only, L2
+  dosage plus consequence one-hot features, and L3/L4 those five features plus
+  SIFT and PolyPhen.
+- Required exact sample universe alignment by `sample_id`, matching labels,
+  and exact per-sample variant universe alignment by
+  `chromosome:position_gene_id`. Row-order differences are handled by sorting
+  canonical variant keys.
+- Cross-validated scalar IG metadata at analysis YAML, aggregate NPZ, and
+  per-sample NPZ levels. Aggregate/per-sample variant scores must match, and
+  each per-sample score vector must equal the L2 norm of raw attribution rows.
+- Loaded aggregate `attributions.npz` with `allow_pickle=True` only because
+  SIEVE stores aggregate `variant_scores` and `metadata` as object arrays.
+  Aggregate score validation accepts both historical ragged object arrays and
+  equal-length rectangular object arrays, converting one selected aggregate
+  score vector at a time to finite float64. Per-sample NPZ files are loaded
+  with `allow_pickle=False` and must still contain normal numeric arrays.
+- Implemented signed raw-attribution cosine as the primary metric, Pearson as
+  a diagnostic with explicit insufficient/constant policies, variant-score
+  cosine, normalized L2 score distance, and per-feature sufficient-statistic
+  summaries.
+- Kept streaming bounded to at most two full raw per-sample attribution
+  matrices at once. The comparator retains compact metadata, aggregate scores,
+  TSV rows, feature sufficient statistics, and small row-order arrays, but it
+  does not materialize fully reordered attribution matrices while another run
+  matrix is resident.
+- Added exact schemas for sample, feature, and summary TSV outputs. These are
+  genuine tab-separated files. The structured YAML output records metrics,
+  zero/constant policies, compatibility reports, checkpoint policy, run
+  provenance, alignment policy, artifact integrity policy, content features,
+  output paths, pairwise summaries, and trust-boundary warnings.
+
+Runtime behavior:
+
+- The script is read-only downstream analysis. It does not train, explain,
+  load checkpoints, construct models, import Torch, generate data, traverse
+  directories, or modify upstream artifacts.
+- It fails closed on malformed, missing, mismatched, legacy-IG, null-baseline,
+  or incompletely provenanced artifacts.
+- It creates each requested output parent directory independently.
+
+Compatibility effects:
+
+- Existing benchmark, training, explanation, null-baseline, model,
+  reconstruction, encoding, and data paths are unchanged.
+- Historical aggregate NPZ pickle usage remains isolated to the trusted
+  aggregate explanation artifact boundary.
+- Existing Phase 12B1/B2 ranking scripts are unchanged; this phase adds a
+  separate raw-attribution magnitude/stability comparator.
+
+Validation:
+
+- Repository gate passed at HEAD
+  `61df6a7757caa539ea73f658499e246daf73d03a`; local HEAD matched
+  `origin/simostocco/position-encoding-benchmark`, and the worktree/index were
+  clean before editing.
+- Focused Phase 12B3B command passed 56 tests:
+  `tests/test_position_benchmark_attributions.py`.
+- Direct CLI help command passed and displayed the five-token
+  `--position-run` contract.
+- Phase 12B1/B2 benchmark regressions passed 127 tests:
+  `tests/test_position_benchmark_metadata.py`,
+  `tests/test_position_benchmark_performance.py`,
+  `tests/test_compare_ablation_rankings.py`, and
+  `tests/test_position_benchmark_rankings.py`.
+- Phase 12B3A provenance regressions passed 40 tests with 1 existing
+  deprecation warning in `tests/test_phase3_explain.py`.
+- Full-suite regression coverage completed via four non-overlapping
+  test-file shards, not a monolithic full-suite run:
+  - shard 1: 376 passed, 1 warning.
+  - shard 2: 272 passed.
+  - shard 3: 456 passed, 1 skipped, 5 warnings.
+  - shard 4: 426 passed.
+  - summed shard coverage: 1530 passed, 1 skipped, 6 warnings.
+- `compileall` passed for
+  `scripts/compare_position_attributions.py` and
+  `tests/test_position_benchmark_attributions.py`.
+- `git diff --check` passed.
+- Ruff and isort passed on the two new Python files.
+- Black formatted the two new files, and bounded `black --check` runs reported
+  `2 files would be left unchanged`; in this environment the Black process did
+  not exit before the timeout after printing that result.
+- Forbidden-path diff was empty for `scripts/explain.py`, `scripts/train.py`,
+  `scripts/compare_attributions.py`, `scripts/compare_ablation_rankings.py`,
+  `scripts/bootstrap_null_calibration.py`,
+  `scripts/run_null_baseline_analysis.sh`, `src/models`, `src/encoding`,
+  `src/explain`, and `src/data`.
+
+Known limitations:
+
+- The comparator requires completed content-IG artifacts with Phase 12B3A model
+  provenance; older explanation outputs must be regenerated before use.
+- It compares raw attribution stability only. It does not perform null
+  calibration, bootstrap uncertainty estimation, or workflow orchestration.
+- Aggregate NPZ loading remains a trusted-local-artifact operation because the
+  historical aggregate schema uses object arrays.
+
 ## Next planned phase
 
-Phase 12B3B - Position-Encoding Attribution Stability Comparison
+Phase 12C - Positional Benchmark Orchestration and Null Workflow Integration
