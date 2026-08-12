@@ -2911,6 +2911,134 @@ Known limitations:
 - Existing dataset metadata does not prove identical cohorts beyond the
   recorded mapping hashes and data-source/covariate provenance.
 
+## Phase 12B2 - Position-Encoding Ranking Stability
+
+Goal:
+
+- Add read-only, strategy-aware ranking-stability comparison for completed
+  positional benchmark explanation runs.
+- Preserve the historical annotation-level ablation ranking comparison as the
+  default behavior.
+
+Files changed:
+
+- `scripts/compare_ablation_rankings.py`
+- `scripts/position_benchmark_metadata.py`
+- `tests/test_compare_ablation_rankings.py`
+- `tests/test_position_benchmark_rankings.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Added `--comparison-axis {level,position}` to
+  `scripts/compare_ablation_rankings.py`, defaulting to `level`.
+- Moved the historical annotation-level CLI execution into a private
+  level-mode runner while preserving the existing ranking-file discovery,
+  score semantics, warning behavior, TSV headers, YAML keys, and output
+  filenames.
+- Added explicit repeated `--position-run RUN_ID CONFIG_YAML RANKING_CSV
+  ANALYSIS_METADATA_YAML` input for position mode. Position strategy identity
+  is always derived from the authoritative training `config.yaml`; ranking
+  CSVs, analysis metadata, paths, and run IDs are not used to infer strategy.
+- Reused Phase 12B1 training-context helpers for strategy identity and
+  non-positional compatibility. `input_dim` may differ across positional
+  strategies, while `content_dim` and other non-positional training/data
+  context fields must match.
+- Added explanation-context extraction and compatibility checks for content
+  Integrated Gradients. Position ranking mode requires raw content-space IG
+  metadata with observed absolute position held fixed.
+- Required raw ranking CSV provenance columns (`resolved_ig_mode`,
+  `attribution_feature_space`, and `variant_score_aggregation`) in position
+  mode and checked their constant per-file values against
+  `analysis_metadata.integrated_gradients`.
+- Kept full positional strategy identity exclusively config-derived. Ranking
+  provenance fields validate attribution-mode compatibility only; they do not
+  replace or augment config-derived strategy identity.
+- Enforced per-run content attribution width:
+  `integrated_gradients.attribution_width` must equal both serialized
+  `content_dim` and IG `content_dim`.
+- Restricted position-mode score columns to raw explanation ranking columns:
+  `rank`, `mean_attribution`, and `max_attribution`. Calibrated, null-derived,
+  bootstrap-derived, or chromosome-corrected ranking columns are rejected until
+  provenance validation is added in Phase 12C.
+- Required an exact variant universe across compared position runs before
+  computing top-k Jaccard values.
+- Made position-mode variant keys strict: use non-empty `variant_id` when
+  present, otherwise require all of chromosome, position, and gene ID. The
+  historical chromosome-position-only fallback remains available only in
+  level mode.
+- Made position-mode tie-breaking independent of CSV row order by sorting on
+  score first and `variant_id` second.
+- Added tidy position-mode outputs: pairwise top-k Jaccard rows with strategy
+  IDs and one row per strategy-specific variant/other-run comparison.
+- Rejected mixed-mode CLI inputs: position mode rejects `--ranking-dir` and
+  `--rankings`, while level mode rejects `--position-run`.
+- Created parent directories independently for all three position-mode outputs:
+  comparison YAML, Jaccard TSV, and strategy-specific TSV.
+
+Runtime behavior:
+
+- Historical level mode remains the default and does not require positional
+  config or analysis metadata.
+- Position mode performs no training, explanation, checkpoint loading, model
+  construction, statistical testing, null-baseline integration, bootstrap
+  integration, or attribution-magnitude stability analysis.
+- Position mode compares completed raw explanation ranking CSVs only.
+- Position mode refuses ranking CSVs whose available attribution provenance
+  does not match analysis metadata, including legacy-IG ranking CSVs paired
+  with content-IG metadata.
+
+Compatibility effects:
+
+- Existing `compare_ablation_rankings.py` level-mode commands keep the
+  historical default `z_attribution` behavior through the level runner.
+- Direct script invocation (`python scripts/compare_ablation_rankings.py
+  --help`) and package import both work after importing Phase 12B1 helpers.
+- Position mode refuses ambiguous or non-comparable inputs rather than
+  producing a partially comparable ranking report.
+- Independent output directories are supported for all position-mode outputs.
+
+Validation:
+
+- Ranking-focused command passed 82 tests:
+  `tests/test_compare_ablation_rankings.py` and
+  `tests/test_position_benchmark_rankings.py`.
+- Direct CLI help command passed:
+  `/home/simostocco/miniforge3/envs/sieve-posenc/bin/python
+  scripts/compare_ablation_rankings.py --help`.
+- Phase 12B1 companion metadata/performance command passed 45 tests.
+- Full-suite regression coverage completed via four non-overlapping
+  test-file shards, not a monolithic full-suite run:
+  - shard 1 rerun: 367 passed, 1 warning in 44.30 seconds. The first shard-1
+    attempt had one load-sensitive timeout in
+    `tests/test_phase3_explain.py::test_validate_epistasis_no_data`; that test
+    passed alone and shard 1 passed on rerun.
+  - shard 2: 313 passed in 6.12 seconds.
+  - shard 3: 331 passed, 1 skipped, 5 warnings in 98.48 seconds.
+  - shard 4: 443 passed in 144.95 seconds.
+  - summed shard coverage: 1454 passed, 1 skipped, 6 warnings.
+- `compileall` passed for the changed ranking script/module/test files.
+- `git diff --check` passed.
+- Ruff, Black check, and isort passed on
+  `scripts/position_benchmark_metadata.py` and
+  `tests/test_position_benchmark_rankings.py`.
+- Legacy modified files were compared against committed baselines:
+  `scripts/compare_ablation_rankings.py` and
+  `tests/test_compare_ablation_rankings.py`. Ruff current findings decreased
+  from 71 to 70. Baseline and current Black checks both report the same two
+  legacy files would be reformatted. Baseline isort reported both legacy files;
+  current isort reports only `tests/test_compare_ablation_rankings.py`.
+
+Known limitations:
+
+- Position-mode ranking stability compares top-k Jaccard and
+  strategy-specific high-ranking variants only.
+- Calibrated/null-derived ranking comparison remains deferred until Phase 12C
+  can validate provenance.
+- Attribution magnitude stability is not implemented in this phase.
+- Regression coverage was completed in four shards because the prior
+  monolithic full-suite run did not complete within the bounded window.
+
 ## Next planned phase
 
-Phase 12B2 - Position-Encoding Ranking Stability
+Phase 12B3 - Position-Encoding Attribution Stability

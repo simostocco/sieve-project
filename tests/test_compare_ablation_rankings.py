@@ -517,3 +517,153 @@ def test_missing_delta_rank_column_errors_cleanly(
 
     assert exit_code == 1
     assert "delta_rank" in captured.err
+
+
+def test_explicit_rankings_level_mode_keeps_legacy_outputs_without_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Explicit LEVEL:PATH mode should not require positional metadata."""
+    l0_path = tmp_path / "custom_l0.csv"
+    l1_path = tmp_path / "custom_l1.csv"
+    write_variant_rankings(
+        l0_path,
+        [
+            {
+                "variant_id": "1:100_A",
+                "gene_name": "GENE1",
+                "gene_id": 1,
+                "chromosome": "1",
+                "position": 100,
+                "z_attribution": 10.0,
+            },
+            {
+                "variant_id": "1:200_B",
+                "gene_name": "GENE2",
+                "gene_id": 2,
+                "chromosome": "1",
+                "position": 200,
+                "z_attribution": 1.0,
+            },
+        ],
+    )
+    write_variant_rankings(
+        l1_path,
+        [
+            {
+                "variant_id": "1:100_A",
+                "gene_name": "GENE1",
+                "gene_id": 1,
+                "chromosome": "1",
+                "position": 100,
+                "z_attribution": 1.0,
+            },
+            {
+                "variant_id": "1:300_C",
+                "gene_name": "GENE3",
+                "gene_id": 3,
+                "chromosome": "1",
+                "position": 300,
+                "z_attribution": 10.0,
+            },
+        ],
+    )
+
+    out_comparison = tmp_path / "summary.yaml"
+    out_jaccard = tmp_path / "jaccard.tsv"
+    out_level_specific = tmp_path / "level_specific.tsv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_ablation_rankings.py",
+            "--rankings",
+            f"L0:{l0_path}",
+            f"L1:{l1_path}",
+            "--top-k",
+            "1",
+            "--high-rank-threshold",
+            "1",
+            "--low-rank-threshold",
+            "1",
+            "--out-comparison",
+            str(out_comparison),
+            "--out-jaccard",
+            str(out_jaccard),
+            "--out-level-specific",
+            str(out_level_specific),
+        ],
+    )
+
+    assert ablation.main() == 0
+
+    jaccard_header = out_jaccard.read_text(encoding="utf-8").splitlines()[0]
+    assert jaccard_header.split("\t") == [
+        "top_k",
+        "level_a",
+        "level_b",
+        "jaccard",
+        "overlap",
+        "size_a",
+        "size_b",
+        "union",
+    ]
+    specific_header = out_level_specific.read_text(encoding="utf-8").splitlines()[0]
+    assert specific_header.split("\t") == [
+        "variant_id",
+        "gene",
+        "chrom",
+        "pos",
+        "specific_to_level",
+        "rank_at_specific_level",
+        "rank_at_L0",
+        "rank_at_L1",
+        "score_at_specific_level",
+    ]
+    summary = yaml.safe_load(out_comparison.read_text(encoding="utf-8"))
+    assert summary["levels_analysed"] == ["L0", "L1"]
+    assert set(summary["jaccard_matrices"]["top_1"]) == {"L0_vs_L1"}
+    assert summary["level_specific_variant_counts"] == {"L0": 1, "L1": 1}
+
+
+def test_level_mode_one_file_warning_is_preserved(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A single discovered level should still warn rather than fail."""
+    ranking_dir = tmp_path / "rankings"
+    ranking_dir.mkdir()
+    write_variant_rankings(
+        ranking_dir / "L0_sieve_variant_rankings.csv",
+        [
+            {
+                "variant_id": "1:100_A",
+                "gene_name": "GENE1",
+                "gene_id": 1,
+                "chromosome": "1",
+                "position": 100,
+                "z_attribution": 10.0,
+            }
+        ],
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_ablation_rankings.py",
+            "--ranking-dir",
+            str(ranking_dir),
+            "--out-comparison",
+            str(tmp_path / "summary.yaml"),
+            "--out-jaccard",
+            str(tmp_path / "jaccard.tsv"),
+            "--out-level-specific",
+            str(tmp_path / "specific.tsv"),
+        ],
+    )
+
+    assert ablation.main() == 0
+
+    assert "Need at least 2 levels" in capsys.readouterr().err

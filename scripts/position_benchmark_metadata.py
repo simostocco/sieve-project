@@ -41,6 +41,14 @@ class ComparisonContext:
 
 
 @dataclass(frozen=True)
+class ExplanationContext:
+    """Integrated-Gradients comparison context for one explanation run."""
+
+    run_id: str
+    fields: dict[str, object]
+
+
+@dataclass(frozen=True)
 class CompatibilityMismatch:
     """One context field whose values differ across compared runs."""
 
@@ -128,6 +136,24 @@ REQUIRED_CONTEXT_FIELDS = (
     "pc_map",
     "pc_map_sha256",
     "num_pcs",
+)
+
+REQUIRED_EXPLANATION_CONTEXT_FIELDS = (
+    "annotation_level",
+    "n_samples",
+    "aggregation_method",
+    "integrated_gradients.attribution_schema_version",
+    "integrated_gradients.resolved_ig_mode",
+    "integrated_gradients.attribution_feature_space",
+    "integrated_gradients.attribution_width",
+    "integrated_gradients.content_dim",
+    "integrated_gradients.variant_score_aggregation",
+    "integrated_gradients.baseline_policy",
+    "integrated_gradients.n_steps",
+    "integrated_gradients.max_variants",
+    "integrated_gradients.sampling_policy",
+    "integrated_gradients.sampling_seed",
+    "integrated_gradients.comparability_warning",
 )
 
 
@@ -289,6 +315,26 @@ def extract_comparison_context(
     return ComparisonContext(run_id=run_id, fields=fields)
 
 
+def extract_explanation_context(
+    analysis_metadata: Mapping[str, object],
+    *,
+    run_id: str,
+) -> ExplanationContext:
+    """Extract required IG comparison fields from analysis metadata."""
+    fields: dict[str, object] = {}
+    missing_fields = []
+    for field in REQUIRED_EXPLANATION_CONTEXT_FIELDS:
+        present, value = _lookup_dotted(analysis_metadata, field)
+        if not present:
+            missing_fields.append(field)
+        else:
+            fields[field] = value
+    if missing_fields:
+        missing = ", ".join(missing_fields)
+        raise ValueError(f"run {run_id!r} is missing required explanation fields: {missing}")
+    return ExplanationContext(run_id=run_id, fields=fields)
+
+
 def compare_contexts(contexts: Sequence[ComparisonContext]) -> CompatibilityReport:
     """Compare predictive contexts and return all field mismatches."""
     if not contexts:
@@ -296,6 +342,33 @@ def compare_contexts(contexts: Sequence[ComparisonContext]) -> CompatibilityRepo
 
     _validate_unique_run_ids(contexts)
     compared_fields = list(REQUIRED_CONTEXT_FIELDS)
+    mismatches: list[CompatibilityMismatch] = []
+    for field in compared_fields:
+        values_by_run = {context.run_id: context.fields[field] for context in contexts}
+        if len({_canonical_compare_value(value) for value in values_by_run.values()}) != 1:
+            mismatches.append(
+                CompatibilityMismatch(
+                    field=field,
+                    values_by_run=values_by_run,
+                )
+            )
+
+    return CompatibilityReport(
+        compatible=not mismatches,
+        compared_fields=compared_fields,
+        mismatches=mismatches,
+    )
+
+
+def compare_explanation_contexts(
+    contexts: Sequence[ExplanationContext],
+) -> CompatibilityReport:
+    """Compare explanation contexts and return all field mismatches."""
+    if not contexts:
+        raise ValueError("at least one explanation context is required")
+
+    _validate_unique_run_ids(contexts)
+    compared_fields = list(REQUIRED_EXPLANATION_CONTEXT_FIELDS)
     mismatches: list[CompatibilityMismatch] = []
     for field in compared_fields:
         values_by_run = {context.run_id: context.fields[field] for context in contexts}
@@ -326,6 +399,20 @@ def require_compatible_contexts(
         f"{mismatch.field}: {mismatch.values_by_run}" for mismatch in report.mismatches
     )
     raise ValueError(f"position comparison context mismatch: {details}")
+
+
+def require_compatible_explanation_contexts(
+    contexts: Sequence[ExplanationContext],
+) -> CompatibilityReport:
+    """Return explanation compatibility report or raise with mismatch details."""
+    report = compare_explanation_contexts(contexts)
+    if report.compatible:
+        return report
+
+    details = "; ".join(
+        f"{mismatch.field}: {mismatch.values_by_run}" for mismatch in report.mismatches
+    )
+    raise ValueError(f"position explanation context mismatch: {details}")
 
 
 def _mapping(

@@ -48,15 +48,59 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import math
 import pathlib
 import re
 import sys
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
+if __package__ in {None, ""}:
+    from position_benchmark_metadata import (
+        ComparisonContext,
+        ExplanationContext,
+        PositionStrategyIdentity,
+        extract_comparison_context,
+        extract_explanation_context,
+        position_strategy_identity,
+        require_compatible_contexts,
+        require_compatible_explanation_contexts,
+    )
+else:
+    from .position_benchmark_metadata import (
+        ComparisonContext,
+        ExplanationContext,
+        PositionStrategyIdentity,
+        extract_comparison_context,
+        extract_explanation_context,
+        position_strategy_identity,
+        require_compatible_contexts,
+        require_compatible_explanation_contexts,
+    )
+
 
 LEVEL_ORDER = ["L0", "L1", "L2", "L3"]
+POSITION_SCORE_COLUMNS = {
+    "rank": "ascending",
+    "mean_attribution": "descending",
+    "max_attribution": "descending",
+}
+POSITION_RANKING_PROVENANCE_COLUMNS = (
+    "resolved_ig_mode",
+    "attribution_feature_space",
+    "variant_score_aggregation",
+)
+DEFERRED_CALIBRATED_SCORE_COLUMNS = {
+    "delta_rank",
+    "z_attribution",
+    "p_rank_boot",
+    "rank_real",
+    "median_rank_null_boot",
+    "corrected_rank",
+}
 
 # ---------------------------------------------------------------------------
 # YAML output helper
@@ -76,6 +120,15 @@ def dump_yaml(value: Any, path: pathlib.Path) -> None:
     """
     with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(value, handle, sort_keys=False)
+
+
+def load_yaml(path: pathlib.Path) -> dict[str, Any]:
+    """Load a YAML mapping from *path*."""
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +166,29 @@ _ASCENDING_SCORE_COLUMNS = frozenset(
         "median_rank_null_boot",
     }
 )
+
+
+@dataclass(frozen=True)
+class PositionRunSpec:
+    """CLI-supplied files for one positional ranking run."""
+
+    run_id: str
+    config_path: pathlib.Path
+    ranking_path: pathlib.Path
+    analysis_metadata_path: pathlib.Path
+
+
+@dataclass(frozen=True)
+class PositionRankingRun:
+    """Loaded metadata and rankings for one positional ranking run."""
+
+    spec: PositionRunSpec
+    config: dict[str, Any]
+    analysis_metadata: dict[str, Any]
+    identity: PositionStrategyIdentity
+    training_context: ComparisonContext
+    explanation_context: ExplanationContext
+    rankings: list[dict[str, Any]]
 
 
 def _find_column(headers: List[str], candidates: List[str]) -> Optional[str]:
@@ -285,6 +361,185 @@ def load_rankings(
     for i, row in enumerate(rows):
         row["rank"] = i + 1
     return rows, resolved_col, was_explicit
+
+
+def _resolve_position_score_column(headers: list[str], score_column: str | None) -> str:
+    """Resolve and validate an explicitly requested raw explanation score column."""
+    if score_column is None:
+        raise ValueError("position comparison requires explicit --score-column")
+
+    requested = score_column.lower()
+    if (
+        requested in DEFERRED_CALIBRATED_SCORE_COLUMNS
+        or requested.startswith("empirical_p")
+        or requested.startswith("fdr")
+    ):
+        raise ValueError(
+            "calibrated/null-derived ranking comparison is deferred until "
+            "provenance can be validated in Phase 12C"
+        )
+    if requested not in POSITION_SCORE_COLUMNS:
+        allowed = ", ".join(sorted(POSITION_SCORE_COLUMNS))
+        raise ValueError(
+            f"position comparison --score-column must be one of: {allowed}"
+        )
+
+    lower_headers = {h.lower(): h for h in headers}
+    if requested not in lower_headers:
+        raise ValueError(f"--score-column '{score_column}' not found in headers: {headers}")
+    return lower_headers[requested]
+
+
+def _build_position_variant_id(
+    row: dict[str, str],
+    headers: list[str],
+    *,
+    run_id: str,
+    row_number: int,
+) -> str:
+    """Build the strict position-mode variant key from one CSV row."""
+    vid_col = _find_column(headers, VARIANT_ID_COLUMNS)
+    if vid_col and row.get(vid_col, "").strip():
+        return row[vid_col].strip()
+
+    chrom_col = _find_column(headers, CHROM_COLUMNS)
+    pos_col = _find_column(headers, POS_COLUMNS)
+    gene_id_col = _find_column(headers, GENE_ID_COLUMNS)
+    components = {
+        "chromosome": row.get(chrom_col, "").strip() if chrom_col else "",
+        "position": row.get(pos_col, "").strip() if pos_col else "",
+        "gene_id": row.get(gene_id_col, "").strip() if gene_id_col else "",
+    }
+    missing = [name for name, value in components.items() if not value]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"run {run_id!r} row {row_number} cannot build variant_id; "
+            f"missing components: {missing_text}"
+        )
+    return f"{components['chromosome']}:{components['position']}_{components['gene_id']}"
+
+
+def _parse_position_score(
+    value: str,
+    *,
+    run_id: str,
+    variant_id: str,
+    score_column: str,
+) -> float:
+    """Parse a strict finite score for position-mode ranking."""
+    if value is None or not str(value).strip():
+        raise ValueError(
+            f"run {run_id!r} variant {variant_id!r} has empty {score_column} score"
+        )
+    try:
+        score = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"run {run_id!r} variant {variant_id!r} has non-numeric "
+            f"{score_column} score: {value!r}"
+        ) from exc
+    if not math.isfinite(score):
+        raise ValueError(
+            f"run {run_id!r} variant {variant_id!r} has non-finite "
+            f"{score_column} score: {value!r}"
+        )
+    return score
+
+
+def load_position_rankings(
+    csv_path: pathlib.Path,
+    *,
+    run_id: str,
+    score_column: str,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """Load a strict raw explanation ranking CSV for position-mode comparison."""
+    with csv_path.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        headers = reader.fieldnames or []
+        resolved_col = _resolve_position_score_column(headers, score_column)
+        sort_order = POSITION_SCORE_COLUMNS[resolved_col.lower()]
+        rows: list[dict[str, Any]] = []
+        for row_number, row in enumerate(reader, start=2):
+            vid = _build_position_variant_id(
+                row,
+                headers,
+                run_id=run_id,
+                row_number=row_number,
+            )
+            score = _parse_position_score(
+                row.get(resolved_col, ""),
+                run_id=run_id,
+                variant_id=vid,
+                score_column=resolved_col,
+            )
+            rows.append(
+                {
+                    "variant_id": vid,
+                    "score": score,
+                    "gene": _get_field(row, headers, GENE_COLUMNS),
+                    "chrom": _get_field(row, headers, CHROM_COLUMNS),
+                    "pos": _get_field(row, headers, POS_COLUMNS),
+                }
+            )
+
+    counts = Counter(row["variant_id"] for row in rows)
+    duplicates = sorted(variant_id for variant_id, count in counts.items() if count > 1)
+    if duplicates:
+        examples = ", ".join(duplicates[:5])
+        raise ValueError(
+            f"run {run_id!r} contains {len(duplicates)} duplicate variant_id "
+            f"values; examples: {examples}"
+        )
+
+    if sort_order == "ascending":
+        rows.sort(key=lambda row: (row["score"], row["variant_id"]))
+    else:
+        rows.sort(key=lambda row: (-row["score"], row["variant_id"]))
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows, resolved_col, sort_order
+
+
+def load_position_ranking_provenance(
+    csv_path: pathlib.Path,
+    *,
+    run_id: str,
+) -> dict[str, str]:
+    """Load constant ranking provenance fields from a position-mode CSV."""
+    with csv_path.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        headers = reader.fieldnames or []
+        lower_headers = {header.lower(): header for header in headers}
+        resolved_columns = {}
+        for field in POSITION_RANKING_PROVENANCE_COLUMNS:
+            if field not in lower_headers:
+                raise ValueError(
+                    f"run {run_id!r} ranking CSV is missing provenance column {field!r}"
+                )
+            resolved_columns[field] = lower_headers[field]
+
+        values_by_field = {field: set() for field in POSITION_RANKING_PROVENANCE_COLUMNS}
+        for row_number, row in enumerate(reader, start=2):
+            for field, column in resolved_columns.items():
+                value = row.get(column, "").strip()
+                if not value:
+                    raise ValueError(
+                        f"run {run_id!r} ranking CSV row {row_number} has empty "
+                        f"provenance field {field!r}"
+                    )
+                values_by_field[field].add(value)
+
+    provenance = {}
+    for field, values in values_by_field.items():
+        if len(values) != 1:
+            examples = sorted(values)
+            raise ValueError(
+                f"run {run_id!r} ranking CSV provenance field {field!r} has "
+                f"inconsistent row values: {examples}"
+            )
+        provenance[field] = next(iter(values))
+    return provenance
 
 
 def find_ranking_files(ranking_dir: pathlib.Path) -> Dict[str, pathlib.Path]:
@@ -487,6 +742,132 @@ def find_level_specific_variants(
     return results
 
 
+def _parse_top_k_values(raw_top_k: str, *, require_positive: bool = False) -> list[int]:
+    """Parse comma-separated top-k values."""
+    values = [int(k.strip()) for k in raw_top_k.split(",")]
+    if require_positive and any(value <= 0 for value in values):
+        raise ValueError("--top-k values must be positive integers")
+    return values
+
+
+def _validate_position_universe(runs: list[PositionRankingRun]) -> set[str]:
+    """Require every position run to contain the exact same variant IDs."""
+    ordered_runs = sorted(runs, key=lambda run: run.spec.run_id)
+    reference = ordered_runs[0]
+    reference_ids = {row["variant_id"] for row in reference.rankings}
+    for run in ordered_runs[1:]:
+        run_ids = {row["variant_id"] for row in run.rankings}
+        if run_ids != reference_ids:
+            missing = sorted(reference_ids - run_ids)
+            extra = sorted(run_ids - reference_ids)
+            raise ValueError(
+                f"variant universe mismatch: reference run {reference.spec.run_id!r} "
+                f"has {len(reference_ids)} variants but run {run.spec.run_id!r} "
+                f"has {len(run_ids)} variants; missing count {len(missing)}, "
+                f"extra count {len(extra)}; missing examples {missing[:5]}, "
+                f"extra examples {extra[:5]}"
+            )
+    return reference_ids
+
+
+def compute_position_jaccard_matrices(
+    runs: list[PositionRankingRun],
+    top_k_values: list[int],
+    *,
+    score_column: str,
+    score_sort_order: str,
+) -> dict[int, list[dict[str, Any]]]:
+    """Compute pairwise top-k Jaccard rows for position runs."""
+    matrices: dict[int, list[dict[str, Any]]] = {}
+    ordered_runs = sorted(runs, key=lambda run: run.spec.run_id)
+
+    for top_k in top_k_values:
+        top_sets: dict[str, set[str]] = {}
+        for run in ordered_runs:
+            top_sets[run.spec.run_id] = {
+                row["variant_id"] for row in run.rankings[:top_k]
+            }
+
+        rows: list[dict[str, Any]] = []
+        for run_a, run_b in itertools.combinations(ordered_runs, 2):
+            run_id_a = run_a.spec.run_id
+            run_id_b = run_b.spec.run_id
+            set_a = top_sets[run_id_a]
+            set_b = top_sets[run_id_b]
+            jaccard, overlap, union_size = compute_jaccard(set_a, set_b)
+            rows.append(
+                {
+                    "top_k": top_k,
+                    "run_id_a": run_id_a,
+                    "run_id_b": run_id_b,
+                    "position_strategy_id_a": run_a.identity.strategy_id,
+                    "position_strategy_id_b": run_b.identity.strategy_id,
+                    "jaccard": round(jaccard, 4),
+                    "overlap": overlap,
+                    "size_a": len(set_a),
+                    "size_b": len(set_b),
+                    "union": union_size,
+                    "score_column": score_column,
+                    "score_sort_order": score_sort_order,
+                }
+            )
+        matrices[top_k] = rows
+
+    return matrices
+
+
+def find_strategy_specific_variants(
+    runs: list[PositionRankingRun],
+    high_rank_threshold: int,
+    low_rank_threshold: int,
+) -> list[dict[str, Any]]:
+    """Find variants high-ranked in one positional strategy and low-ranked elsewhere."""
+    ordered_runs = sorted(runs, key=lambda run: run.spec.run_id)
+    rank_lookup = {
+        run.spec.run_id: {row["variant_id"]: row["rank"] for row in run.rankings}
+        for run in ordered_runs
+    }
+
+    rows: list[dict[str, Any]] = []
+    for run in ordered_runs:
+        other_runs = [other for other in ordered_runs if other.spec.run_id != run.spec.run_id]
+        high_rows = [row for row in run.rankings if row["rank"] <= high_rank_threshold]
+        for variant_row in high_rows:
+            variant_id = variant_row["variant_id"]
+            if all(
+                rank_lookup[other.spec.run_id][variant_id] > low_rank_threshold
+                for other in other_runs
+            ):
+                for other in other_runs:
+                    rows.append(
+                        {
+                            "variant_id": variant_id,
+                            "gene": variant_row.get("gene", ""),
+                            "chrom": variant_row.get("chrom", ""),
+                            "pos": variant_row.get("pos", ""),
+                            "specific_to_run_id": run.spec.run_id,
+                            "specific_to_position_strategy_id": run.identity.strategy_id,
+                            "rank_at_specific_strategy": variant_row["rank"],
+                            "score_at_specific_strategy": variant_row["score"],
+                            "other_run_id": other.spec.run_id,
+                            "other_position_strategy_id": other.identity.strategy_id,
+                            "rank_at_other_strategy": rank_lookup[other.spec.run_id][
+                                variant_id
+                            ],
+                        }
+                    )
+
+    rows.sort(
+        key=lambda row: (
+            row["specific_to_run_id"],
+            row["rank_at_specific_strategy"],
+            row["variant_id"],
+            row["other_run_id"],
+        )
+    )
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # CLI and main
 # ---------------------------------------------------------------------------
@@ -498,7 +879,13 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--comparison-axis",
+        choices=("level", "position"),
+        default="level",
+        help="Comparison axis to evaluate (default: level)",
+    )
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "--ranking-dir",
         type=str,
@@ -515,6 +902,16 @@ def parse_args() -> argparse.Namespace:
             "Explicit per-level ranking files, e.g. "
             "L0:results/L0/sieve_variant_rankings.csv "
             "L1:results/L1/sieve_variant_rankings.csv"
+        ),
+    )
+    parser.add_argument(
+        "--position-run",
+        action="append",
+        nargs=4,
+        metavar=("RUN_ID", "CONFIG_YAML", "RANKING_CSV", "ANALYSIS_METADATA_YAML"),
+        help=(
+            "Position-mode run specification. Repeat once per strategy. "
+            "Strategy identity is read from CONFIG_YAML."
         ),
     )
     parser.add_argument(
@@ -552,7 +949,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-column",
         type=str,
-        default="z_attribution",
+        default=None,
         help=(
             "Column name to use for ranking variants. delta_rank is the "
             "recommended choice: it is scale-free, stable across annotation "
@@ -591,11 +988,413 @@ def _parse_rankings_arg(rankings: List[str]) -> Dict[str, pathlib.Path]:
     return level_files
 
 
-def main() -> int:
-    """Entry point for the ablation ranking comparison."""
-    args = parse_args()
+def _parse_position_run_specs(
+    position_runs: list[list[str]] | None,
+) -> list[PositionRunSpec]:
+    """Parse and validate repeated --position-run arguments."""
+    if position_runs is None or len(position_runs) < 2:
+        raise ValueError("position comparison requires at least two --position-run entries")
 
-    if args.score_column == "empirical_p_variant":
+    specs: list[PositionRunSpec] = []
+    seen = set()
+    duplicates = set()
+    for run_id, config_path, ranking_path, analysis_path in position_runs:
+        if run_id in seen:
+            duplicates.add(run_id)
+        seen.add(run_id)
+        spec = PositionRunSpec(
+            run_id=run_id,
+            config_path=pathlib.Path(config_path),
+            ranking_path=pathlib.Path(ranking_path),
+            analysis_metadata_path=pathlib.Path(analysis_path),
+        )
+        for path in (spec.config_path, spec.ranking_path, spec.analysis_metadata_path):
+            if not path.exists():
+                raise FileNotFoundError(f"position run {run_id!r} path not found: {path}")
+        specs.append(spec)
+
+    if duplicates:
+        duplicate_list = ", ".join(repr(run_id) for run_id in sorted(duplicates))
+        raise ValueError(f"duplicate position run IDs are not allowed: {duplicate_list}")
+    return sorted(specs, key=lambda spec: spec.run_id)
+
+
+def _required_mapping(
+    data: dict[str, Any],
+    key: str,
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"run {run_id!r} requires analysis_metadata[{key!r}] mapping")
+    return value
+
+
+def _require_run_equal(
+    *,
+    run_id: str,
+    field: str,
+    config_value: Any,
+    analysis_value: Any,
+) -> None:
+    if config_value != analysis_value:
+        raise ValueError(
+            f"run {run_id!r} {field} mismatch: config value {config_value!r}, "
+            f"analysis metadata value {analysis_value!r}"
+        )
+
+
+def _require_ranking_provenance_equal(
+    *,
+    run_id: str,
+    field: str,
+    ranking_value: Any,
+    analysis_value: Any,
+) -> None:
+    if ranking_value != analysis_value:
+        raise ValueError(
+            f"run {run_id!r} {field} mismatch: ranking CSV value "
+            f"{ranking_value!r}, analysis metadata value {analysis_value!r}"
+        )
+
+
+def _validate_position_analysis_metadata(
+    *,
+    spec: PositionRunSpec,
+    config: dict[str, Any],
+    analysis_metadata: dict[str, Any],
+    identity: PositionStrategyIdentity,
+) -> None:
+    """Validate analysis metadata required for raw content-IG ranking comparison."""
+    run_id = spec.run_id
+    ig = _required_mapping(analysis_metadata, "integrated_gradients", run_id=run_id)
+    if ig.get("executed") is not True:
+        raise ValueError(f"run {run_id!r} integrated_gradients.executed must be True")
+    if analysis_metadata.get("is_null_baseline") is not False:
+        raise ValueError(f"run {run_id!r} analysis_metadata.is_null_baseline must be False")
+
+    required_ig_values = {
+        "resolved_ig_mode": "content",
+        "attribution_feature_space": "content",
+        "comparability_warning": None,
+        "baseline_policy": "zero_content_observed_absolute_position",
+        "position_encoding_metadata_source": "reconstructed_resolved_config",
+    }
+    for field, expected in required_ig_values.items():
+        value = ig.get(field)
+        if value != expected:
+            raise ValueError(
+                f"run {run_id!r} integrated_gradients.{field} must be "
+                f"{expected!r}, got {value!r}"
+            )
+
+    dataset_identity = config.get("dataset_identity")
+    if not isinstance(dataset_identity, dict):
+        raise ValueError(f"run {run_id!r} config.dataset_identity must be a mapping")
+
+    _require_run_equal(
+        run_id=run_id,
+        field="annotation_level",
+        config_value=config.get("level"),
+        analysis_value=analysis_metadata.get("annotation_level"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="genome_build",
+        config_value=dataset_identity.get("genome_build"),
+        analysis_value=analysis_metadata.get("genome_build"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.content_dim",
+        config_value=config.get("content_dim"),
+        analysis_value=ig.get("content_dim"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.attribution_width",
+        config_value=config.get("content_dim"),
+        analysis_value=ig.get("attribution_width"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.attribution_width",
+        config_value=ig.get("content_dim"),
+        analysis_value=ig.get("attribution_width"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.input_dim",
+        config_value=config.get("input_dim"),
+        analysis_value=ig.get("input_dim"),
+    )
+
+    absolute = identity.payload["absolute"]
+    relative = identity.payload["relative"]
+    chromosome = identity.payload["chromosome"]
+    if not isinstance(absolute, dict) or not isinstance(relative, dict) or not isinstance(
+        chromosome,
+        dict,
+    ):
+        raise ValueError(f"run {run_id!r} position strategy payload is malformed")
+
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.absolute_position_encoding",
+        config_value=absolute.get("type"),
+        analysis_value=ig.get("absolute_position_encoding"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.relative_position_encoding",
+        config_value=relative.get("type"),
+        analysis_value=ig.get("relative_position_encoding"),
+    )
+    _require_run_equal(
+        run_id=run_id,
+        field="integrated_gradients.chromosome_encoding",
+        config_value=chromosome.get("encoding"),
+        analysis_value=ig.get("chromosome_encoding"),
+    )
+
+
+def _validate_position_ranking_provenance(
+    *,
+    spec: PositionRunSpec,
+    analysis_metadata: dict[str, Any],
+) -> None:
+    """Require ranking CSV provenance to match IG analysis metadata."""
+    run_id = spec.run_id
+    ig = _required_mapping(analysis_metadata, "integrated_gradients", run_id=run_id)
+    provenance = load_position_ranking_provenance(
+        spec.ranking_path,
+        run_id=run_id,
+    )
+    for field, ranking_value in provenance.items():
+        _require_ranking_provenance_equal(
+            run_id=run_id,
+            field=field,
+            ranking_value=ranking_value,
+            analysis_value=ig.get(field),
+        )
+
+
+def _load_position_run(spec: PositionRunSpec, *, score_column: str) -> PositionRankingRun:
+    """Load and validate one position-mode run."""
+    config = load_yaml(spec.config_path)
+    analysis_metadata = load_yaml(spec.analysis_metadata_path)
+    identity = position_strategy_identity(config)
+    _validate_position_analysis_metadata(
+        spec=spec,
+        config=config,
+        analysis_metadata=analysis_metadata,
+        identity=identity,
+    )
+    _validate_position_ranking_provenance(
+        spec=spec,
+        analysis_metadata=analysis_metadata,
+    )
+    rankings, _, _ = load_position_rankings(
+        spec.ranking_path,
+        run_id=spec.run_id,
+        score_column=score_column,
+    )
+    return PositionRankingRun(
+        spec=spec,
+        config=config,
+        analysis_metadata=analysis_metadata,
+        identity=identity,
+        training_context=extract_comparison_context(config, run_id=spec.run_id),
+        explanation_context=extract_explanation_context(
+            analysis_metadata,
+            run_id=spec.run_id,
+        ),
+        rankings=rankings,
+    )
+
+
+def _write_position_jaccard_tsv(
+    path: pathlib.Path,
+    matrices: dict[int, list[dict[str, Any]]],
+    top_k_values: list[int],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "top_k",
+        "run_id_a",
+        "run_id_b",
+        "position_strategy_id_a",
+        "position_strategy_id_b",
+        "jaccard",
+        "overlap",
+        "size_a",
+        "size_b",
+        "union",
+        "score_column",
+        "score_sort_order",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for top_k in top_k_values:
+            for row in matrices.get(top_k, []):
+                writer.writerow(row)
+
+
+def _write_strategy_specific_tsv(
+    path: pathlib.Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "variant_id",
+        "gene",
+        "chrom",
+        "pos",
+        "specific_to_run_id",
+        "specific_to_position_strategy_id",
+        "rank_at_specific_strategy",
+        "score_at_specific_strategy",
+        "other_run_id",
+        "other_position_strategy_id",
+        "rank_at_other_strategy",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _run_position_comparison(args: argparse.Namespace) -> int:
+    """Run strategy-aware position ranking comparison."""
+    try:
+        if args.ranking_dir or args.rankings:
+            raise ValueError("position comparison rejects --ranking-dir and --rankings")
+        top_k_values = _parse_top_k_values(args.top_k, require_positive=True)
+        specs = _parse_position_run_specs(args.position_run)
+        score_column = args.score_column
+        if score_column is None:
+            raise ValueError("position comparison requires explicit --score-column")
+        runs = [_load_position_run(spec, score_column=score_column) for spec in specs]
+        training_report = require_compatible_contexts(
+            [run.training_context for run in runs]
+        )
+        explanation_report = require_compatible_explanation_contexts(
+            [run.explanation_context for run in runs]
+        )
+        variant_universe = _validate_position_universe(runs)
+        _, resolved_score_column, score_sort_order = load_position_rankings(
+            specs[0].ranking_path,
+            run_id=specs[0].run_id,
+            score_column=score_column,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    jaccard_matrices = compute_position_jaccard_matrices(
+        runs,
+        top_k_values,
+        score_column=resolved_score_column,
+        score_sort_order=score_sort_order,
+    )
+    strategy_specific = find_strategy_specific_variants(
+        runs,
+        args.high_rank_threshold,
+        args.low_rank_threshold,
+    )
+
+    _write_position_jaccard_tsv(
+        pathlib.Path(args.out_jaccard),
+        jaccard_matrices,
+        top_k_values,
+    )
+    _write_strategy_specific_tsv(
+        pathlib.Path(args.out_level_specific),
+        strategy_specific,
+    )
+
+    strategy_specific_counts = []
+    for run in sorted(runs, key=lambda item: item.spec.run_id):
+        count = len(
+            {
+                row["variant_id"]
+                for row in strategy_specific
+                if row["specific_to_run_id"] == run.spec.run_id
+            }
+        )
+        strategy_specific_counts.append(
+            {
+                "run_id": run.spec.run_id,
+                "position_strategy_id": run.identity.strategy_id,
+                "count": count,
+            }
+        )
+
+    yaml_summary: dict[str, Any] = {
+        "comparison_axis": "position",
+        "score": {
+            "column": resolved_score_column,
+            "sort_order": score_sort_order,
+        },
+        "compatibility": {
+            "training_context": training_report.to_dict(),
+            "explanation_context": explanation_report.to_dict(),
+        },
+        "runs": [
+            {
+                "run_id": run.spec.run_id,
+                "position_strategy_id": run.identity.strategy_id,
+                "position_strategy_name": run.identity.name,
+                "position_strategy_hash": run.identity.hash,
+                "position_strategy": run.identity.payload,
+                "config_path": str(run.spec.config_path),
+                "ranking_path": str(run.spec.ranking_path),
+                "analysis_metadata_path": str(run.spec.analysis_metadata_path),
+                "n_variants": len(run.rankings),
+            }
+            for run in sorted(runs, key=lambda item: item.spec.run_id)
+        ],
+        "top_k_values": top_k_values,
+        "variant_universe": {
+            "n_variants": len(variant_universe),
+            "key_rule": "explicit_variant_id_else_chromosome_position_gene_id",
+        },
+        "jaccard_matrices": {
+            f"top_{top_k}": jaccard_matrices.get(top_k, [])
+            for top_k in top_k_values
+        },
+        "strategy_specific_variant_counts": strategy_specific_counts,
+        "thresholds": {
+            "high_rank_threshold": args.high_rank_threshold,
+            "low_rank_threshold": args.low_rank_threshold,
+        },
+    }
+    comparison_path = pathlib.Path(args.out_comparison)
+    comparison_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_yaml(yaml_summary, comparison_path)
+
+    print(f"Jaccard matrix written to {args.out_jaccard}", file=sys.stderr)
+    print(
+        f"Strategy-specific variants written to {args.out_level_specific} "
+        f"({len(strategy_specific)} rows)",
+        file=sys.stderr,
+    )
+    print(f"Comparison summary written to {args.out_comparison}", file=sys.stderr)
+    return 0
+
+
+def _run_level_comparison(args: argparse.Namespace) -> int:
+    """Run the historical annotation-level ranking comparison."""
+    if args.position_run:
+        print("ERROR: level comparison rejects --position-run", file=sys.stderr)
+        return 1
+
+    score_column = args.score_column or "z_attribution"
+
+    if score_column == "empirical_p_variant":
         print(
             "Warning: empirical_p_variant may be at the resolution floor for "
             "high-information annotation levels (median p pinned to 1/(N+1)), "
@@ -604,14 +1403,20 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    top_k_values = [int(k.strip()) for k in args.top_k.split(",")]
+    top_k_values = _parse_top_k_values(args.top_k)
 
     # Discover ranking files
     if args.ranking_dir:
         ranking_dir = pathlib.Path(args.ranking_dir)
         level_files = find_ranking_files(ranking_dir)
-    else:
+    elif args.rankings:
         level_files = _parse_rankings_arg(args.rankings)
+    else:
+        print(
+            "ERROR: No ranking files found. Check --ranking-dir or --rankings.",
+            file=sys.stderr,
+        )
+        return 1
 
     if not level_files:
         print(
@@ -636,7 +1441,7 @@ def main() -> int:
     for level, fpath in level_files.items():
         try:
             rankings, col_name, was_explicit = load_rankings(
-                fpath, score_column=args.score_column
+                fpath, score_column=score_column
             )
         except ValueError as exc:
             print(
@@ -769,6 +1574,14 @@ def main() -> int:
     )
     print(f"Comparison summary written to {args.out_comparison}", file=sys.stderr)
     return 0
+
+
+def main() -> int:
+    """Entry point for ranking comparison."""
+    args = parse_args()
+    if args.comparison_axis == "position":
+        return _run_position_comparison(args)
+    return _run_level_comparison(args)
 
 
 if __name__ == "__main__":
