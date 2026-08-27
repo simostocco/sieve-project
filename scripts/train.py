@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
+from sklearn.model_selection import train_test_split
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -72,6 +73,17 @@ from src.training import (
     print_fold_stats,
 )
 from src.training.loss import compute_class_weights
+from src.training.split_plan import (
+    build_cv_split_plan,
+    build_single_split_plan,
+    build_split_plan_metadata,
+    cv_folds_from_plan,
+    load_split_plan,
+    ordered_sample_ids,
+    single_split_from_plan,
+    validate_split_plan,
+    write_or_validate_existing_split_plan,
+)
 
 
 def _enum_choices(enum_cls) -> list[str]:
@@ -173,6 +185,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='Number of CV folds (if None, use single train/val split)')
     parser.add_argument('--val-split', type=float, default=0.2,
                         help='Validation split ratio (if not using CV)')
+    parser.add_argument(
+        '--split-plan',
+        type=str,
+        default=None,
+        help='Path to a saved split_plan.yaml whose exact sample indices should be replayed',
+    )
 
     # Output arguments
     parser.add_argument('--output-dir', type=str, default='outputs',
@@ -863,6 +881,81 @@ def _resolve_pos_weight(
     return None
 
 
+def prepare_training_split_plan(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    sample_ids: list[str],
+    labels: np.ndarray,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object] | None]:
+    """Resolve generated/replayed sample splits and persist split-plan metadata."""
+    mode = "cv" if args.cv is not None else "single_split"
+    expected_n_folds = args.cv if mode == "cv" else None
+    experiment_plan_path = output_dir / "split_plan.yaml"
+    input_plan_path = Path(args.split_plan).resolve() if args.split_plan else None
+    input_plan = None
+
+    if input_plan_path is not None:
+        input_plan = validate_split_plan(
+            load_split_plan(input_plan_path),
+            sample_ids=sample_ids,
+            expected_mode=mode,
+            expected_n_folds=expected_n_folds,
+        )
+        requested_plan = copy.deepcopy(input_plan)
+        requested_plan["split_source"] = "replayed"
+        source = "replayed"
+    elif mode == "cv":
+        generated_folds = create_stratified_folds(
+            labels,
+            n_folds=args.cv,
+            random_state=args.seed,
+        )
+        requested_plan = build_cv_split_plan(
+            folds=generated_folds,
+            sample_ids=sample_ids,
+            seed=args.seed,
+            split_source="generated",
+            n_folds=args.cv,
+        )
+        source = "generated"
+    else:
+        indices = np.arange(len(labels))
+        train_idx, val_idx = train_test_split(
+            indices,
+            test_size=args.val_split,
+            stratify=labels,
+            random_state=args.seed,
+        )
+        requested_plan = build_single_split_plan(
+            train_indices=train_idx,
+            val_indices=val_idx,
+            sample_ids=sample_ids,
+            seed=args.seed,
+            split_source="generated",
+        )
+        source = "generated"
+
+    # The split plan validates sample membership only. Labels and args.seed may
+    # differ during null replay because phenotype permutation is the scientific
+    # intervention Phase 12C needs to isolate.
+    experiment_plan = write_or_validate_existing_split_plan(
+        experiment_plan_path,
+        requested_plan,
+        sample_ids=sample_ids,
+        expected_mode=mode,
+        expected_n_folds=expected_n_folds,
+    )
+    metadata = build_split_plan_metadata(
+        source=source,
+        experiment_plan_path=experiment_plan_path,
+        plan=experiment_plan,
+        input_plan_path=input_plan_path,
+        input_plan=input_plan,
+    )
+    return experiment_plan, metadata, input_plan
+
+
 def train_single_fold(
     train_loader,
     val_loader,
@@ -1044,6 +1137,9 @@ def main():
             f"({dataset.num_covariates} vs {num_covariates})."
         )
 
+    sample_ids = ordered_sample_ids(all_samples)
+    labels = np.array([sample.label for sample in all_samples])
+
     # Get dimensions. New training runs are always explicit new-schema runs, so
     # the resolved positional configuration is the model-width authority.
     resolved_position_encoding = prepare_training_position_encoding(
@@ -1059,6 +1155,12 @@ def main():
         dataset.chrom_index,
     )
     training_mode = "cv" if args.cv is not None else "single_split"
+    split_plan, split_plan_metadata, _ = prepare_training_split_plan(
+        args=args,
+        output_dir=output_dir,
+        sample_ids=sample_ids,
+        labels=labels,
+    )
     run_metadata = build_training_run_metadata(
         input_dim=input_dim,
         num_genes=num_genes,
@@ -1070,6 +1172,7 @@ def main():
         chromosome_mapping_sha256=str(dataset_identity["chromosome_mapping_sha256"]),
         training_mode=training_mode,
     )
+    run_metadata["split_plan"] = split_plan_metadata
     serialized_position_encoding = run_metadata["position_encoding"]
     learned_binned_position_layout = _training_learned_binned_layout_from_metadata(
         resolved_position_encoding,
@@ -1094,7 +1197,6 @@ def main():
     print(f"CRITICAL: Using chunked processing for FULL GENOME coverage (not just chr1/chr2)!")
 
     # Get labels
-    labels = np.array([sample.label for sample in all_samples])
     n_cases = labels.sum()
     n_controls = len(labels) - n_cases
     print(f"Cases: {n_cases}, Controls: {n_controls} ({n_cases/len(labels):.1%} case rate)")
@@ -1124,7 +1226,7 @@ def main():
         print(f"Running {args.cv}-fold cross-validation")
         print(f"{'='*60}")
 
-        folds = create_stratified_folds(labels, n_folds=args.cv, random_state=args.seed)
+        folds = cv_folds_from_plan(split_plan)
         cv_results = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
@@ -1260,15 +1362,7 @@ def main():
         # Single train/val split
         print(f"\nUsing single train/val split ({1-args.val_split:.0%}/{args.val_split:.0%})")
 
-        # Create stratified split
-        from sklearn.model_selection import train_test_split
-        indices = np.arange(len(labels))
-        train_idx, val_idx = train_test_split(
-            indices,
-            test_size=args.val_split,
-            stratify=labels,
-            random_state=args.seed,
-        )
+        train_idx, val_idx = single_split_from_plan(split_plan)
 
         # Print split statistics
         train_labels = labels[train_idx]

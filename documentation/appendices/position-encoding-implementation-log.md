@@ -3302,4 +3302,117 @@ Known limitations:
 
 ## Next planned phase
 
-Phase 12C - Positional Benchmark Orchestration and Null Workflow Integration
+## Phase 12C2A - Exact Training Split Provenance and Replay
+
+Goal:
+
+- Add the split-provenance prerequisite needed for real-vs-null positional
+  benchmark orchestration.
+- Make exact sample train/validation membership serializable and replayable
+  without changing historical default split generation, model execution, null
+  orchestration, calibration, or downstream ranking comparison.
+
+Files changed:
+
+- `src/training/split_plan.py`
+- `scripts/train.py`
+- `tests/test_split_plan.py`
+- `tests/test_train_split_plan.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Added a versioned `split_plan.yaml` schema with `schema_version: 1`,
+  `mode`, `n_samples`, ordered full-sample `sample_ids_sha256`, `seed`,
+  `split_source`, and exact sample-level train/validation index membership.
+- Defined split-plan SHA-256 as a scientific sample-membership identity, not a
+  raw YAML file hash. The canonical payload includes only schema, mode, sample
+  count, full sample-ID hash, exact train/validation indices, subset
+  sample-ID hashes, and CV fold structure. It excludes `split_source`, `seed`,
+  filesystem paths, YAML formatting, and config/runtime provenance fields.
+- Used the ordered `all_samples` list in `train.py` as the sample-index
+  authority. Sample IDs must be strings, non-empty after `strip()`, and unique,
+  but the exact strings are hashed without stripping or normalization.
+- Kept generated default behavior additive and historical: CV still calls
+  `create_stratified_folds(labels, n_folds=args.cv, random_state=args.seed)`;
+  single split still calls `train_test_split(indices, test_size=args.val_split,
+  stratify=labels, random_state=args.seed)`. The generated result is then
+  normalized and validated through the same split-plan validator used for
+  replay.
+- Added `--split-plan PATH` for replay. Replay loads and validates exact saved
+  indices against the current ordered sample IDs and requested mode/fold count,
+  then uses those indices directly. Replay intentionally does not compare
+  labels and does not require `args.seed == split_plan.seed`; Phase 12C null
+  training needs to replay real sample membership against permuted labels.
+- Preserved class-weighting semantics. The class-weighting mode/configuration
+  remains saved as before, while numeric per-fold `pos_weight` is still derived
+  from the labels present in the replayed training subset.
+- Wrote or reused `<experiment>/split_plan.yaml` before any training/checkpoint
+  save. If the file already exists with identical membership it is reused
+  unchanged, even if `split_source`, `seed`, formatting, or key order differ.
+  If membership differs, training fails clearly.
+- Added additive `split_plan` metadata to parent configs, fold configs, and
+  checkpoint metadata via the existing run-metadata path. The metadata records
+  the current invocation source plus the immutable experiment split-plan path,
+  membership SHA-256, ordered sample-ID SHA-256, and replay input path/hash when
+  applicable.
+
+Runtime behavior:
+
+- New training runs always write or validate `<experiment>/split_plan.yaml`.
+- With no `--split-plan`, split membership is generated exactly as before and
+  then serialized.
+- With `--split-plan`, CV and single-split paths do not regenerate splits from
+  labels; they replay the saved train/validation sample indices exactly.
+- Existing CV `fold_info.yaml` files are still written and receive the same
+  sample indices used by the split plan.
+
+Compatibility effects:
+
+- No positional encoding, model, attention, reconstruction, explanation,
+  null-baseline, calibration, or downstream comparison behavior changed.
+- Existing training CLI defaults remain unchanged except for the additive
+  optional `--split-plan`.
+- Historical `seed`, `cv`, and `val_split` config fields remain serialized.
+- Replayed null training may recompute numeric class weights from permuted
+  labels while preserving the configured class-weighting mode.
+
+Validation:
+
+- Repository gate passed at HEAD
+  `062c4e0d690db11118f1ac786f2ee9afe983261f`; local HEAD matched
+  `origin/simostocco/position-encoding-benchmark`, and the worktree/index were
+  clean before editing.
+- Focused split-plan tests passed 43 tests:
+  `tests/test_split_plan.py` and `tests/test_train_split_plan.py`.
+- Focused training/config/reconstruction command passed 264 tests:
+  `tests/test_split_plan.py`, `tests/test_train_split_plan.py`,
+  `tests/test_fold_config_saving.py`, `tests/test_train_config_metadata.py`,
+  `tests/test_train_position_cli.py`, `tests/test_position_training_phase7.py`,
+  and `tests/test_position_reconstruction_phase7.py`.
+- Phase 12 benchmark regressions passed 166 tests:
+  `tests/test_position_benchmark_metadata.py`,
+  `tests/test_position_benchmark_performance.py`,
+  `tests/test_position_benchmark_rankings.py`, and
+  `tests/test_position_benchmark_attributions.py`.
+- Direct CLI help command passed and displayed `--split-plan`.
+- Full-suite regression coverage completed via four non-overlapping Python test
+  file shards, not a monolithic full-suite run:
+  - shard 1: 428 passed.
+  - shard 2: 367 passed, 1 warning.
+  - shard 3: 263 passed.
+  - shard 4: 515 passed, 1 skipped, 5 warnings.
+  - summed shard coverage: 1573 passed, 1 skipped, 6 warnings.
+
+Known limitations:
+
+- This phase does not implement the benchmark manifest, null orchestrator, null
+  calibration, calibrated ranking comparison, or any path-specific real/null
+  compatibility policy beyond exact split replay.
+- The split-plan hash proves sample membership, not phenotype values,
+  preprocessing identity, positional strategy identity, checkpoint identity, or
+  attribution provenance; those remain Phase 12C orchestration concerns.
+
+## Next planned phase
+
+Phase 12C2B - Positional Benchmark Manifest and Dry-Run Orchestration
