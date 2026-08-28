@@ -3413,6 +3413,160 @@ Known limitations:
   preprocessing identity, positional strategy identity, checkpoint identity, or
   attribution provenance; those remain Phase 12C orchestration concerns.
 
+## Phase 12C2B - Positional Benchmark Manifest and Dry-Run Orchestration
+
+Goal:
+
+- Add a versioned positional benchmark manifest and deterministic dry-run
+  command planner without executing training, explanation, null generation, or
+  downstream comparisons.
+- Keep existing training, explanation, split-plan, and B1/B2/B3 comparison
+  scripts as the authoritative execution and validation surfaces.
+
+Files changed:
+
+- `scripts/position_benchmark_manifest.py`
+- `scripts/run_position_benchmark.py`
+- `tests/test_position_benchmark_manifest.py`
+- `tests/test_position_benchmark_orchestration.py`
+- `documentation/examples/position-benchmark-L3.yaml`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Introduced manifest schema v1 where one manifest represents one annotation
+  level, one benchmark role, one shared dataset, one shared training protocol,
+  one shared split authority, one shared explanation protocol, and multiple
+  positional strategy runs. Because position-mode ranking and attribution
+  comparison authorities require at least two runs, manifest v1 rejects
+  zero-run and one-run manifests.
+- Kept manifest paths portable and deterministic by resolving relative paths
+  against the manifest directory, never process cwd. Required input paths are
+  resolved strictly and must be files, not directories; planned output paths
+  are resolved without creating them. Manifest-authored relative Python
+  executable paths also resolve against the manifest directory, while CLI
+  `--python ./...` overrides keep invocation-cwd-relative semantics.
+- Limited dataset orchestration v1 to `preprocessed_data` plus `genome_build`.
+  The dry-run planner validates file existence but intentionally does not load
+  the large `.pt` artifact.
+- Required an existing Phase 12C2A `split_plan.yaml` as the sample-membership
+  authority. The planner validates its structure, constructs a normalized
+  structural split plan in canonical field order, sorts CV folds by
+  `fold_index`, and computes `split_plan_sha256()` from that normalized
+  structure so membership identity does not depend on fold-list serialization
+  order. The structural validator proves all invariants possible without the
+  cohort: valid seed/source, in-range non-duplicate integer indices, disjoint
+  train/validation pairs, exact per-fold partitions, exact CV fold-index set,
+  and each CV sample appearing once across validation folds. It still
+  explicitly records
+  `dataset_sample_binding_validation: deferred_to_train_runtime` because
+  `train.py` remains the authority for validating the plan against ordered
+  sample IDs.
+- Required explicit CV `fold_index` for explanation planning and rejected
+  best-fold auto-selection in benchmark manifests. Single-split manifests omit
+  the fold index.
+- Represented each positional strategy as explicit raw train CLI intent rather
+  than a second normalized config schema. Legacy runs require only
+  `position_preset: legacy`; custom runs require explicit active strategy axes
+  and all scientifically applicable method-specific parameters.
+- Did not emit `position_strategy_id`, provisional IDs, or strategy hashes
+  before training. Canonical strategy identity remains derived later from
+  saved `config.yaml` by the existing B1/B2/B3 metadata helpers.
+- Added internal duplicate-intent rejection using deterministic JSON over the
+  validated explicit position mapping. This prevents accidental duplicate rows
+  in the v1 strategy-comparison matrix without pretending to prove resolved
+  semantic equivalence.
+- Planned deterministic real-run output directories under
+  `<output_root>/<benchmark_id>/<annotation_level>/runs/<run_id>/real/` and
+  comparison outputs under `comparisons/performance`,
+  `comparisons/raw_rankings`, and `comparisons/raw_attributions`.
+- Mapped training paths to `train.py` as `--output-dir <run_root>/real` and
+  `--experiment-name training` so the executed experiment lands exactly at
+  `<run_root>/real/training` without creating `training/training`.
+- Built exact future argv lists for `train.py`, `explain.py`,
+  `ablation_compare.py --comparison-axis position`,
+  `compare_ablation_rankings.py --comparison-axis position`, and
+  `compare_position_attributions.py`. Serialized argv lists are the replay
+  authority; shell-escaped strings are printed only for human review.
+- Chose `mean_attribution` as the raw B2 ranking view and kept calibrated/null
+  ranking columns deferred.
+- Rejected `null:` in manifest schema v1. Null dataset generation, null
+  training/explanation, null calibration, and calibrated ranking orchestration
+  remain future work.
+- Added fail-closed existing-output inspection. Missing and empty planned leaf
+  directories are allowed; files or non-empty directories fail by default, and
+  `--allow-existing-outputs` records non-empty directories as warnings for
+  audit-only review.
+- Normalized ordinary file/YAML failures, including missing manifests,
+  directory paths supplied where files are required, malformed manifest/split
+  YAML, and directory-valued Python paths, into concise
+  `BenchmarkManifestError` CLI messages without tracebacks.
+- Computed `manifest_file_sha256` over exact manifest bytes as an operational
+  integrity fingerprint of the dry-run input, not as benchmark scientific
+  identity.
+- Read repository revision directly from `.git/HEAD` and refs, with
+  `packed-refs` fallback, so dry-run performs no `git` subprocess.
+
+Runtime behavior:
+
+- New dry-run CLI:
+  `python scripts/run_position_benchmark.py MANIFEST --dry-run`.
+- Without `--out-plan`, the CLI creates no files or directories.
+- With `--out-plan PATH`, the only permitted write is that explicit resolved
+  plan YAML; existing plan files are refused.
+- The planner never executes benchmark-stage subprocesses. It only validates
+  input manifests/split-plan structure and builds future argv.
+
+Compatibility effects:
+
+- No existing training, explanation, comparison, null-baseline, model,
+  encoding, data, or split-plan behavior changed.
+- Existing B1/B2/B3 scripts remain the authoritative validators for completed
+  artifacts.
+- The manifest example documents the primary L3 eight-strategy matrix but the
+  validator does not hard-code required run IDs or require exactly that matrix.
+
+Validation:
+
+- Repository gate passed at HEAD
+  `c3a4d4fb421cb4d87fa79c5796a354fac99412a9`; local HEAD matched
+  `origin/simostocco/position-encoding-benchmark`, and the worktree/index were
+  clean before editing.
+- Focused dry-run planner tests passed 79 tests:
+  `tests/test_position_benchmark_manifest.py` and
+  `tests/test_position_benchmark_orchestration.py`.
+- Direct CLI help passed:
+  `python scripts/run_position_benchmark.py --help`.
+- A temporary real dry-run CLI invocation against tiny YAML/text fixtures
+  passed, exited 0, and created no benchmark-stage output directories.
+- A direct malformed-input CLI check for a missing manifest returned exit 2
+  with concise stderr and no traceback.
+- Phase 12 regression command passed 209 tests:
+  `tests/test_split_plan.py`, `tests/test_train_split_plan.py`,
+  `tests/test_position_benchmark_metadata.py`,
+  `tests/test_position_benchmark_performance.py`,
+  `tests/test_position_benchmark_rankings.py`, and
+  `tests/test_position_benchmark_attributions.py`.
+- Full-suite regression coverage completed via four non-overlapping Python test
+  file shards, not a monolithic full-suite run:
+  - shard 1: 519 passed, 1 warning.
+  - shard 2: 246 passed.
+  - shard 3: 395 passed, 1 skipped, 5 warnings.
+  - shard 4: 492 passed.
+  - summed shard coverage: 1652 passed, 1 skipped, 6 warnings.
+
+Known limitations:
+
+- 12C2B supports planned real runs only. It does not implement execution,
+  resume/reuse, completed-run manifests, null workflows, or calibrated ranking
+  orchestration.
+- Split-plan dry-run validation is structural. It does not prove the split plan
+  matches the current preprocessed cohort sample IDs; that binding remains
+  deferred to `train.py`.
+- The dry-run planner does not compute canonical positional strategy identity
+  before training. Identity remains authoritative only after saved config
+  metadata exists.
+
 ## Next planned phase
 
-Phase 12C2B - Positional Benchmark Manifest and Dry-Run Orchestration
+Phase 12C3A - Null Dataset Lineage and Provenance

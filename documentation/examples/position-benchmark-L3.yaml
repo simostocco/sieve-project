@@ -1,0 +1,128 @@
+# Example Phase 12C2B positional benchmark manifest.
+#
+# Paths are resolved relative to this file's directory unless absolute.
+# Replace the placeholder dataset and split-plan paths before dry-run.
+schema_version: 1
+benchmark_id: posenc_grch37_l3_primary
+annotation_level: L3
+benchmark_role: primary
+
+paths:
+  output_root: ../outputs/position_benchmarks
+
+dataset:
+  preprocessed_data: ../data/cohort.preprocessed.pt
+  genome_build: GRCh37
+
+training:
+  mode: cv
+  cv_folds: 5
+  seed: 42
+  val_split: 0.2
+  split_plan: ../splits/l3_primary_split_plan.yaml
+  latent_dim: 64
+  hidden_dim: 128
+  num_heads: 4
+  num_attention_layers: 2
+  aggregation_method: mean
+  classifier_type: flatten
+  batch_size: 32
+  epochs: 100
+  lr: 0.001
+  lambda_attr: 0.0
+  early_stopping: 10
+  gradient_clip: null
+  gradient_accumulation_steps: 1
+  class_weighting: auto
+  chunk_size: 3000
+  chunk_overlap: 0
+  sex_map: null
+  pc_map: null
+  num_pcs: 0
+
+explanation:
+  fold_index: 0
+  ig_mode: content
+  n_steps: 50
+  max_variants: 2000
+  aggregation_method: mean
+
+runtime:
+  python: python
+  device: cuda
+  train_num_workers: 0
+  explain_batch_size: 4
+
+runs:
+  - run_id: legacy
+    position:
+      position_preset: legacy
+
+  - run_id: no_position
+    position:
+      position_preset: custom
+      absolute_position_encoding: none
+      relative_position_encoding: none
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+
+  - run_id: sinusoidal
+    position:
+      position_preset: custom
+      absolute_position_encoding: sinusoidal
+      relative_position_encoding: none
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      position_dim: 64
+      sinusoidal_coordinate_scale: 1.0
+      sinusoidal_max_wavelength: 10000.0
+
+  - run_id: learned_binned
+    position:
+      position_preset: custom
+      absolute_position_encoding: learned_binned
+      relative_position_encoding: none
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      position_dim: 64
+      position_bin_size: 10000
+
+  - run_id: t5
+    position:
+      position_preset: custom
+      absolute_position_encoding: none
+      relative_position_encoding: t5_bucket
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      num_position_buckets: 32
+      max_position_distance: 100000
+
+  - run_id: rope
+    position:
+      position_preset: custom
+      absolute_position_encoding: none
+      relative_position_encoding: rope
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      rope_coordinate_scale: 10000.0
+      rope_base: 10000.0
+
+  - run_id: alibi_fixed
+    position:
+      position_preset: custom
+      absolute_position_encoding: none
+      relative_position_encoding: alibi_fixed
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      alibi_distance_function: log1p
+      alibi_distance_scale: 10000.0
+
+  - run_id: alibi_learned
+    position:
+      position_preset: custom
+      absolute_position_encoding: none
+      relative_position_encoding: alibi_learned
+      chromosome_encoding: none
+      cross_chromosome_policy: separate
+      alibi_distance_function: log1p
+      alibi_distance_scale: 10000.0
