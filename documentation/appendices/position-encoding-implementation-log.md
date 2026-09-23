@@ -3567,6 +3567,251 @@ Known limitations:
   before training. Identity remains authoritative only after saved config
   metadata exists.
 
+## Phase 12C3A - Null Dataset Lineage and Provenance
+
+Goal:
+
+- Make one phenotype-permuted null dataset a machine-verifiable scientific
+  artifact: prove exactly which real preprocessed artifact produced it, the
+  exact ordered sample universe, the exact original and permuted phenotype
+  vectors, the exact permutation applied, that sample ordering and all
+  non-label biological content were preserved, that the source was not
+  mutated, and that the final null artifact has not been silently replaced.
+- Concern dataset lineage only. Do not train models, run explanations, or
+  compute `delta_rank`; do not implement 12C3B; do not modify B1/B2/B3 or
+  historical per-variant attribution/`delta_rank` mathematics.
+
+Files changed:
+
+- `src/data/null_lineage.py` (new)
+- `tests/test_null_lineage.py` (new)
+- `scripts/create_null_baseline.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+Decisions and reasoning:
+
+- Kept three explicitly separate identities: `source_artifact_sha256`
+  (streaming SHA-256 over the exact source `.pt` bytes), `lineage_sha256`
+  (the scientific transformation: source identity + ordered sample IDs +
+  original labels + the full permutation vector + resulting labels), and
+  `null_artifact_sha256` (streaming SHA-256 over the exact final null `.pt`
+  bytes, recomputed after the file is written and closed). Paths are
+  provenance only and never participate in any of the three hashes.
+- Made the full `permutation_indices` vector, not `permutation_seed`, the
+  scientific authority. `lineage_sha256` excludes the seed entirely, so two
+  records with different seeds but identical source SHA, sample order,
+  original labels, and `permutation_indices` are the same scientific null
+  transformation and hash identically. The seed is retained only as
+  reproduction provenance (embedded metadata and sidecar) so the historical
+  `numpy.random.default_rng(seed).permutation(n_samples)` invocation used to
+  draw a fresh permutation stays reproducible.
+- Confirmed the gather direction already used by the historical generator
+  (`permuted_labels = labels[permuted_indices]`) is the authoritative
+  interpretation and encoded it as
+  `null_label[i] = original_label[permutation_indices[i]]`
+  (`apply_permutation_gather`), validated end-to-end by hand-computed tests
+  and by the pair validator reconstructing expected null labels without
+  invoking the RNG.
+- Discovered and documented (but did not fix) a historical bug in the
+  non-strict generator: the `else` branch of
+  `create_single_permutation`'s per-sample loop does
+  `sample_copy = sample; sample_copy.label = ...`, which aliases and mutates
+  the original object rather than copying it. Strict construction avoids this
+  entirely via `dataclasses.replace(sample, label=new_label)`
+  (`build_null_samples`), which never mutates source `SampleVariants`
+  objects; this is covered by dedicated tests asserting the source file's
+  byte SHA and loaded labels are unchanged after strict generation. The
+  historical non-strict path was left exactly as-is, per phase scope.
+- Reused, rather than duplicated, existing helpers: `compute_file_sha256`
+  from `src/data/covariates.py` for raw-byte source/null hashing, and
+  `ordered_sample_ids`/`sample_ids_sha256` from the already-shipped Phase
+  12C2A `src/training/split_plan.py` for ordered sample-ID extraction and
+  hashing. The dependency from `src/data/null_lineage.py` on
+  `src/training/split_plan.py` is a narrow, accepted, documented layering
+  exception (dataset lineage depending on a training-split module) so both
+  modules share one sample-ID hashing convention instead of a second,
+  competing one; `split_plan.py` itself was not modified.
+- Deliberately excluded `split_plan_sha256`, split/training seeds, fold,
+  annotation level, positional strategy, and checkpoint identity from
+  `lineage_sha256`. A null dataset's identity is cohort + label permutation
+  only; it must be split-plan-independent so every positional strategy in
+  the primary benchmark can consume the exact same validated null artifact,
+  and so the same null dataset can later be paired with an independent
+  `split_plan.yaml` in Phase 12C3B.
+- Added `same_position_count` to both the strict embedded metadata and the
+  sidecar, correcting a schema inconsistency the design review found (it was
+  in embedded metadata and listed as an overlapping consistency field, but
+  initially missing from the proposed sidecar). It is classified as
+  validation/descriptive, not scientific identity, and the pair validator
+  requires exact agreement between the embedded value, the sidecar value,
+  and a fresh recomputation from loaded labels.
+- Deliberately did not embed `null_artifact_sha256` inside the null `.pt`
+  itself: a file cannot authoritatively contain the hash of its own final
+  serialized bytes. It is recomputed by the validator and only ever recorded
+  in the sidecar.
+- Made strict lineage purely additive and opt-in via `--strict-lineage`
+  (plus `--reuse`) on `scripts/create_null_baseline.py`. Historical
+  invocations of `create_single_permutation`/`create_multiple_permutations`,
+  their CLI paths, and their metadata shape are entirely untouched; strict
+  mode never emits a `.null-lineage.yaml` sidecar and legacy metadata never
+  gains new strict-only keys. `--strict-lineage` is rejected together with
+  `--output-dir`/multi-permutation mode; 12C3A supports single-artifact
+  strict lineage only, matching the primary benchmark's shared-null policy
+  (one validated null artifact consumed by every positional strategy, never
+  regenerated per strategy).
+- Implemented a fail-closed existing-output policy in
+  `create_strict_single_permutation`: reject if the requested output path
+  resolves to the source path (before any write); reject if the output
+  exists without its sidecar, or the sidecar exists without the output;
+  reject an existing valid pair unless `--reuse` is passed; with `--reuse`,
+  fully validate the existing pair via `validate_null_pair` and reuse it only
+  if its `lineage_sha256` matches the freshly computed requested lineage
+  exactly, otherwise reject naming the mismatch. Strict mode never silently
+  overwrites or reuses an artifact.
+- Implemented the atomic-write sequence exactly as specified: `torch.save`
+  to a same-directory temp file, `os.replace` to publish the null artifact,
+  recompute its streaming SHA-256 from the published bytes, build and write
+  the sidecar to a same-directory temp file, then `os.replace` to publish it.
+  On any failure after the null artifact is published but before the sidecar
+  is, the artifact created by *this* invocation is rolled back on a
+  best-effort basis (never a pre-existing artifact, since the existing-output
+  policy already guarantees no output/sidecar existed before a fresh-creation
+  attempt begins); temp files are always cleaned up. If rollback itself
+  fails, a `RuntimeError` names the orphaned artifact path and the original
+  failure rather than leaving a sidecar-less or mismatched pair silently in
+  place.
+- Implemented `validate_null_pair` as a pure, reusable validation surface
+  that never trusts an embedded or sidecar claim without independently
+  recomputing and comparing it against raw file bytes and loaded dataset
+  objects: source/null byte SHA-256, sample-order identity (recomputed
+  independently on both sides), original/permuted label hashes, permutation
+  structure and hash, gather-reconstructed expected null labels,
+  `n_samples`/`n_cases`/`n_controls`/`same_position_count`, all non-label
+  `SampleVariants`/`VariantRecord` content (via a small recursive equality
+  helper that also tolerates NaN-valued and tensor/array-valued annotations,
+  without inventing a general canonical serializer), all top-level
+  preprocessing-metadata keys other than `samples`/`_null_baseline_metadata`,
+  and finally three-way agreement of `lineage_sha256` across the
+  recomputation, the embedded metadata, and the sidecar. Path relocation
+  alone does not invalidate a pair as long as byte identities still match.
+  Every failure raises `ValueError` naming the specific failed invariant.
+
+Runtime behavior:
+
+- New strict CLI:
+  `python scripts/create_null_baseline.py --input ... --output ... --seed ... --strict-lineage [--reuse]`.
+- Strict creation writes `<output>.pt` plus a deterministic
+  `<output>.pt.null-lineage.yaml` sidecar; `--reuse` against a valid,
+  matching existing pair performs no writes and returns the existing
+  validated identity.
+- Historical invocations (no `--strict-lineage`) are byte-for-byte unaffected
+  in code path, output shape, and metadata content.
+
+Compatibility effects:
+
+- No B1/B2/B3, historical per-variant attribution, `delta_rank`, model
+  architecture, position runtime, or attention mathematics changed.
+- No existing training, explanation, split-plan, or benchmark-manifest
+  behavior changed; `src/training/split_plan.py` was read-only referenced,
+  not modified.
+- `DEFERRED_CALIBRATED_SCORE_COLUMNS` in
+  `scripts/compare_ablation_rankings.py` remains unchanged; calibrated
+  ranking columns remain deferred.
+- Existing `create_single_permutation`/`create_multiple_permutations`
+  behavior, CLI defaults, and metadata shape are unchanged; no strict fields
+  leak into legacy output.
+
+Validation:
+
+- Repository gate passed at HEAD
+  `c667d8af2aca448774b992cd1145df6362052453`; local HEAD matched
+  `origin/simostocco/position-encoding-benchmark`, and the worktree/index were
+  clean before editing.
+- Focused new-module tests passed 103 tests: `tests/test_null_lineage.py`
+  (includes the post-review schema-completeness and optional-hardening
+  additions; see "Review corrections" below).
+- Focused existing null-baseline and split-plan regression tests passed 53
+  tests (all pre-existing, unmodified, unchanged behavior):
+  `tests/test_null_baseline.py`, `tests/test_null_baseline_protocol_matching.py`,
+  `tests/test_split_plan.py`, `tests/test_train_split_plan.py`.
+- Combined focused command passed 401 tests: the above plus
+  `tests/test_position_benchmark_manifest.py`,
+  `tests/test_position_benchmark_orchestration.py`,
+  `tests/test_position_benchmark_metadata.py`,
+  `tests/test_position_benchmark_performance.py`,
+  `tests/test_position_benchmark_rankings.py`, and
+  `tests/test_position_benchmark_attributions.py`.
+- Full-suite regression: `python -m pytest -q` passed 1756 tests, 0 failed,
+  0 skipped, 6 warnings, in 218.89s (0:03:38).
+- Direct CLI help command passed and displayed `--strict-lineage` and
+  `--reuse`.
+- `python -m ruff check` on changed files: clean except one pre-existing
+  `E741` (ambiguous variable name `l`) inside the untouched historical
+  `create_single_permutation` loop, left as-is per the baseline-lint
+  condition and to avoid altering legacy code outside scope.
+- `python -m black --check` and `python -m isort --check-only`: clean on the
+  two new files (`src/data/null_lineage.py`, `tests/test_null_lineage.py`).
+  `scripts/create_null_baseline.py` was deliberately *not* run through
+  whole-file `black`, because the file predates repository-wide Black
+  adoption (single-quote style throughout) and reformatting it would have
+  rewritten every historical line's quoting/wrapping as an unrelated cosmetic
+  diff; new code in that file matches its existing single-quote style, is
+  within the 100-column limit, and is Ruff/isort-clean.
+- `git diff --check`: clean (no whitespace errors).
+
+Known limitations:
+
+- Strict lineage supports the single-null-artifact workflow only; historical
+  multi-permutation mode never emits a strict sidecar in this phase.
+- The historical non-strict generator's source-mutation aliasing bug
+  (`sample_copy = sample; sample_copy.label = ...`) was documented, not
+  fixed, to keep legacy behavior byte-for-byte unchanged outside strict mode.
+- This phase does not implement real/null training or explanation
+  orchestration, exact split-plan binding to a null dataset, calibrated
+  ranking comparison, or `delta_rank`; those remain Phase 12C3B.
+- Atomic-failure rollback is tested by injecting a failure between artifact
+  and sidecar publication (monkeypatching the sidecar writer) rather than
+  simulating lower-level filesystem faults (e.g. disk full mid-`torch.save`),
+  since that boundary is the one this phase's write sequence actually
+  exposes as a two-step publication.
+
+### Review corrections (post-acceptance)
+
+- Found: `validate_null_pair` recomputed and compared scientific-identity
+  fields correctly, but provenance-only fields (paths, `permutation_seed`,
+  `generator.*`) were read with `.get()` and could be absent from both the
+  embedded metadata and the sidecar without failing validation, since a
+  missing field on both sides compares `None == None`.
+- Fix: added `_validate_embedded_metadata_schema` and
+  `_validate_sidecar_schema` (`src/data/null_lineage.py`), each an explicit,
+  upfront presence/type check over every required strict field (including
+  `generator.script`/`repository_revision`/`argv`, all SHA-256 fields as
+  lowercase 64-character hex strings, and integer fields rejecting bool).
+  They run immediately after `load_sidecar` and after loading the embedded
+  `_null_baseline_metadata`, before any scientific-identity comparison, so
+  an incomplete strict artifact fails closed. `lineage_sha256`'s payload and
+  scientific-identity comparison logic were not changed.
+- Confirmed `source.path`/`null.path` (and all other provenance paths)
+  remain required-present but are still never compared against the
+  validator's own current file paths; a `test_path_relocation_still_validates_when_bytes_match`
+  test was added proving a pair moved to a new directory still validates
+  when byte identities are unchanged.
+- Implemented both optional hardening items from the review, narrowly:
+  (A) `create_strict_single_permutation` now rejects a source artifact whose
+  own `_null_baseline_metadata.is_null_baseline` is already `True`, refusing
+  to permute a null dataset; (B) if the freshly published null artifact and
+  sidecar fail their own `validate_null_pair` self-check, both files created
+  by *that* invocation are removed on a best-effort basis before a
+  `RuntimeError` is raised, so a failed self-check never leaves a
+  strict-looking pair on disk.
+- Added 19 new tests to `tests/test_null_lineage.py` (84 -> 103): sixteen
+  strict-schema-completeness tests (fourteen tamper tests covering
+  missing/mistyped embedded and sidecar fields -- including a hex-format
+  test and a bool-typed-integer test on each side -- plus two direct unit
+  tests of the schema helpers), the path-relocation test, and two tests for
+  the optional hardening items. No existing test was removed or weakened.
+
 ## Next planned phase
 
-Phase 12C3A - Null Dataset Lineage and Provenance
+Phase 12C3B - Real/Null Orchestration and Calibrated Comparison (not
+implemented in this phase)
