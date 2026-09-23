@@ -74,6 +74,8 @@ __all__ = [
     "write_sidecar",
     "load_sidecar",
     "extract_samples",
+    "validate_embedded_metadata_schema",
+    "validate_sidecar_schema",
     "validate_null_pair",
 ]
 
@@ -743,6 +745,27 @@ def _validate_sidecar_schema(sidecar: Mapping[str, Any]) -> None:
     _validate_non_empty_string(
         _require_key(generator, "script", f"{path}.generator"), f"{path}.generator.script"
     )
+
+
+def validate_embedded_metadata_schema(embedded: Mapping[str, Any]) -> None:
+    """Public strict-schema check for embedded ``_null_baseline_metadata``.
+
+    Phase 12C3B1 additive export: a thin alias over the 12C3A schema pass so
+    training/explanation provenance can fail closed on a structurally invalid
+    strict artifact without reaching into a private helper. Semantics are
+    identical to the check ``validate_null_pair`` already performs.
+    """
+    _validate_embedded_metadata_schema(_require_mapping(embedded, "embedded"))
+
+
+def validate_sidecar_schema(sidecar: Mapping[str, Any]) -> None:
+    """Public strict-schema check for a loaded ``.null-lineage.yaml`` sidecar.
+
+    Phase 12C3B1 additive export used by the dry-run benchmark planner, which
+    must validate sidecar structure without loading either cohort artifact.
+    Semantics are identical to the check ``validate_null_pair`` performs.
+    """
+    _validate_sidecar_schema(_require_mapping(sidecar, "sidecar"))
 
 
 def validate_null_pair(

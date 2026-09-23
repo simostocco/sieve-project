@@ -3815,3 +3815,349 @@ Known limitations:
 
 Phase 12C3B - Real/Null Orchestration and Calibrated Comparison (not
 implemented in this phase)
+
+## Phase 12C3B1 - Paired Real/Null Benchmark Planning and Validation
+
+Goal:
+
+- Establish the deterministic plan and the compatibility rules for, per
+  positional strategy `m`, `REAL: Train(X, y, S, strategy_m, protocol)` and
+  `NULL: Train(X, y_perm, S, strategy_m, protocol)`, where only phenotype
+  assignment differs.
+- Planning and validation only. No subprocess execution, no training, no
+  explanation, no null-dataset generation, no bootstrap execution. Positional,
+  Integrated Gradients, variant-ranking, B1/B2/B3, bootstrap, and
+  `delta_rank` mathematics are unchanged. Execution/resume is Phase 12C3B2;
+  the calibrated-comparison gate is Phase 12C3C.
+
+Files changed:
+
+- `scripts/position_benchmark_manifest.py`
+- `scripts/run_position_benchmark.py` (docstring only)
+- `scripts/train.py` (metadata only)
+- `scripts/explain.py` (metadata and fail-closed provenance checks only)
+- `scripts/compare_position_attributions.py` (model-provenance key validation
+  only; see review corrections)
+- `tests/test_position_benchmark_attributions.py` (appended tests only)
+- `src/data/null_lineage.py` (additive public exports only)
+- `src/data/dataset_provenance.py` (new)
+- `scripts/position_benchmark_pairing.py` (new)
+- `documentation/examples/position-benchmark-L3-paired.yaml` (new)
+- `tests/test_position_benchmark_paired_manifest.py` (new)
+- `tests/test_position_benchmark_pairing.py` (new)
+- `tests/test_dataset_provenance.py` (new)
+- `tests/test_null_lineage.py` (appended tests only)
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+`src/data/dataset_provenance.py` was not in the pre-approved file list. It is
+a narrow new module because `train.py` and `explain.py` must build the exact
+same `dataset_provenance` block; duplicating it in both scripts, or making
+`explain.py` import `train.py`, would be worse.
+
+Decisions and reasoning:
+
+- Manifest versioning. `schema_version: 1` is unchanged (real-only). A
+  golden comparison of fully resolved v1 plans and human summaries (CV and
+  single-split, L3 primary and L0 sensitivity) generated before and after
+  this phase is byte-identical, and all existing 12C2B planner tests pass
+  unmodified. `schema_version: 2` adds exactly two required top-level blocks,
+  `null_baseline` and `calibration`. A v1 manifest with either block still fails as an
+  unknown top-level key; v1 runtime still rejects `calibration_n_jobs`.
+- One benchmark-level null. `null_baseline` contains exactly `artifact`. A
+  `runs[].null_baseline` (or `runs[].null`) entry is rejected explicitly, so
+  strategy-specific nulls are
+  structurally impossible. `lineage_sidecar`, `permutation_seed`,
+  `lineage_sha256`, `source_artifact_sha256`, `sample_ids_sha256`,
+  `null_artifact_sha256`, `source_dataset`, and `reuse` are rejected as
+  restated identity. The sidecar path is always derived with 12C3A's
+  `sidecar_path_for(null_baseline.artifact)`, and the source dataset is always
+  `dataset.preprocessed_data`, enforced by byte hashes.
+- Block name. The v2 block is `null_baseline`, not `null`: a bare `null:`
+  YAML key parses as a null (`None`) key, a footgun a brand-new schema should
+  not introduce. Only one spelling is accepted; a top-level `null` (quoted or
+  bare) is rejected as an unknown top-level key. A bare `off` value is YAML
+  boolean false, so v2 rejects `class_weighting: false` with a quoting hint and
+  the example writes `class_weighting: "off"` (the existing CLI vocabulary).
+- Shared null binding (dry run). The planner hashes the real dataset and the
+  null artifact bytes, parses the sidecar YAML, validates it with the new
+  public `null_lineage.validate_sidecar_schema`, and requires
+  `sha256(real) == sidecar.source.sha256`,
+  `sha256(null) == sidecar.null.sha256`,
+  `sidecar.samples.sample_ids_sha256 == split_plan.sample_ids_sha256`,
+  `sidecar.samples.n_samples == split_plan.n_samples`, distinct real/null
+  paths, and distinct real/null bytes. The resolved plan records
+  `null_binding` with `lineage_sha256`, `source_artifact_sha256`,
+  `null_artifact_sha256`, `sample_ids_sha256`, `n_samples`,
+  `null_artifact_path`, and `sidecar_path` (the paths are operational
+  provenance only), plus `validation_level:
+  sidecar_schema_and_file_sha256_only` and `execution_authorized: false`.
+  The split plan's `dataset_sample_binding_validation` becomes
+  `bound_via_null_lineage_sidecar_sample_ids_sha256` in v2, which transitively
+  binds the split plan to the real dataset without loading it. The planner
+  never calls `torch.load` (a test monkeypatches it to raise), and
+  `null_lineage` is imported lazily only on the v2 path. **Passing this
+  lightweight binding does not authorize execution:** full
+  `validate_null_pair(real, null, sidecar)`, which loads both artifacts, is
+  the Phase 12C3B2 execution preflight.
+- 12C3A export. `validate_sidecar_schema` and
+  `validate_embedded_metadata_schema` are public thin aliases over the
+  existing private schema passes, added to `__all__`. Lineage semantics,
+  artifact creation, permutation semantics, strict reuse, and validation
+  mathematics are unchanged, and the existing 103 12C3A tests pass
+  unmodified. New tests prove the public and private helpers raise identical
+  messages.
+- Training dataset provenance. For `--preprocessed-data` runs, `train.py`
+  now records `run_metadata["dataset_provenance"]` right after
+  `run_metadata["split_plan"]`. The block contains `schema_version: 1`, the
+  resolved `preprocessed_data_path`, the raw-byte `preprocessed_data_sha256`,
+  the ordered `sample_ids_sha256`, `is_null_baseline`, `null_metadata_kind`
+  (`none` / `strict_v1` / `legacy_unversioned`), and `null_lineage`. The
+  existing `run_metadata` path persists it into the root `config.yaml`, every
+  fold `config.yaml`, and every checkpoint's `metadata`. It is built before
+  any in-memory sample mutation such as the sex map. VCF-input runs record
+  `dataset_provenance: null`. Model and training mathematics are untouched.
+- Null detection. `_null_baseline_metadata` with a `schema_version` must pass
+  the strict 12C3A embedded-schema check plus cheap self-consistency against
+  the loaded samples (ordered sample IDs, sample count, permuted-label hash);
+  otherwise training fails, so a broken strict artifact is never treated as
+  real data. Historical unversioned metadata that declares
+  `is_null_baseline: true` is recorded as `legacy_unversioned` null without
+  lineage, so legacy null workflows keep running while the paired validator
+  rejects them. Any other `_null_baseline_metadata` value fails. This is not
+  real/null pair validation, which remains the 12C3B2 preflight.
+- Explanation dataset provenance. `explain.py` records the same block in
+  `analysis_metadata.yaml` via `resolve_explanation_dataset_provenance`,
+  before sex-map/PC handling and IG. The contract boundary is the training
+  config. A new provenance-aware config (one containing
+  `dataset_provenance`) gets strict fail-closed validation: training
+  `is_null_baseline` must equal `--is-null-baseline`, and the explanation
+  dataset bytes must equal training `preprocessed_data_sha256`. That rejects
+  both a new null run without the flag and a new real run with it. A
+  historical config without `dataset_provenance` keeps historical
+  `explain.py` behaviour: the flag is metadata-only, and provenance is
+  recorded best-effort (`None` if the dataset cannot be classified), so old
+  runs stay usable. The pair validator still rejects historical and
+  unversioned runs for paired calibration.
+- Fold-0 rule. v2 CV manifests must use `explanation.fold_index: 0`.
+  `train.py` seeds once before the CV loop and replay consumes no RNG before
+  fold 0, so only fold 0 starts from the same post-seed RNG state on both
+  sides; later folds inherit RNG consumption from label-dependent early
+  stopping in earlier folds. Historical CV reseeding semantics were not
+  changed and no per-fold reseeding was added. v2 single-split remains
+  allowed.
+- Class-weighting rule. v2 requires `class_weighting: "off"`. `auto` is a
+  label-dependent switch on the training fold's case fraction after exact
+  split replay, and `on` computes a label-dependent `pos_weight`, so either
+  would make the loss definition differ between real and null. `train.py`'s
+  class-weighting behaviour is unchanged, and v1 still accepts
+  `auto`/`on`/`off`.
+- Seeds. Real and null use the identical `training.seed`. Split identity is
+  the replayed `split_plan.yaml`. The null permutation seed is provenance
+  only (the permutation vector is authoritative) and never enters any
+  command. The legacy `run_null_baseline_analysis.sh` convention of
+  conflating training and permutation seeds is not used.
+- Train argv pairing. A single `_build_train_argv(..., side=)` builds both
+  sides, and they differ only in `--preprocessed-data` and `--output-dir`.
+  The same `--split-plan`, `--seed`, positional flags, architecture,
+  optimizer/training hyperparameters, and `--class-weighting off` are
+  emitted. No null flag was added to `train.py`, because null status is
+  detected from the artifact.
+- Explain argv pairing. A single `_build_explain_argv(..., side=)` builds
+  both sides, which differ only in `--experiment-dir`,
+  `--preprocessed-data`, and `--output-dir`, plus a trailing
+  `--is-null-baseline` on the null side. Both use `--experiment-dir` with
+  `--fold-index 0` in CV (never best-fold selection, never `--checkpoint`),
+  `--ig-mode content`, and identical `--n-steps`, `--max-variants`,
+  `--aggregation-method`, and batch/runtime settings.
+- Layout. `runs/<run_id>/{real,null}/{training,explanation}` and
+  `runs/<run_id>/calibration/` holding the three bootstrap outputs plus
+  `paired_compatibility.yaml`. `comparisons/{performance,raw_rankings,
+  raw_attributions}` are unchanged, `comparisons/calibrated_rankings` is
+  recorded as reserved for 12C3C, and no null-specific B1/B2/B3 outputs are
+  planned. Output-safety checks now cover `null/training`,
+  `null/explanation`, and `calibration`, and reject the null artifact or its
+  sidecar coinciding with, or lying inside, any planned output directory.
+- Calibration argv (planned only). This is unchanged
+  `scripts/bootstrap_null_calibration.py` with
+  `--real-rankings runs/<m>/real/explanation/sieve_variant_rankings.csv`,
+  `--null-attributions runs/<m>/null/explanation/attributions.npz`, the three
+  explicit calibration outputs, `--n-bootstrap`, `--seed`, `--top-k` (the
+  validated YAML list of unique positive plain integers, serialized to the
+  historical comma-separated form only here), `--min-variants-per-gene`,
+  `--gene-delta-rank-aggregation`, always an explicit `--genome-build`,
+  `--n-jobs` from `runtime.calibration_n_jobs` (default 1; parallelism does
+  not change per-replicate seeds), and `--exclude-sex-chroms` only when
+  true.
+- Bootstrap semantics (unchanged). `rank_real = rankdata(-mean_attribution,
+  method="average")`, null bootstrap ranks use `rankdata(-null_bootstrap_mean,
+  method="average")`, `delta_rank = median_rank_null_boot - rank_real`, and
+  `p_rank_boot`/FDR are unchanged. `VariantRanker`'s displayed ranking still
+  uses `method="min"`; the historical min/average difference is intentional
+  and was not harmonized.
+- Bootstrap interpretation. There is ONE shared null phenotype-permutation
+  dataset per benchmark and ONE null-trained model PER positional strategy.
+  `bootstrap_null_calibration.py` resamples NULL SAMPLES WITH REPLACEMENT
+  from that strategy's single null explanation. It does not bootstrap
+  phenotype permutations, variants, model initializations, or independently
+  trained null models. It therefore measures cohort/sample-resampling
+  variation conditional on one null permutation and one fitted null model per
+  strategy, and must not be described as permutation uncertainty. The
+  resolved plan records this under `calibration`.
+- Pair validator (`scripts/position_benchmark_pairing.py`).
+  `compare_real_null_pair` returns a deterministic, YAML-serializable report
+  listing every violated rule; `require_compatible_real_null_pair` raises;
+  `require_shared_null_across_pairs` requires every strategy pair to share
+  one null binding. Rule groups:
+  - MUST EQUAL: every predictive-context field except dataset paths; full
+    `position_encoding`, `position_encoding_execution`, `input_dim`, and the
+    canonical strategy hash; split-plan schema, source, `sha256`,
+    `sample_ids_sha256`, and `input_sha256`; the full `integrated_gradients`
+    block and explanation-context fields; `max_variants_per_sample`;
+    attention settings; checkpoint selection mode and selected fold;
+    `n_samples`; genome build; variant universe; repository revision.
+  - MUST BE: `class_weighting == "off"`, split source `replayed`,
+    content-only IG (feature space, baseline policy, no comparability
+    warning, `executed`), `cv_explicit_fold` with fold 0 (or
+    `single_run_best_model`), and explanation dataset provenance equal to
+    training dataset provenance.
+  - BIND: `real.preprocessed_data_sha256 == null.null_lineage.source_artifact_sha256
+    == null_binding.source_artifact_sha256`,
+    `null.preprocessed_data_sha256 == null_binding.null_artifact_sha256`,
+    `null.null_lineage.lineage_sha256 == null_binding.lineage_sha256`,
+    `null_metadata_kind` is `none` on the real side and `strict_v1` on the
+    null side, and each side's `is_null_baseline` is correct.
+  - SANITY: byte-identical real/null checkpoint SHA fails with a specific
+    error. Checkpoint inequality is not treated as the pair's scientific
+    identity criterion.
+  - PROVENANCE ONLY: dataset paths, fold AUC, and timestamps.
+  Training and explanation do not record a repository revision, so
+  `PairSide.repository_revision` is supplied by the caller (12C3B2 stage
+  records); `unknown` or empty is rejected. `load_pair_side` binds the
+  explanation to the supplied `training_dir` (config path, config bytes,
+  checkpoint location, and checkpoint bytes; see review corrections).
+- Variant-universe identity. `variant_universe_sha256(attributions.npz)`
+  streams one canonical-JSON header line and then one line per sample,
+  holding `sample_index`, `sample_id`, `n_variants`, and the ordered
+  `chromosomes`, `positions`, and `gene_ids`. This preserves sample
+  boundaries rather than hashing one ambiguous flat concatenation. Labels
+  and scores are excluded because they differ by design. Real and null
+  fingerprints must match. The historical bootstrap join key is unchanged.
+- Gate. `DEFERRED_CALIBRATED_SCORE_COLUMNS` and
+  `compare_ablation_rankings.py`/`compare_position_attributions.py` are
+  unchanged. B1/B2/B3 remain real-only, and v2 emits comparison argv
+  identical to an equivalent v1 manifest (tested). `z_attribution` and
+  `corrected_rank` remain deferred behind chromosome-correction provenance,
+  not the null gate.
+
+Validation:
+
+- New tests: `tests/test_position_benchmark_paired_manifest.py` (68),
+  `tests/test_position_benchmark_pairing.py` (111),
+  `tests/test_dataset_provenance.py` (36), 10 appended to
+  `tests/test_null_lineage.py` (103 -> 113), and 5 appended to
+  `tests/test_position_benchmark_attributions.py` (56 -> 61), for 230 new
+  tests (after all review corrections).
+- Focused suites (the null-lineage, split-plan, train split-plan, 12C2B
+  manifest/orchestration, B1/B2/B3 metadata/performance/rankings/attributions,
+  bootstrap null calibration, and the three new files): 641 passed; with the
+  explain/train IG-mode, position, phase-3 explain, checkpoint-metadata, and
+  fold-config suites added: 820 passed.
+- v1 golden comparison: resolved plans and human summaries for four v1
+  fixtures (CV/single-split x L3 primary/L0 sensitivity), generated from the
+  pristine 8f40a13 code and after this phase, are byte-identical.
+- Full-suite regression (after all review corrections): `python -m pytest -q`
+  passed 1986 tests, 0 failed, 0 skipped, 6 warnings (pre-existing), in
+  158.48s.
+- Mutation spot-checks: disabling the null-dataset binding rules, the
+  variant-universe rule, or the checkpoint sanity rule makes the
+  corresponding pairing tests fail.
+- `ruff check`: clean on every new file, `position_benchmark_manifest.py`,
+  `run_position_benchmark.py`, `null_lineage.py`, and `test_null_lineage.py`.
+  `train.py` and `explain.py` have no new findings relative to their
+  pre-existing baselines (legacy F541/UP006/etc. left untouched).
+- `black --check` and `isort --check-only`: clean on all new files and on
+  the previously Black-clean changed files. `train.py`/`explain.py` predate
+  repository-wide Black adoption and were not whole-file reformatted; the new
+  lines follow their existing style.
+- `py_compile` on all changed files and `git diff --check`: clean.
+- `scripts/check_docs_style.py`: no new violations (108 pre-existing, all in
+  earlier sections).
+
+Known limitations:
+
+- The dry-run null binding is lightweight (sidecar schema plus byte hashes).
+  It does not prove non-label equality of the two cohorts; that requires
+  `validate_null_pair`, deferred to the 12C3B2 preflight.
+- Repository revision is not yet recorded by `train.py`/`explain.py`; the
+  pair validator requires it as an explicit input that 12C3B2 stage records
+  must supply.
+- The pair validator is exposed and tested but never invoked by the planner,
+  because no completed artifacts exist at dry-run time.
+- Historical explanation runs (training configs without
+  `dataset_provenance`) are not flag-validated by design; they are only
+  rejected later by the pair validator.
+- Same-seed pairing gives an identical post-seed RNG state only for fold 0;
+  CUDA non-determinism can still make real/null runs non-bit-reproducible.
+- Split plans are stratified on real labels, so null folds are not
+  stratified on null labels. This is inherent to exact split replay.
+
+### Review corrections (post-acceptance)
+
+- Renamed the v2 manifest block from `null` to `null_baseline` across
+  validation, resolved-plan error messages, the example manifest, tests,
+  and this log. Only `null_baseline` is accepted, and a top-level `null`
+  (quoted string or bare YAML null key) is rejected as an unknown key. The
+  unknown-key message now sorts with `key=str`, so a YAML-null key produces
+  a clean rejection instead of a `TypeError`; ordering for string keys (and
+  hence every v1 message) is unchanged. The sidecar is still derived from
+  `sidecar_path_for(null_baseline.artifact)`, and `lineage_sidecar` is not
+  exposed. `null_binding` behaviour is unchanged.
+- Restored historical explanation compatibility. Strict bidirectional
+  null-flag and dataset-byte validation now applies only when the training
+  config carries `dataset_provenance`. Historical configs keep historical
+  `explain.py` behaviour, including legacy null artifacts explained without
+  `--is-null-baseline` and datasets whose provenance cannot be classified
+  (recorded as `dataset_provenance: null`). Pair-validator requirements were
+  not weakened, and new tests prove historical and legacy-unversioned runs
+  still fail pairing.
+- All other accepted semantics are unchanged.
+- Closed a provenance gap in `load_pair_side`. It previously loaded
+  `training_dir/config.yaml` but trusted the explanation's recorded
+  `model_provenance.config_path`/`checkpoint_path`, so an explanation from
+  run B could have been paired with run A's training config when protocol
+  metadata matched. It now requires:
+  - `Path(config_path).resolve() == (training_dir / "config.yaml").resolve()`
+    (full resolved-path equality, not filename);
+  - the new `model_provenance.config_sha256` to equal the current config
+    bytes;
+  - `checkpoint_path.resolve()` to equal `training_dir/fold_{selected_fold}/
+    best_model.pt` for `cv_explicit_fold` (with `selected_fold` a plain
+    non-negative integer), or `training_dir/best_model.pt` for
+    `single_run_best_model` (with `selected_fold` null);
+  - the recomputed `checkpoint_sha256` to match, as before.
+  Other selection modes (`cv_best_fold`, `explicit_checkpoint`) fail closed in
+  the loader, and the pair rules still reject them independently. A fold-1
+  explanation loads, since it is rooted correctly, but still fails the
+  primary fold-0 pair rule.
+- `explain.py` `model_provenance` gains `config_sha256` (SHA-256 of the exact
+  config file bytes used for reconstruction), recorded right after
+  `config_path`. The change is additive: every existing field is unchanged
+  and reconstruction semantics are untouched.
+- Hard dependency, reported and approved before editing: B3
+  (`compare_position_attributions.py`) required `model_provenance` keys to
+  equal exactly the historical set, so the additive key would have made B3
+  reject every new explanation. B3 now requires the eight historical keys and
+  allows only the optional `config_sha256`, which, when present, must be a
+  lowercase SHA-256. Any other extra or missing key is still rejected, and
+  older analysis metadata without `config_sha256` remains valid. This is a
+  validation-only change; no B3 mathematics or outputs changed.
+- Execution-stage file hashes for calibration inputs and outputs remain
+  Phase 12C3B2 scope.
+
+## Next planned phase
+
+Phase 12C3B2 - Paired benchmark execution: subprocess execution, null
+preflight `validate_null_pair()`, stage records (including repository
+revision), `paired_compatibility.yaml` serialization, and safe resume/reuse
+(not implemented in this phase). Phase 12C3C - calibrated positional
+comparison gate - follows.

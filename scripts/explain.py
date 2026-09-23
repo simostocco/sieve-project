@@ -53,6 +53,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from src.data.covariates import attach_pc_covariates_to_samples, load_pc_map
+from src.data.dataset_provenance import resolve_explanation_dataset_provenance
 from src.encoding import (
     AnnotationLevel,
     ChunkedVariantDataset,
@@ -193,7 +194,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "'rank_average': composite rank across mean, max, and sample count."
                         ))
     parser.add_argument('--is-null-baseline', action='store_true',
-                        help='Flag indicating this is a null baseline analysis (for metadata)')
+                        help=('Declare a null baseline analysis. For training runs that '
+                              'record dataset_provenance, must match the training run\'s '
+                              'null status and mismatches fail closed; historical runs '
+                              'keep metadata-only behaviour.'))
 
     # Device
     parser.add_argument('--device', type=str, default='cuda',
@@ -285,7 +289,8 @@ def _build_model_provenance(
 
     Attribution stability comparisons need to know which checkpoint generated
     each explanation; paths identify the selection and the hash identifies the
-    immutable file bytes.
+    immutable file bytes. ``config_sha256`` (Phase 12C3B1, additive) records
+    the exact bytes of the config file used for reconstruction.
     """
     checkpoint_path = checkpoint_path.resolve()
     config_path = config_path.resolve()
@@ -296,6 +301,7 @@ def _build_model_provenance(
         'checkpoint_path': str(checkpoint_path),
         'checkpoint_sha256': _sha256_file(checkpoint_path),
         'config_path': str(config_path),
+        'config_sha256': _sha256_file(config_path),
         'selected_fold': selected_fold,
         'selected_fold_auc': selected_fold_auc,
         'cv_results_path': str(cv_results_path) if cv_results_path is not None else None,
@@ -735,6 +741,15 @@ def main():
     preprocessed = torch.load(args.preprocessed_data, weights_only=False)
     all_samples = preprocessed['samples']
     metadata = preprocessed.get('metadata', {})
+    # Bind the explanation to exact dataset bytes. Provenance-aware training
+    # configs fail closed on a dataset or --is-null-baseline mismatch;
+    # historical configs keep historical behaviour (best-effort record only).
+    dataset_provenance = resolve_explanation_dataset_provenance(
+        preprocessed,
+        path=Path(args.preprocessed_data),
+        training_config=config,
+        is_null_baseline_flag=args.is_null_baseline,
+    )
 
     print(f"Loaded {len(all_samples)} samples")
     if metadata:
@@ -1337,6 +1352,7 @@ def main():
         'skip_attention': args.skip_attention,
         'skip_ig': args.skip_ig,
         'model_provenance': model_load.model_provenance,
+        'dataset_provenance': dataset_provenance,
         'integrated_gradients': integrated_gradients_metadata,
         'attention_threshold_mode': args.attention_threshold_mode,
         'attention_threshold': args.attention_threshold,

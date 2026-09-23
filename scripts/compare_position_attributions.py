@@ -148,6 +148,8 @@ MODEL_PROVENANCE_KEYS = {
     "selected_fold_auc",
     "cv_results_path",
 }
+# Phase 12C3B1: optional additive key written by newer explain.py outputs.
+OPTIONAL_MODEL_PROVENANCE_KEYS = {"config_sha256"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAMPLE_FILE_RE = re.compile(r"^sample_([0-9]+)\.npz$")
 FEATURE_NAMES_BY_LEVEL = {
@@ -1049,8 +1051,14 @@ def _validate_model_provenance(
     provenance = analysis_metadata.get("model_provenance")
     if not isinstance(provenance, Mapping):
         raise ValueError(f"run {spec.run_id!r} requires model_provenance")
-    if set(provenance) != MODEL_PROVENANCE_KEYS:
+    keys = set(provenance)
+    if not MODEL_PROVENANCE_KEYS <= keys <= MODEL_PROVENANCE_KEYS | OPTIONAL_MODEL_PROVENANCE_KEYS:
         raise ValueError(f"run {spec.run_id!r} model_provenance schema keys are invalid")
+    if "config_sha256" in provenance and (
+        not isinstance(provenance["config_sha256"], str)
+        or SHA256_RE.fullmatch(provenance["config_sha256"]) is None
+    ):
+        raise ValueError(f"run {spec.run_id!r} config_sha256 must be lowercase SHA-256")
     if provenance.get("schema_version") != 1 or isinstance(provenance.get("schema_version"), bool):
         raise ValueError(f"run {spec.run_id!r} model_provenance.schema_version must be 1")
     mode = provenance.get("checkpoint_selection_mode")

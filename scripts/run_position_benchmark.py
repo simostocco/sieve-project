@@ -3,6 +3,12 @@
 
 Phase 12C2B intentionally builds commands only. It never executes training,
 explanation, comparison, or null-baseline stages.
+
+Phase 12C3B1 adds schema_version 2 manifests, which additionally plan one
+null-trained model per positional strategy on one shared null artifact and the
+per-strategy bootstrap calibration command. Planning remains dry-run only; a
+passing plan does not authorize execution (Phase 12C3B2 adds execution behind
+a full validate_null_pair preflight).
 """
 
 from __future__ import annotations

@@ -39,6 +39,7 @@ from src.data.covariates import (
     compute_file_sha256,
     load_pc_map,
 )
+from src.data.dataset_provenance import build_dataset_provenance
 from src.encoding import (
     AnnotationLevel,
     ChunkedVariantDataset,
@@ -1083,6 +1084,12 @@ def main():
         preprocessed = torch.load(args.preprocessed_data, weights_only=False)
         all_samples = preprocessed['samples']
         metadata = preprocessed.get('metadata', {})
+        # Metadata only: bind this run to the exact dataset bytes and null
+        # lineage before any in-memory sample mutation (e.g. sex map).
+        dataset_provenance = build_dataset_provenance(
+            preprocessed,
+            path=Path(args.preprocessed_data),
+        )
 
         load_time = time.time() - start_time
         print(f"Loaded {len(all_samples)} samples in {load_time:.1f} seconds")
@@ -1100,7 +1107,8 @@ def main():
                     n_updated += 1
             print(f"  Updated {n_updated}/{len(all_samples)} samples with sex info")
     else:
-        # Load from VCF
+        # Load from VCF; no preprocessed artifact bytes to bind.
+        dataset_provenance = None
         print(f"\nLoading data from {args.vcf}...")
         start_time = time.time()
         all_samples = build_sample_variants(
@@ -1173,6 +1181,7 @@ def main():
         training_mode=training_mode,
     )
     run_metadata["split_plan"] = split_plan_metadata
+    run_metadata["dataset_provenance"] = dataset_provenance
     serialized_position_encoding = run_metadata["position_encoding"]
     learned_binned_position_layout = _training_learned_binned_layout_from_metadata(
         resolved_position_encoding,

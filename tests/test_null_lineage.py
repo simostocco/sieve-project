@@ -1193,5 +1193,68 @@ class TestOptionalHardening:
         assert not null_lineage.sidecar_path_for(output_path).exists()
 
 
+# ---------------------------------------------------------------------------
+# Phase 12C3B1 public schema-validation exports (additive; semantics unchanged)
+# ---------------------------------------------------------------------------
+
+
+class TestPublicSchemaExports:
+    def test_exports_are_listed_in_all(self):
+        assert "validate_sidecar_schema" in null_lineage.__all__
+        assert "validate_embedded_metadata_schema" in null_lineage.__all__
+
+    def test_public_helpers_accept_a_valid_strict_pair(self, tmp_path):
+        _, output_path, sidecar_path, _, _ = _create_valid_pair(tmp_path)
+        embedded = torch.load(output_path, weights_only=False)["_null_baseline_metadata"]
+
+        null_lineage.validate_sidecar_schema(null_lineage.load_sidecar(sidecar_path))
+        null_lineage.validate_embedded_metadata_schema(embedded)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda s: s.pop("lineage_sha256"),
+            lambda s: s["source"].update({"sha256": "XYZ"}),
+            lambda s: s["permutation"].update({"seed": True}),
+            lambda s: s["generator"].update({"script": ""}),
+        ],
+    )
+    def test_public_sidecar_helper_matches_private_behaviour(self, tmp_path, mutate):
+        _, _, sidecar_path, _, _ = _create_valid_pair(tmp_path)
+        sidecar = null_lineage.load_sidecar(sidecar_path)
+        mutate(sidecar)
+
+        with pytest.raises(ValueError) as private_error:
+            null_lineage._validate_sidecar_schema(sidecar)
+        with pytest.raises(ValueError) as public_error:
+            null_lineage.validate_sidecar_schema(sidecar)
+        assert str(public_error.value) == str(private_error.value)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda e: e.pop("permutation_indices"),
+            lambda e: e.update({"is_null_baseline": False}),
+            lambda e: e.update({"n_cases": -1}),
+        ],
+    )
+    def test_public_embedded_helper_matches_private_behaviour(self, tmp_path, mutate):
+        _, output_path, _, _, _ = _create_valid_pair(tmp_path)
+        embedded = torch.load(output_path, weights_only=False)["_null_baseline_metadata"]
+        mutate(embedded)
+
+        with pytest.raises(ValueError) as private_error:
+            null_lineage._validate_embedded_metadata_schema(embedded)
+        with pytest.raises(ValueError) as public_error:
+            null_lineage.validate_embedded_metadata_schema(embedded)
+        assert str(public_error.value) == str(private_error.value)
+
+    def test_public_helpers_reject_non_mappings(self):
+        with pytest.raises(ValueError, match="sidecar must be a mapping"):
+            null_lineage.validate_sidecar_schema(["x"])
+        with pytest.raises(ValueError, match="embedded must be a mapping"):
+            null_lineage.validate_embedded_metadata_schema(None)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

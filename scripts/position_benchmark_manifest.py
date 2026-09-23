@@ -4,6 +4,15 @@ This module builds deterministic command plans only. It does not execute
 benchmark stages, load preprocessed cohorts, create null data, or inspect
 completed training/explanation artifacts. Existing training, explanation, and
 comparison scripts remain the execution and validation authorities.
+
+Manifest ``schema_version: 1`` plans real-only positional benchmarks (Phase
+12C2B) and is unchanged. ``schema_version: 2`` (Phase 12C3B1) additionally
+plans, for every positional strategy, one null-trained model on ONE shared,
+benchmark-level null artifact plus the per-strategy bootstrap calibration
+command. v2 dry-run planning hashes the real/null artifact bytes and parses the
+12C3A lineage sidecar, but never unpickles either cohort; passing this
+lightweight binding does NOT authorize execution. Full ``validate_null_pair``
+is the Phase 12C3B2 execution-preflight authority.
 """
 
 from __future__ import annotations
@@ -98,6 +107,46 @@ TRAIN_CHOICES = {
 EXPLAIN_AGGREGATION_CHOICES = {"mean", "max", "rank_average"}
 RUN_LEAF_NAMES = ("training", "explanation")
 COMPARISON_NAMES = ("performance", "raw_rankings", "raw_attributions")
+PAIRED_SCHEMA_VERSION = 2
+NULL_BASELINE_KEY = "null_baseline"
+PAIRED_TOP_LEVEL_KEYS = TOP_LEVEL_KEYS | {NULL_BASELINE_KEY, "calibration"}
+PAIRED_RUN_LEAF_NAMES = (
+    "training",
+    "explanation",
+    "null_training",
+    "null_explanation",
+    "calibration",
+)
+PAIRED_CV_FOLD_INDEX = 0
+PAIRED_CLASS_WEIGHTING = "off"
+NULL_KEYS = {"artifact"}
+NULL_SIDECAR_DERIVED_KEYS = (
+    "lineage_sidecar",
+    "source_dataset",
+    "permutation_seed",
+    "lineage_sha256",
+    "source_artifact_sha256",
+    "sample_ids_sha256",
+    "null_artifact_sha256",
+    "reuse",
+)
+CALIBRATION_KEYS = {
+    "n_bootstrap",
+    "seed",
+    "top_k",
+    "exclude_sex_chroms",
+    "min_variants_per_gene",
+    "gene_delta_rank_aggregation",
+}
+GENE_DELTA_RANK_AGGREGATION_CHOICES = {"max", "mean"}
+CALIBRATION_RANKINGS_NAME = "bootstrap_calibrated_variant_rankings.csv"
+CALIBRATION_GENE_STATS_NAME = "bootstrap_calibrated_variant_rankings_gene_stats.csv"
+CALIBRATION_SUMMARY_NAME = "bootstrap_calibrated_variant_rankings_summary.yaml"
+PAIRED_COMPATIBILITY_NAME = "paired_compatibility.yaml"
+RESERVED_CALIBRATED_COMPARISON = "calibrated_rankings"
+NULL_BINDING_VALIDATION_LEVEL = "sidecar_schema_and_file_sha256_only"
+NULL_FULL_PAIR_VALIDATION = "deferred_to_phase_12c3b2_preflight_validate_null_pair"
+SIDECAR_SAMPLE_BINDING = "bound_via_null_lineage_sidecar_sample_ids_sha256"
 
 
 class BenchmarkManifestError(ValueError):
@@ -141,6 +190,10 @@ def build_resolved_plan(
         validated["training"]["split_plan_path"],
         training=validated["training"],
     )
+    paired = validated["schema_version"] == PAIRED_SCHEMA_VERSION
+    null_binding = _build_null_binding(validated, split_plan) if paired else None
+    if paired:
+        split_plan["dataset_sample_binding_validation"] = SIDECAR_SAMPLE_BINDING
     runs = _build_runs(
         validated,
         runtime=runtime,
@@ -162,7 +215,54 @@ def build_resolved_plan(
         split_plan_path=validated["training"]["split_plan_path"],
         sex_map_path=validated["training"]["sex_map_path"],
         pc_map_path=validated["training"]["pc_map_path"],
+        null_input_paths=(
+            [
+                (Path(null_binding["null_artifact_path"]), "null_baseline.artifact"),
+                (Path(null_binding["sidecar_path"]), "null lineage sidecar"),
+            ]
+            if paired
+            else None
+        ),
     )
+
+    if paired:
+        return {
+            "schema_version": PAIRED_SCHEMA_VERSION,
+            "manifest_path": str(manifest_path),
+            "manifest_file_sha256": manifest_file_sha256,
+            "repository_root": str(repo_root),
+            "repository_revision": _read_repository_revision(repo_root),
+            "benchmark": {
+                "benchmark_id": validated["benchmark_id"],
+                "annotation_level": validated["annotation_level"],
+                "benchmark_role": validated["benchmark_role"],
+            },
+            "dataset": {
+                "preprocessed_data": str(validated["dataset"]["preprocessed_data_path"]),
+                "genome_build": validated["dataset"]["genome_build"],
+            },
+            "split_plan": split_plan,
+            "null_binding": null_binding,
+            "calibration": _plan_calibration_settings(validated["calibration"]),
+            "paired_policy": _paired_policy(validated),
+            "runtime": runtime,
+            "runs": runs,
+            "comparisons": comparisons,
+            "reserved_comparisons": {
+                RESERVED_CALIBRATED_COMPARISON: {
+                    "directory": str(
+                        benchmark_root / "comparisons" / RESERVED_CALIBRATED_COMPARISON
+                    ),
+                    "status": "reserved_for_phase_12c3c",
+                }
+            },
+            "warnings": warnings,
+            "null_execution": {
+                "status": "planned_not_executed",
+                "execution_authorized": False,
+                "required_preflight": NULL_FULL_PAIR_VALIDATION,
+            },
+        }
 
     return {
         "schema_version": 1,
@@ -204,6 +304,16 @@ def build_human_summary(plan: Mapping[str, Any]) -> str:
         f"Runtime: {plan['runtime']['python']} on {plan['runtime']['device']}",
         "Run order:",
     ]
+    paired = plan["schema_version"] == PAIRED_SCHEMA_VERSION
+    if paired:
+        binding = plan["null_binding"]
+        lines[5:5] = [
+            f"Null artifact: {binding['null_artifact_path']}",
+            f"Null lineage sidecar: {binding['sidecar_path']}",
+            f"Null lineage SHA256: {binding['lineage_sha256']}",
+            f"Null source SHA256: {binding['source_artifact_sha256']}",
+            f"Null artifact SHA256: {binding['null_artifact_sha256']}",
+        ]
     for run in plan["runs"]:
         lines.extend(
             [
@@ -215,13 +325,28 @@ def build_human_summary(plan: Mapping[str, Any]) -> str:
                 f"    explain: {_display_argv(run['explain_argv'])}",
             ]
         )
+        if paired:
+            lines.extend(
+                [
+                    f"    null training: {run['directories']['null_training']}",
+                    f"    null explanation: {run['directories']['null_explanation']}",
+                    f"    null train: {_display_argv(run['null_train_argv'])}",
+                    f"    null explain: {_display_argv(run['null_explain_argv'])}",
+                    f"    calibration: {_display_argv(run['calibration']['argv'])}",
+                ]
+            )
     lines.extend(
         [
             "Comparison commands:",
             f"  performance: {_display_argv(plan['comparisons']['performance']['argv'])}",
             f"  raw_rankings: {_display_argv(plan['comparisons']['raw_rankings']['argv'])}",
             f"  raw_attributions: {_display_argv(plan['comparisons']['raw_attributions']['argv'])}",
-            "NULL EXECUTION: deferred to Phase 12C3",
+            (
+                "NULL EXECUTION: planned only; not authorized until the Phase 12C3B2 "
+                "validate_null_pair preflight"
+                if paired
+                else "NULL EXECUTION: deferred to Phase 12C3"
+            ),
         ]
     )
     if plan["warnings"]:
@@ -241,14 +366,28 @@ def write_resolved_plan(path: str | Path, plan: Mapping[str, Any]) -> None:
 
 
 def _validate_manifest(manifest: Mapping[str, Any], manifest_path: Path) -> dict[str, Any]:
-    unknown = set(manifest) - TOP_LEVEL_KEYS
+    raw_version = manifest.get("schema_version")
+    paired = raw_version == PAIRED_SCHEMA_VERSION and not isinstance(raw_version, bool)
+    top_level_keys = PAIRED_TOP_LEVEL_KEYS if paired else TOP_LEVEL_KEYS
+    unknown = set(manifest) - top_level_keys
     if unknown:
-        raise BenchmarkManifestError(f"manifest has unknown top-level keys: {sorted(unknown)}")
+        # key=str keeps historical ordering for string keys and tolerates a
+        # YAML-null key (e.g. a bare ``null:``) without a TypeError.
+        raise BenchmarkManifestError(
+            f"manifest has unknown top-level keys: {sorted(unknown, key=str)}"
+        )
+    for key in sorted(top_level_keys - TOP_LEVEL_KEYS):
+        if key not in manifest:
+            raise BenchmarkManifestError(
+                f"manifest.{key} is required for schema_version {PAIRED_SCHEMA_VERSION}"
+            )
     for key in TOP_LEVEL_KEYS - {"runtime"}:
         if key not in manifest:
             raise BenchmarkManifestError(f"manifest.{key} is required")
-    if manifest["schema_version"] != 1 or isinstance(manifest["schema_version"], bool):
-        raise BenchmarkManifestError("manifest.schema_version must be 1")
+    if not paired and (
+        manifest["schema_version"] != 1 or isinstance(manifest["schema_version"], bool)
+    ):
+        raise BenchmarkManifestError("manifest.schema_version must be 1 or 2")
 
     benchmark_id = _validate_id(manifest["benchmark_id"], "manifest.benchmark_id")
     level = _required_choice(
@@ -266,13 +405,22 @@ def _validate_manifest(manifest: Mapping[str, Any], manifest_path: Path) -> dict
 
     paths = _validate_paths(manifest["paths"])
     dataset = _validate_dataset(manifest["dataset"], manifest_path)
+    if (
+        paired
+        and isinstance(manifest["training"], Mapping)
+        and manifest["training"].get("class_weighting") is False
+    ):
+        raise BenchmarkManifestError(
+            "manifest.training.class_weighting parsed as boolean false; write the string "
+            '"off" (quoted) because bare off is YAML boolean false'
+        )
     training = _validate_training(manifest["training"], manifest_path)
     explanation = _validate_explanation(manifest["explanation"], training=training)
-    runtime = _validate_runtime(manifest.get("runtime", {}))
-    runs = _validate_runs(manifest["runs"])
+    runtime = _validate_runtime(manifest.get("runtime", {}), paired=paired)
+    runs = _validate_runs(manifest["runs"], paired=paired)
 
-    return {
-        "schema_version": 1,
+    validated = {
+        "schema_version": PAIRED_SCHEMA_VERSION if paired else 1,
         "benchmark_id": benchmark_id,
         "annotation_level": level,
         "benchmark_role": role,
@@ -282,6 +430,97 @@ def _validate_manifest(manifest: Mapping[str, Any], manifest_path: Path) -> dict
         "explanation": explanation,
         "runtime": runtime,
         "runs": runs,
+    }
+    if paired:
+        _validate_paired_protocol(training=training, explanation=explanation)
+        validated[NULL_BASELINE_KEY] = _validate_null_baseline(
+            manifest[NULL_BASELINE_KEY], manifest_path
+        )
+        validated["calibration"] = _validate_calibration(manifest["calibration"])
+    return validated
+
+
+def _validate_paired_protocol(
+    *, training: Mapping[str, Any], explanation: Mapping[str, Any]
+) -> None:
+    """Enforce the controlled real/null protocol restrictions of schema v2.
+
+    ``class_weighting`` must be ``off``: ``auto`` switches on the training
+    fold's case fraction and ``on`` computes a label-dependent ``pos_weight``,
+    so either would make the loss definition differ between real and null
+    after exact split replay. CV explanation must use fold 0: ``train.py``
+    seeds once before the CV loop, so only fold 0 is guaranteed to start from
+    the same RNG state on both sides (later folds inherit RNG consumption from
+    label-dependent early stopping in earlier folds).
+    """
+    if training["class_weighting"] != PAIRED_CLASS_WEIGHTING:
+        raise BenchmarkManifestError(
+            "manifest.training.class_weighting must be 'off' for schema_version 2 "
+            "paired benchmarks ('auto' and 'on' are label-dependent)"
+        )
+    if training["mode"] == "cv" and explanation["fold_index"] != PAIRED_CV_FOLD_INDEX:
+        raise BenchmarkManifestError(
+            "manifest.explanation.fold_index must be 0 for schema_version 2 paired CV "
+            "benchmarks (only fold 0 shares the real/null post-seed RNG state)"
+        )
+
+
+def _validate_null_baseline(value: Any, manifest_path: Path) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BenchmarkManifestError("manifest.null_baseline must be a mapping")
+    restated = sorted(key for key in value if key in NULL_SIDECAR_DERIVED_KEYS)
+    if restated:
+        raise BenchmarkManifestError(
+            f"manifest.null_baseline must not restate {restated}; lineage identity and the "
+            "sidecar path are derived from the 12C3A lineage sidecar"
+        )
+    if set(value) != NULL_KEYS:
+        raise BenchmarkManifestError("manifest.null_baseline must contain exactly artifact")
+    artifact_path = _resolve_existing_path(
+        value["artifact"], manifest_path, "manifest.null_baseline.artifact"
+    )
+    return {"artifact": value["artifact"], "artifact_path": artifact_path}
+
+
+def _validate_calibration(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BenchmarkManifestError("manifest.calibration must be a mapping")
+    unknown = set(value) - CALIBRATION_KEYS
+    if unknown:
+        raise BenchmarkManifestError(f"manifest.calibration has unknown keys: {sorted(unknown)}")
+    missing = CALIBRATION_KEYS - set(value)
+    if missing:
+        raise BenchmarkManifestError(
+            f"manifest.calibration missing required keys: {sorted(missing)}"
+        )
+    top_k = value["top_k"]
+    if not isinstance(top_k, Sequence) or isinstance(top_k, (str, bytes)) or not top_k:
+        raise BenchmarkManifestError(
+            "manifest.calibration.top_k must be a non-empty list of positive integers"
+        )
+    top_k_values = [
+        _required_positive_int(item, f"manifest.calibration.top_k[{index}]")
+        for index, item in enumerate(top_k)
+    ]
+    if len(set(top_k_values)) != len(top_k_values):
+        raise BenchmarkManifestError("manifest.calibration.top_k must not contain duplicates")
+    if not isinstance(value["exclude_sex_chroms"], bool):
+        raise BenchmarkManifestError("manifest.calibration.exclude_sex_chroms must be a bool")
+    return {
+        "n_bootstrap": _required_positive_int(
+            value["n_bootstrap"], "manifest.calibration.n_bootstrap"
+        ),
+        "seed": _required_non_negative_int(value["seed"], "manifest.calibration.seed"),
+        "top_k": top_k_values,
+        "exclude_sex_chroms": value["exclude_sex_chroms"],
+        "min_variants_per_gene": _required_positive_int(
+            value["min_variants_per_gene"], "manifest.calibration.min_variants_per_gene"
+        ),
+        "gene_delta_rank_aggregation": _required_choice(
+            value["gene_delta_rank_aggregation"],
+            GENE_DELTA_RANK_AGGREGATION_CHOICES,
+            "manifest.calibration.gene_delta_rank_aggregation",
+        ),
     }
 
 
@@ -471,16 +710,24 @@ def _validate_explanation(value: Any, *, training: Mapping[str, Any]) -> dict[st
     }
 
 
-def _validate_runtime(value: Any) -> dict[str, Any]:
+def _validate_runtime(value: Any, *, paired: bool = False) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise BenchmarkManifestError("manifest.runtime must be a mapping")
     allowed = {"python", "device", "train_num_workers", "explain_batch_size"}
+    if paired:
+        allowed = allowed | {"calibration_n_jobs"}
     unknown = set(value) - allowed
     if unknown:
         raise BenchmarkManifestError(f"manifest.runtime has unknown keys: {sorted(unknown)}")
     device = value.get("device", "cuda")
     if device not in {"cuda", "cpu"}:
         raise BenchmarkManifestError("manifest.runtime.device must be 'cuda' or 'cpu'")
+    if paired:
+        n_jobs = value.get("calibration_n_jobs", 1)
+        if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs == 0 or n_jobs < -1:
+            raise BenchmarkManifestError(
+                "manifest.runtime.calibration_n_jobs must be a positive integer or -1"
+            )
     return {
         "python": value.get("python"),
         "device": device,
@@ -492,10 +739,11 @@ def _validate_runtime(value: Any) -> dict[str, Any]:
             value.get("explain_batch_size", 4),
             "manifest.runtime.explain_batch_size",
         ),
+        **({"calibration_n_jobs": value.get("calibration_n_jobs", 1)} if paired else {}),
     }
 
 
-def _validate_runs(value: Any) -> list[dict[str, Any]]:
+def _validate_runs(value: Any, *, paired: bool = False) -> list[dict[str, Any]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise BenchmarkManifestError("manifest.runs must be a list")
     if len(value) < 2:
@@ -507,6 +755,12 @@ def _validate_runs(value: Any) -> list[dict[str, Any]]:
         path = f"manifest.runs[{index}]"
         if not isinstance(raw_run, Mapping):
             raise BenchmarkManifestError(f"{path} must be a mapping")
+        strategy_null = sorted(key for key in (NULL_BASELINE_KEY, "null") if key in raw_run)
+        if paired and strategy_null:
+            raise BenchmarkManifestError(
+                f"{path}.{strategy_null[0]} is not allowed: schema_version 2 uses exactly one "
+                "benchmark-level manifest.null_baseline artifact shared by every strategy"
+            )
         if set(raw_run) != {"run_id", "position"}:
             raise BenchmarkManifestError(f"{path} must contain exactly run_id and position")
         run_id = _validate_id(raw_run["run_id"], f"{path}.run_id")
@@ -851,6 +1105,7 @@ def _build_runs(
     repo_root: Path,
     benchmark_root: Path,
 ) -> list[dict[str, Any]]:
+    paired = validated["schema_version"] == PAIRED_SCHEMA_VERSION
     runs = []
     for run in validated["runs"]:
         run_root = (benchmark_root / "runs" / run["run_id"]).resolve(strict=False)
@@ -872,20 +1127,59 @@ def _build_runs(
             repo_root=repo_root,
             run_root=run_root,
         )
-        runs.append(
-            {
-                "run_id": run["run_id"],
-                "position_intent": run["position"],
-                "canonical_position_strategy_identity": DEFERRED_STRATEGY_IDENTITY,
-                "directories": directories,
-                "train_argv": train_argv,
-                "explain_argv": explain_argv,
-                "expected_artifacts": _expected_artifacts(
-                    run_root, validated["training"]["mode"], validated["explanation"]["fold_index"]
-                ),
-            }
-        )
+        mode = validated["training"]["mode"]
+        fold_index = validated["explanation"]["fold_index"]
+        planned = {
+            "run_id": run["run_id"],
+            "position_intent": run["position"],
+            "canonical_position_strategy_identity": DEFERRED_STRATEGY_IDENTITY,
+            "directories": directories,
+            "train_argv": train_argv,
+            "explain_argv": explain_argv,
+            "expected_artifacts": _expected_artifacts(run_root, mode, fold_index),
+        }
+        if paired:
+            directories["null_training"] = str(run_root / "null" / "training")
+            directories["null_explanation"] = str(run_root / "null" / "explanation")
+            directories["calibration"] = str(run_root / "calibration")
+            planned["null_train_argv"] = _build_train_argv(
+                run,
+                validated=validated,
+                runtime=runtime,
+                repo_root=repo_root,
+                run_root=run_root,
+                side="null",
+            )
+            planned["null_explain_argv"] = _build_explain_argv(
+                validated=validated,
+                runtime=runtime,
+                repo_root=repo_root,
+                run_root=run_root,
+                side="null",
+            )
+            planned["calibration"] = _build_calibration(
+                validated=validated,
+                runtime=runtime,
+                repo_root=repo_root,
+                run_root=run_root,
+            )
+            null_artifacts = _expected_artifacts(run_root, mode, fold_index, side="null")
+            planned["expected_artifacts"]["null_training"] = null_artifacts["training"]
+            planned["expected_artifacts"]["null_explanation"] = null_artifacts["explanation"]
+            planned["expected_artifacts"]["calibration"] = planned["calibration"][
+                "expected_outputs"
+            ]
+        runs.append(planned)
     return runs
+
+
+def _side_dataset_path(validated: Mapping[str, Any], side: str) -> Path:
+    """Return the dataset for *side*; the only scientific input that differs."""
+    if side == "real":
+        return validated["dataset"]["preprocessed_data_path"]
+    if side == "null":
+        return validated[NULL_BASELINE_KEY]["artifact_path"]
+    raise BenchmarkManifestError(f"unknown benchmark side: {side!r}")
 
 
 def _build_train_argv(
@@ -895,13 +1189,20 @@ def _build_train_argv(
     runtime: Mapping[str, Any],
     repo_root: Path,
     run_root: Path,
+    side: str = "real",
 ) -> list[str]:
+    """Build real or null training argv from one shared definition.
+
+    Real and null differ only in ``--preprocessed-data`` and ``--output-dir``;
+    split plan, training seed, positional flags, architecture, optimizer, and
+    class weighting are emitted from the same manifest values for both sides.
+    """
     training = validated["training"]
     argv = [
         runtime["python"],
         str(repo_root / "scripts" / "train.py"),
         "--preprocessed-data",
-        str(validated["dataset"]["preprocessed_data_path"]),
+        str(_side_dataset_path(validated, side)),
         "--level",
         validated["annotation_level"],
         "--seed",
@@ -936,7 +1237,7 @@ def _build_train_argv(
         ]
     )
     argv.extend(_position_to_train_argv(run["position"]))
-    argv.extend(["--output-dir", str(run_root / "real"), "--experiment-name", "training"])
+    argv.extend(["--output-dir", str(run_root / side), "--experiment-name", "training"])
     return argv
 
 
@@ -946,23 +1247,30 @@ def _build_explain_argv(
     runtime: Mapping[str, Any],
     repo_root: Path,
     run_root: Path,
+    side: str = "real",
 ) -> list[str]:
+    """Build real or null explanation argv from one shared definition.
+
+    Both sides always use ``--experiment-dir`` with an explicit ``--fold-index``
+    in CV (never best-fold selection or ``--checkpoint``) and identical IG
+    settings; the null side additionally declares ``--is-null-baseline``.
+    """
     explanation = validated["explanation"]
     training = validated["training"]
     argv = [
         runtime["python"],
         str(repo_root / "scripts" / "explain.py"),
         "--experiment-dir",
-        str(run_root / "real" / "training"),
+        str(run_root / side / "training"),
     ]
     if training["mode"] == "cv":
         argv.extend(["--fold-index", str(explanation["fold_index"])])
     argv.extend(
         [
             "--preprocessed-data",
-            str(validated["dataset"]["preprocessed_data_path"]),
+            str(_side_dataset_path(validated, side)),
             "--output-dir",
-            str(run_root / "real" / "explanation"),
+            str(run_root / side / "explanation"),
             "--genome-build",
             validated["dataset"]["genome_build"],
             "--device",
@@ -983,7 +1291,173 @@ def _build_explain_argv(
         argv.extend(
             ["--pc-map", str(training["pc_map_path"]), "--num-pcs", str(training["num_pcs"])]
         )
+    if side == "null":
+        argv.append("--is-null-baseline")
     return argv
+
+
+def _build_calibration(
+    *,
+    validated: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    repo_root: Path,
+    run_root: Path,
+) -> dict[str, Any]:
+    """Plan (never execute) unchanged bootstrap calibration for one strategy pair.
+
+    ``bootstrap_null_calibration.py`` resamples NULL SAMPLES with replacement
+    from this strategy's single null explanation. It does not bootstrap
+    phenotype permutations, variants, model initializations, or independently
+    trained null models.
+    """
+    calibration = validated["calibration"]
+    calibration_dir = run_root / "calibration"
+    outputs = {
+        "rankings": calibration_dir / CALIBRATION_RANKINGS_NAME,
+        "gene_stats": calibration_dir / CALIBRATION_GENE_STATS_NAME,
+        "summary": calibration_dir / CALIBRATION_SUMMARY_NAME,
+    }
+    argv = [
+        runtime["python"],
+        str(repo_root / "scripts" / "bootstrap_null_calibration.py"),
+        "--real-rankings",
+        str(run_root / "real" / "explanation" / "sieve_variant_rankings.csv"),
+        "--null-attributions",
+        str(run_root / "null" / "explanation" / "attributions.npz"),
+        "--output",
+        str(outputs["rankings"]),
+        "--output-gene-stats",
+        str(outputs["gene_stats"]),
+        "--output-summary",
+        str(outputs["summary"]),
+        "--n-bootstrap",
+        str(calibration["n_bootstrap"]),
+        "--seed",
+        str(calibration["seed"]),
+        "--top-k",
+        ",".join(str(value) for value in calibration["top_k"]),
+        "--min-variants-per-gene",
+        str(calibration["min_variants_per_gene"]),
+        "--gene-delta-rank-aggregation",
+        calibration["gene_delta_rank_aggregation"],
+        "--genome-build",
+        validated["dataset"]["genome_build"],
+        "--n-jobs",
+        str(runtime["calibration_n_jobs"]),
+    ]
+    if calibration["exclude_sex_chroms"]:
+        argv.append("--exclude-sex-chroms")
+    return {
+        "directory": str(calibration_dir),
+        "status": "planned_not_executed",
+        "requires": "passing paired compatibility report and Phase 12C3B2 preflight",
+        "paired_compatibility": str(calibration_dir / PAIRED_COMPATIBILITY_NAME),
+        "argv": argv,
+        "expected_outputs": [str(path) for path in outputs.values()],
+    }
+
+
+def _plan_calibration_settings(calibration: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "script": "scripts/bootstrap_null_calibration.py",
+        "n_bootstrap": calibration["n_bootstrap"],
+        "seed": calibration["seed"],
+        "top_k": list(calibration["top_k"]),
+        "exclude_sex_chroms": calibration["exclude_sex_chroms"],
+        "min_variants_per_gene": calibration["min_variants_per_gene"],
+        "gene_delta_rank_aggregation": calibration["gene_delta_rank_aggregation"],
+        "resampling_unit": "null_samples_with_replacement",
+        "not_bootstrapped": [
+            "phenotype_permutations",
+            "variants",
+            "model_initializations",
+            "independently_trained_null_models",
+        ],
+        "rank_ties": "rankdata(method='average') for rank_real and null bootstrap ranks",
+        "delta_rank": "median_rank_null_boot - rank_real",
+    }
+
+
+def _paired_policy(validated: Mapping[str, Any]) -> dict[str, Any]:
+    training = validated["training"]
+    return {
+        "shared_null_artifacts_per_benchmark": 1,
+        "null_models_per_strategy": 1,
+        "split_replay": "same --split-plan for real and null",
+        "training_seed": training["seed"],
+        "training_seed_shared_by_real_and_null": True,
+        "permutation_seed_role": "provenance_only_permutation_vector_is_authoritative",
+        "class_weighting": training["class_weighting"],
+        "explanation_fold_index": validated["explanation"]["fold_index"],
+        "checkpoint_selection": (
+            "cv_explicit_fold" if training["mode"] == "cv" else "single_run_best_model"
+        ),
+        "raw_comparisons": "real_only",
+    }
+
+
+def _build_null_binding(
+    validated: Mapping[str, Any], split_plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind the one benchmark null artifact to the real dataset and split plan.
+
+    Lightweight by design: hashes raw file bytes and parses the 12C3A sidecar,
+    but never unpickles either cohort. Passing this check does NOT authorize
+    execution; full ``validate_null_pair`` runs in the Phase 12C3B2 preflight.
+    """
+    from src.data import null_lineage
+
+    dataset_path = validated["dataset"]["preprocessed_data_path"]
+    null_path = validated[NULL_BASELINE_KEY]["artifact_path"]
+    if null_path == dataset_path:
+        raise BenchmarkManifestError(
+            "manifest.null_baseline.artifact must differ from dataset.preprocessed_data"
+        )
+    sidecar_path = null_lineage.sidecar_path_for(null_path)
+    if not sidecar_path.is_file():
+        raise BenchmarkManifestError(
+            f"null lineage sidecar not found at its deterministic path: {sidecar_path}"
+        )
+    sidecar = _load_yaml_mapping(sidecar_path, "null lineage sidecar")
+    try:
+        null_lineage.validate_sidecar_schema(sidecar)
+    except ValueError as error:
+        raise BenchmarkManifestError(f"null lineage sidecar schema is invalid: {error}") from error
+
+    real_sha = _sha256_file(dataset_path)
+    null_sha = _sha256_file(null_path)
+    if real_sha == null_sha:
+        raise BenchmarkManifestError("null artifact bytes are identical to the real dataset bytes")
+    if sidecar["source"]["sha256"] != real_sha:
+        raise BenchmarkManifestError(
+            "null lineage sidecar source.sha256 does not match dataset.preprocessed_data bytes"
+        )
+    if sidecar["null"]["sha256"] != null_sha:
+        raise BenchmarkManifestError(
+            "null lineage sidecar null.sha256 does not match manifest.null_baseline.artifact bytes"
+        )
+    if sidecar["samples"]["sample_ids_sha256"] != split_plan["sample_ids_sha256"]:
+        raise BenchmarkManifestError(
+            "null lineage sidecar samples.sample_ids_sha256 does not match "
+            "split_plan.sample_ids_sha256"
+        )
+    if sidecar["samples"]["n_samples"] != split_plan["n_samples"]:
+        raise BenchmarkManifestError(
+            "null lineage sidecar samples.n_samples does not match split_plan.n_samples"
+        )
+    return {
+        "schema_version": 1,
+        "lineage_sha256": sidecar["lineage_sha256"],
+        "source_artifact_sha256": real_sha,
+        "null_artifact_sha256": null_sha,
+        "sample_ids_sha256": sidecar["samples"]["sample_ids_sha256"],
+        "n_samples": sidecar["samples"]["n_samples"],
+        "null_artifact_path": str(null_path),
+        "sidecar_path": str(sidecar_path),
+        "validation_level": NULL_BINDING_VALIDATION_LEVEL,
+        "full_pair_validation": NULL_FULL_PAIR_VALIDATION,
+        "execution_authorized": False,
+    }
 
 
 def _position_to_train_argv(position: Mapping[str, Any]) -> list[str]:
@@ -1123,9 +1597,11 @@ def _build_comparisons(
     }
 
 
-def _expected_artifacts(run_root: Path, mode: str, fold_index: int | None) -> dict[str, Any]:
-    training_dir = run_root / "real" / "training"
-    explanation_dir = run_root / "real" / "explanation"
+def _expected_artifacts(
+    run_root: Path, mode: str, fold_index: int | None, *, side: str = "real"
+) -> dict[str, Any]:
+    training_dir = run_root / side / "training"
+    explanation_dir = run_root / side / "explanation"
     model_artifact = (
         training_dir / f"fold_{fold_index}" / "best_model.pt"
         if mode == "cv"
@@ -1158,7 +1634,7 @@ def _inspect_existing_outputs(
     warnings = []
     leaf_paths = []
     for run in runs:
-        leaf_paths.extend(Path(run["directories"][name]) for name in RUN_LEAF_NAMES)
+        leaf_paths.extend(Path(run["directories"][name]) for name in _run_leaf_names(run))
     leaf_paths.extend(Path(comparison["directory"]) for comparison in comparisons.values())
     for path in leaf_paths:
         if path.is_file():
@@ -1172,6 +1648,10 @@ def _inspect_existing_outputs(
     return warnings
 
 
+def _run_leaf_names(run: Mapping[str, Any]) -> tuple[str, ...]:
+    return PAIRED_RUN_LEAF_NAMES if "null_training" in run["directories"] else RUN_LEAF_NAMES
+
+
 def _validate_output_collisions(
     runs: Sequence[Mapping[str, Any]],
     comparisons: Mapping[str, Any],
@@ -1180,6 +1660,7 @@ def _validate_output_collisions(
     split_plan_path: Path,
     sex_map_path: Path | None,
     pc_map_path: Path | None,
+    null_input_paths: Sequence[tuple[Path, str]] | None = None,
 ) -> None:
     run_leafs = []
     for run in runs:
@@ -1190,6 +1671,11 @@ def _validate_output_collisions(
                 f"training and explanation paths collide for {run['run_id']}"
             )
         run_leafs.extend([training, explanation])
+        run_leafs.extend(
+            Path(run["directories"][name])
+            for name in _run_leaf_names(run)
+            if name not in RUN_LEAF_NAMES
+        )
     comparison_leafs = [Path(comparison["directory"]) for comparison in comparisons.values()]
     _reject_duplicate_paths(run_leafs, "run output")
     _reject_duplicate_paths(comparison_leafs, "comparison output")
@@ -1209,6 +1695,12 @@ def _validate_output_collisions(
     for path in comparison_leafs:
         if path in run_leafs:
             raise BenchmarkManifestError(f"comparison output collides with run output: {path}")
+    for source_path, name in null_input_paths or ():
+        for leaf in [*run_leafs, *comparison_leafs]:
+            if source_path == leaf or _is_nested(source_path, leaf):
+                raise BenchmarkManifestError(
+                    f"{name} path collides with a planned output path: {source_path}"
+                )
     for index, left in enumerate(run_leafs):
         for right in run_leafs[index + 1 :]:
             if _is_nested(left, right) or _is_nested(right, left):
@@ -1247,6 +1739,11 @@ def _resolve_runtime(
         "device": device,
         "train_num_workers": runtime.get("train_num_workers", 0),
         "explain_batch_size": runtime.get("explain_batch_size", 4),
+        **(
+            {"calibration_n_jobs": runtime["calibration_n_jobs"]}
+            if "calibration_n_jobs" in runtime
+            else {}
+        ),
     }
 
 
@@ -1329,6 +1826,12 @@ def _validate_output_root(output_root: Path, validated: Mapping[str, Any]) -> No
         sources.append((validated["training"]["sex_map_path"], "training.sex_map"))
     if validated["training"]["pc_map_path"] is not None:
         sources.append((validated["training"]["pc_map_path"], "training.pc_map"))
+    if NULL_BASELINE_KEY in validated:
+        from src.data.null_lineage import sidecar_path_for
+
+        null_path = validated[NULL_BASELINE_KEY]["artifact_path"]
+        sources.append((null_path, "null_baseline.artifact"))
+        sources.append((sidecar_path_for(null_path), "null lineage sidecar"))
     for source_path, source_name in sources:
         if output_root == source_path:
             raise BenchmarkManifestError(

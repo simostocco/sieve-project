@@ -602,6 +602,48 @@ def test_checkpoint_provenance_rejects_malformed_inputs(
         _compare(tmp_path, [run_a, run_b])
 
 
+def test_optional_config_sha256_in_model_provenance_is_accepted(tmp_path: Path) -> None:
+    def with_config_sha(analysis: dict) -> None:
+        analysis["model_provenance"]["config_sha256"] = "a" * 64
+
+    run_a = _make_run(tmp_path, "run_a", analysis_updates=with_config_sha)
+    run_b = _make_run(tmp_path, "run_b")
+    comparison = _compare(tmp_path, [run_a, run_b])
+    assert comparison["compatibility"]["checkpoint_policy"]["selected_fold"] is not None
+
+
+@pytest.mark.parametrize(
+    ("analysis_mutator", "match"),
+    [
+        (
+            lambda analysis: analysis["model_provenance"].update({"config_sha256": "bad"}),
+            "config_sha256 must be lowercase SHA-256",
+        ),
+        (
+            lambda analysis: analysis["model_provenance"].update({"config_sha256": None}),
+            "config_sha256 must be lowercase SHA-256",
+        ),
+        (
+            lambda analysis: analysis["model_provenance"].update({"unexpected": 1}),
+            "schema keys are invalid",
+        ),
+        (
+            lambda analysis: analysis["model_provenance"].pop("config_path"),
+            "schema keys are invalid",
+        ),
+    ],
+)
+def test_model_provenance_optional_key_policy_stays_strict(
+    tmp_path: Path,
+    analysis_mutator: Callable[[dict], None],
+    match: str,
+) -> None:
+    run_a = _make_run(tmp_path, "run_a")
+    run_b = _make_run(tmp_path, "run_b", analysis_updates=analysis_mutator)
+    with pytest.raises(ValueError, match=match):
+        _compare(tmp_path, [run_a, run_b])
+
+
 def test_cv_requires_same_explicit_fold_but_auc_may_differ(tmp_path: Path) -> None:
     run_a = _make_run(tmp_path, "run_a", selected_fold=1, selected_fold_auc=0.7)
     run_b = _make_run(tmp_path, "run_b", selected_fold=1, selected_fold_auc=0.9)
