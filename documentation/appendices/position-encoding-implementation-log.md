@@ -4161,3 +4161,369 @@ preflight `validate_null_pair()`, stage records (including repository
 revision), `paired_compatibility.yaml` serialization, and safe resume/reuse
 (not implemented in this phase). Phase 12C3C - calibrated positional
 comparison gate - follows.
+
+## Phase 12C3B2A - Execution Foundation and Null Preflight
+
+Goal:
+
+- Build the safe execution substrate for paired (schema-v2) positional
+  benchmarks: exact reviewed-plan identity, v2 input-file byte binding,
+  rebuild authority, permanent benchmark-root plan binding, repository and
+  output-location gates, an execution lock, execution-environment
+  provenance, deterministic file and directory fingerprints, versioned stage
+  records with atomic writes, a generic subprocess stage primitive, and the
+  full `validate_null_pair` null preflight with `null_validation.yaml`.
+- Infrastructure only. No benchmark stage was executed: no `train.py`,
+  `explain.py`, pair validation, `bootstrap_null_calibration.py`, or B1/B2/B3
+  comparison is launched by this phase, and the public CLI remains dry-run
+  only. Positional, attention, Integrated Gradients, `VariantRanker`,
+  bootstrap, `delta_rank`, and B1/B2/B3 mathematics are unchanged, and the
+  calibrated ranking gate (`DEFERRED_CALIBRATED_SCORE_COLUMNS`) stays closed.
+
+Files changed:
+
+- `scripts/position_benchmark_manifest.py`
+- `scripts/position_benchmark_records.py` (new)
+- `scripts/position_benchmark_execution.py` (new)
+- `tests/test_position_benchmark_records.py` (new)
+- `tests/test_position_benchmark_execution.py` (new)
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+`scripts/run_position_benchmark.py`, `train.py`, `explain.py`,
+`position_benchmark_pairing.py`, `bootstrap_null_calibration.py`,
+`compare_ablation_rankings.py`, `compare_position_attributions.py`, and all
+model, runtime, attention, IG, and ranking modules are untouched. No hard
+dependency on them appeared.
+
+Decisions and reasoning:
+
+- v2 `input_files`. Schema-v2 resolved plans gain one block, placed after
+  `split_plan`, with `preprocessed_data`, `null_artifact`,
+  `null_lineage_sidecar`, `split_plan`, `sex_map`, and `pc_map`, each
+  `{path, sha256}` over raw file bytes (`sex_map`/`pc_map` are `null` when
+  absent). The real and null hashes intentionally overlap `null_binding`
+  and reuse its streaming hashes rather than hashing multi-GB cohorts twice:
+  `null_binding` is the scientific real/null relationship, `input_files` is
+  exact reviewed input-file integrity. v1 plans do not get the block.
+- Plan publication. `write_resolved_plan` now publishes atomically through a
+  same-directory temporary file, `flush`, `fsync`, `os.replace`, and a
+  parent-directory `fsync`. The YAML bytes are produced by the same
+  `yaml.safe_dump(plan, sort_keys=False)` call, and existing-file refusal and
+  its message are unchanged. The existence check and the rename are not one
+  atomic step; concurrent executors are excluded by the execution lock.
+- Plan identity. `resolved_plan_file_sha256(path)` is SHA-256 of the exact
+  persisted plan bytes. It is the only execution-plan identity; no second
+  semantic plan hash was introduced. A byte-different but YAML-equal file is
+  a different plan by design.
+- Persisted-plan loader. `load_persisted_execution_plan` validates
+  structure only and executes nothing: YAML mapping, `schema_version == 2`
+  (v1 is rejected; v1 remains real-only dry-run planning), a structurally
+  valid `null_binding` with `execution_authorized: false`,
+  `null_execution.execution_authorized: false` (planning never authorizes
+  execution), `warnings == []`, a complete and internally consistent
+  `input_files` block (its real/null hashes and paths must agree with
+  `null_binding`, `dataset`, and `split_plan`), a full 40-hex
+  `repository_revision` (never `unknown`), absolute `repository_root`,
+  `manifest_path`, and `runtime.python`, a lowercase `manifest_file_sha256`,
+  and every planned argv (four per run, calibration, three comparisons) a
+  non-empty list of strings starting with `runtime.python`. A plan written
+  before this phase lacks `input_files` and is therefore not executable.
+- Rebuild authority. `verify_plan_rebuild` loads the plan, hashes its exact
+  bytes, optionally cross-checks an explicitly supplied manifest path, reruns
+  `build_resolved_plan(plan.manifest_path, python_override=plan.runtime.python,
+  device_override=plan.runtime.device, allow_existing_outputs=True)`, YAML
+  round-trips the rebuilt plan, and requires type-strict deep equality with
+  the persisted plan except `warnings` (which legitimately change once
+  outputs exist). This detects changes to manifest bytes, split membership,
+  any `input_files` byte hash (split-plan file, sidecar, sex map, PC map),
+  real/null artifacts, repository revision, Python path, planned argv, and
+  output paths. Differences are reported as dotted paths.
+- Permanent binding. `bind_benchmark_plan` copies the exact verified plan
+  bytes atomically to `<benchmark_root>/execution/resolved_plan.yaml` on
+  first binding and writes `execution/plan_binding.yaml` (with
+  `resolved_plan_sha256`, repository revision, and manifest SHA). Neither
+  file is ever rewritten; later invocations must present byte-identical plan
+  bytes. If a crash lands between the two writes, the next call re-verifies
+  the plan bytes and completes the missing binding record. The benchmark
+  root is derived from the planned run/comparison directories and must be
+  consistent. Dry-run never binds (tested).
+- Repository gate. `require_repository_gate` runs `git rev-parse
+  --show-toplevel`, `git rev-parse HEAD`, and `git status --porcelain=v1
+  --untracked-files=all` as argv lists with `shell=False`, and requires the
+  root and revision to equal the plan and the worktree, index, and untracked
+  state to be empty. There is no dirty-worktree override.
+- Output locations. `require_output_location_safe` accepts a path outside
+  the repository or one reported ignored by `git check-ignore -q`; a
+  non-ignored path inside the repository, the repository root itself, or any
+  `check-ignore` error rejects, because executor outputs there would dirty
+  the scientific worktree and fail every later gate.
+  `require_execution_locations_safe` applies it to the benchmark root and the
+  persisted plan file.
+- Lock. `ExecutionLock` takes `fcntl.flock(LOCK_EX | LOCK_NB)` on
+  `<benchmark_root>/execution/execution.lock` and keeps the descriptor open
+  for its lifetime. The kernel lock is the authority; pid, hostname, start
+  time, and plan SHA written into the file are diagnostic only. The kernel
+  releases the lock when the holder dies, so there is no stale-lock deletion
+  heuristic, and the file is never deleted. `flock` may be unreliable on some
+  network filesystems.
+- Environment probe. `probe_execution_environment` runs
+  `[plan.runtime.python, "-c", ENVIRONMENT_PROBE]` with `shell=False` and
+  records the plan Python path, the probed executable, Python version,
+  PyTorch version, `torch.version.cuda`, `torch.cuda.is_available()`, CUDA
+  device names, platform, hostname, and `CUDA_VISIBLE_DEVICES`. A plan
+  requesting `cuda` where CUDA is unavailable fails. This is execution
+  provenance only; it never enters positional strategy identity, and the
+  interpreter binary is not hashed.
+- Records module (`position_benchmark_records.py`, standard library plus
+  PyYAML only, so fingerprinting never imports torch):
+  - `file_fingerprint` streams SHA-256 and records `{kind, path, sha256,
+    size}`; missing paths, directories, symlinks, and special files reject,
+    and a size mismatch against `fstat` taken before reading rejects a file
+    rewritten mid-hash. Mtimes are never identity.
+  - `directory_manifest` implements `sieve.directory_manifest.v1`: every
+    regular file below the root contributes `{path (relative POSIX), size,
+    sha256}`, sorted by path; symlinks (to files or directories), FIFOs,
+    sockets, devices, and a symlinked root reject rather than being skipped.
+    The hash is SHA-256 over a canonical JSON header line (`schema`,
+    `n_files`) plus one canonical JSON line per entry, excluding mtimes,
+    inodes, permissions, and absolute paths. The persisted JSONL file's own
+    SHA-256 equals the manifest hash. Empty directories contribute no entries.
+  - Atomic writes use a same-directory temporary file, `flush`, `fsync`,
+    `os.replace`, and a best-effort parent `fsync`, refuse overwrite by
+    default, and remove the temporary file on any failure.
+  - Stage records have `schema_version: 1` and an exact key set per
+    `record_kind`. Common fields: `record_kind`, `stage_id` (path-like, for
+    example `runs/<run_id>/real_training`, because run IDs may contain `.`),
+    `stage_type`, `run_id`, `side`, `repository_revision`,
+    `resolved_plan_sha256`, `manifest_file_sha256`, `execution` (subprocess
+    `{argv, cwd, logs, exit_code}` or in-process `{callable}`), `inputs`,
+    `dependencies` (`{stage_id, record_path, record_sha256}`),
+    `environment`, and `started_at`. `completed` adds `completed_at`,
+    non-empty `outputs`, and `post_validation.status: passed` (and exit code
+    0 for subprocesses). `failed` adds `completed_at` and `failure {reason,
+    exit_code, exception, partial_outputs_present}` and can never carry
+    `outputs`. `running` carries neither. Records live at
+    `<benchmark_root>/execution/stages/<stage_id>.<kind>.yaml`, outside
+    scientific output directories. `require_completed_record` accepts only a
+    schema-valid `completed` record at its canonical location, so a running
+    or failed record, a renamed record, or an empty file never authorizes
+    reuse.
+- Generic subprocess primitive. `run_subprocess_stage` passes the planned
+  argv list through unchanged with `shell=False` and an explicit absolute
+  `cwd`, writes stdout and stderr directly to
+  `<log_stem>.stdout.log`/`.stderr.log` (refusing existing logs) so logs
+  survive an executor crash, and fingerprints both logs. Non-zero exit raises
+  `StageFailure` with the structured result. `KeyboardInterrupt` sends SIGINT,
+  waits, then terminates and kills the child, and raises `StageInterrupted`
+  (a `KeyboardInterrupt` subclass, so it cannot be swallowed by `except
+  Exception`). Terminal visibility of child output is not streamed; logs are
+  the persistent record. `execute_subprocess_stage` wraps this in record
+  discipline: it refuses to start if any record exists for the stage or an
+  owned output is non-empty, publishes a `running` record, and on failure or
+  interruption publishes a `failed` record and removes the running marker.
+  On success it returns while the running marker remains; only the caller
+  can publish `completed`, through `publish_completed_record`, after its own
+  post-validation and hashing. `record_stage_failure` covers zero-exit
+  stages that fail post-validation. No helper deletes or modifies partial
+  scientific outputs.
+- Full null preflight. `run_null_preflight` first recomputes every
+  `input_files` hash, requires the sidecar to be the deterministic
+  `sidecar_path_for(null)`, runs the full 12C3A
+  `validate_null_pair(real, null, sidecar)` (which loads both artifacts),
+  and requires `lineage_sha256`, `source_artifact_sha256`,
+  `null_artifact_sha256`, `sample_ids_sha256`, and `n_samples` to equal
+  `plan.null_binding` exactly. It only reads; the null artifact and sidecar
+  are never regenerated or rewritten (tested by forbidding the 12C3A
+  creation helpers and checking bytes and mtimes).
+- `null_validation.yaml`. `build_null_validation_report` and
+  `write_null_validation_report` produce
+  `<benchmark_root>/null_binding/null_validation.yaml` (`schema_version: 1`)
+  with `status: passed`, `validated_at`, repository revision, plan and
+  manifest SHAs, `source`/`null`/`lineage_sidecar` `{path, sha256}`,
+  `lineage_sha256`, `sample_ids_sha256`, `n_samples`, `split_plan {path,
+  file_sha256, membership_sha256, sample_ids_sha256}`, the validator name,
+  the full validator report, and `plan_binding_match: true`. It is written
+  atomically once. Only the timestamp is non-deterministic. It is an
+  execution-stage record; no scientific identity is derived from it.
+- Split identity. Planner `split_plan.membership_sha256` and training config
+  `split_plan.sha256` (and `input_sha256`) are all
+  `src.training.split_plan.split_plan_sha256()` over the canonical
+  membership payload, which excludes `seed` and `split_source`, so a
+  replayed plan keeps the membership hash of its generated input. Phase
+  12C3B2B will require that equality. `input_files.split_plan.sha256` is
+  separately the raw file-byte hash and changes with formatting-only edits
+  (tested). No new split hash was introduced.
+- Paired compatibility policy is unchanged. For 12C3B2B,
+  `paired_compatibility.yaml` stays the pure deterministic report from
+  `require_compatible_real_null_pair`; execution file hashes belong in its
+  stage record.
+- Future CLI. The approved 12C3B2B interface is `python
+  scripts/run_position_benchmark.py MANIFEST --execute-plan PLAN [--resume]`.
+  It is not exposed: without `--dry-run` the CLI still exits 2 with
+  `execution is not implemented yet`, and `--execute-plan` is an unknown
+  argument (tested).
+- Production plan timing. `repository_revision` is execution-bound, so
+  production plans must be generated after the final Phase 12C3B2 executor
+  commit. A plan generated at `dada89a` (or at this phase's commit) can never
+  pass the repository gate of a later commit; during development, plans are
+  fixtures and review artifacts only.
+
+Runtime behaviour:
+
+- `--dry-run` behaviour is unchanged except that v2 resolved plans now contain
+  `input_files` and `--out-plan` is published atomically. Human summaries are
+  unchanged.
+- No execution entry point exists. The new helpers are importable library
+  functions for Phase 12C3B2B.
+
+Compatibility effects:
+
+- v1 resolved plans and human summaries are byte-identical: four v1 fixtures
+  (CV and single-split, L3 primary and L0 sensitivity) were generated from
+  the pristine `dada89a` code and after this phase and compared with `cmp`;
+  all eight files are identical.
+- v2 plans gain one additive top-level key. All existing 12C3B1 paired
+  manifest and pairing tests pass unmodified.
+
+Validation:
+
+- Repository gate passed at HEAD `dada89a59d6d127cb2c3785f6743327ef7952668`
+  (matching `origin/simostocco/position-encoding-benchmark`, clean worktree
+  and index) before editing.
+- New tests: `tests/test_position_benchmark_records.py` (47) and
+  `tests/test_position_benchmark_execution.py` (107), 154 in total, all
+  passing. Subprocess tests use tiny fake Python scripts (including a real
+  SIGINT delivered to the executor during a running child), git tests use a
+  fake runner or a throwaway repository, lock contention is tested in-process
+  and across processes (including release on holder death), and the null
+  preflight runs the real `validate_null_pair` on the existing tiny strict
+  null fixture.
+- Mutation spot-checks: ignoring `input_files` in the rebuild comparison,
+  disabling the null-binding field comparison, or accepting symlinks in the
+  directory manifest makes the corresponding tests fail.
+- Focused regression (12C2B manifest/orchestration, 12C3A null lineage,
+  12C3B1 paired manifest/pairing/dataset provenance, split-plan and train
+  split-plan, B1/B2/B3 metadata/performance/rankings/attributions, bootstrap
+  null calibration, and the two new files): 795 passed, 5 warnings.
+- Full suite: `python -m pytest -q` passed 2140 tests, 0 failed, 0 skipped,
+  6 warnings (pre-existing), in 163.03s (rerun after the final loader fix).
+- `ruff check`, `black --check`, and `isort --check-only` are clean on all
+  five changed Python files; `py_compile` is clean on them and on
+  `run_position_benchmark.py`; `git diff --check` is clean;
+  `scripts/check_docs_style.py` reports no violations in the five Python
+  files and no new violations in this log (108 pre-existing, all in earlier
+  sections).
+
+Known limitations:
+
+- Infrastructure only: the stage DAG, stage post-validators (training,
+  explanation, pair validation, calibration, comparisons), the calibration
+  input hash gate, resume, and the public `--execute-plan` wiring are Phase
+  12C3B2B.
+- Existence-then-rename refusal in atomic writes is not a single atomic
+  operation; exclusion of concurrent writers relies on the execution lock.
+- `flock` may be unreliable on some network filesystems.
+- Directory manifests cover regular files only; empty directories are not
+  represented.
+- Child stdout/stderr are persisted to files rather than streamed to the
+  terminal.
+- The environment probe requires the plan Python to import torch; it records
+  provenance but does not pin versions.
+- The persisted-plan loader validates structure; scientific equality between
+  plan intent and saved training/explanation metadata is 12C3B2B work.
+
+### Review corrections (post-acceptance)
+
+Scope: execution primitives only. `input_files`, v1 byte identity, plan SHA
+semantics, rebuild equality, plan binding, the Git gate, output-location
+policy, the lock, the environment probe, stage-record schemas, file and
+directory fingerprints, the null preflight, `null_validation.yaml`, split-hash
+semantics, and the dry-run-only CLI are unchanged. Only
+`scripts/position_benchmark_execution.py`,
+`tests/test_position_benchmark_execution.py`, and this log changed.
+
+- Launch preconditions before `running`. A new shared
+  `validate_launch_preconditions` (returning a frozen `SubprocessLaunch`)
+  checks, without touching the filesystem, that argv is a non-empty list of
+  strings, `cwd` is absolute and an existing directory, the log layout is
+  valid (absolute log directory whose nearest existing ancestor is a real
+  directory; single-segment log stem), and neither the stdout nor the stderr
+  log exists. `execute_subprocess_stage` now runs, in order: stage
+  record/output preconditions, launch preconditions, `running` publication,
+  launch. Previously `run_subprocess_stage` could raise `StageStateError`
+  (malformed argv, relative or missing `cwd`, existing log) after the
+  running record was published, leaving an orphaned `running` marker for a
+  process that never started. Now such failures leave no running record, no
+  failed record, no log, no subprocess, and no output change.
+  `run_subprocess_stage` still validates defensively through the same helper.
+  Execution logs are placed under the resolved execution directory.
+- Defensive failure after `running`. `StageFailure` and `StageInterrupted`
+  handling is unchanged. Any other ordinary `Exception` after the running
+  record exists (for example a launch bug or a hashing error after the child
+  finished) is recorded best-effort as a `failed` record with reason
+  `unexpected_error` and `exception` set to `"<Type>: <message>"`, the
+  execution block built from the validated launch (argv, cwd, and log
+  fingerprints when both logs exist), and `partial_outputs_present`. The
+  running marker is removed only after the failed record is published, and a
+  `StageFailure` chained (`from`) to the original exception is raised. If the
+  failed record cannot be published, the running marker is left (fail
+  closed) and `StageRecordError` naming both errors is raised, chained to the
+  original. `KeyboardInterrupt`, `SystemExit`, and other `BaseException` are
+  never converted. Partial outputs are never touched.
+- Process-group interrupt handling. Stages now launch with
+  `start_new_session=True`, so each stage is its own POSIX session and
+  process group and worker processes (such as future bootstrap calibration
+  workers) are stopped with it. On `KeyboardInterrupt` the executor signals
+  the stage group with `os.killpg`: SIGINT, wait
+  `INTERRUPT_GRACE_SECONDS`; SIGTERM, wait `TERMINATE_GRACE_SECONDS`;
+  SIGKILL, wait `KILL_GRACE_SECONDS`. Escalation stops as soon as the group
+  is empty, which is probed with signal 0 after reaping the leader, so
+  workers that outlive the leader are still escalated. An already-exited
+  group is not an error. The executor never signals its own process group
+  (it falls back to signalling only the direct child in that misconfigured
+  case). Because a stage is no longer in the terminal foreground group, a
+  terminal Ctrl-C reaches only the executor, which forwards it to the stage
+  group. The SIGINT handler is swapped during shutdown only on the main
+  thread. This supersedes the child-only SIGINT/terminate/kill sequence
+  described above and relies on POSIX, like the existing `fcntl.flock` lock.
+
+Validation (review corrections):
+
+- New tests in `tests/test_position_benchmark_execution.py` (107 -> 132):
+  malformed argv (five shapes), relative `cwd`, missing `cwd`, `cwd` that
+  is a file, pre-existing stdout log, pre-existing stderr log, and a blocked
+  log directory, each through `execute_subprocess_stage` and each proving no
+  stage records, no subprocess, and unchanged logs and outputs; an unexpected
+  launch exception and an unexpected post-run exception each producing a
+  failed record, no running record, no completed record, and preserved
+  partial output; failed-record publication failure leaving the running
+  marker; `SystemExit` not converted; `start_new_session=True` passed to
+  `Popen`; process-group escalation SIGINT, SIGINT+SIGTERM, and
+  SIGINT+SIGTERM+SIGKILL (including workers outliving the leader); an
+  already-gone group sending nothing; tolerance of `ProcessLookupError`; and
+  never signalling the executor's own group. Fake process and process-group
+  helpers are used; no real process trees are created. The existing real
+  SIGINT test still passes with no completed record.
+- Mutation spot-checks: validating launch preconditions only after `running`
+  publication (11 failures), signalling only the direct child (7),
+  launching without a new session (2), and removing the generic `Exception`
+  handler (3) each make the corresponding tests fail.
+- Records plus execution-foundation tests: 179 passed (47 + 132).
+- Focused regression (12C2B, 12C3A, 12C3B1, split-plan and train split-plan,
+  B1/B2/B3, bootstrap null calibration, and the two new files): 820 passed,
+  5 warnings.
+- Full suite: `python -m pytest -q` passed 2165 tests, 0 failed, 0 skipped,
+  6 warnings (pre-existing), in 164.05s.
+- `ruff check`, `black --check`, `isort --check-only`, and `py_compile` are
+  clean on all five changed Python files; `git diff --check` is clean; v1
+  golden plans and summaries remain byte-identical.
+
+## Next planned phase
+
+Phase 12C3B2B - Paired benchmark stage execution and resume: wire the
+12C3B2A primitives into the stage DAG (null preflight, real/null training and
+explanation, pair validation with `paired_compatibility.yaml`, shared-null
+validation, calibration input hash gate and post-checks, raw B1/B2/B3
+comparisons), stage post-validation, explicit `--resume`, and the public
+`--execute-plan` CLI. Phase 12C3C - calibrated positional comparison gate -
+follows.

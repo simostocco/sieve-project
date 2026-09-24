@@ -13,6 +13,12 @@ command. v2 dry-run planning hashes the real/null artifact bytes and parses the
 12C3A lineage sidecar, but never unpickles either cohort; passing this
 lightweight binding does NOT authorize execution. Full ``validate_null_pair``
 is the Phase 12C3B2 execution-preflight authority.
+
+Phase 12C3B2A adds a v2-only ``input_files`` block recording the raw-byte
+SHA-256 of every reviewed input file, atomic ``--out-plan`` publication, and
+``resolved_plan_file_sha256``: the exact persisted plan bytes are the only
+execution-plan identity (there is deliberately no second, semantic plan hash).
+v1 plans are byte-identical to Phase 12C2B and remain dry-run only.
 """
 
 from __future__ import annotations
@@ -39,6 +45,11 @@ from src.encoding.position_config import (
     RelativePositionEncoding,
 )
 from src.training.split_plan import split_plan_sha256
+
+if __package__ in {None, ""}:
+    from position_benchmark_records import atomic_write_bytes
+else:
+    from .position_benchmark_records import atomic_write_bytes
 
 DEFERRED_STRATEGY_IDENTITY = "deferred_until_saved_config"
 DEFERRED_SAMPLE_BINDING = "deferred_to_train_runtime"
@@ -242,6 +253,7 @@ def build_resolved_plan(
                 "genome_build": validated["dataset"]["genome_build"],
             },
             "split_plan": split_plan,
+            "input_files": _build_input_files(validated, null_binding),
             "null_binding": null_binding,
             "calibration": _plan_calibration_settings(validated["calibration"]),
             "paired_policy": _paired_policy(validated),
@@ -356,13 +368,34 @@ def build_human_summary(plan: Mapping[str, Any]) -> str:
 
 
 def write_resolved_plan(path: str | Path, plan: Mapping[str, Any]) -> None:
-    """Write one explicit resolved-plan YAML file, refusing overwrite."""
+    """Atomically publish one explicit resolved-plan YAML file, refusing overwrite.
+
+    The YAML bytes are exactly those of the historical direct write
+    (``yaml.safe_dump(plan, sort_keys=False)``); only publication changed. The
+    file is written to a same-directory temporary file, flushed, ``fsync``ed,
+    and renamed into place, so an execution can never bind to a truncated plan.
+    """
     output_path = Path(path)
     if output_path.exists():
         raise BenchmarkManifestError(f"--out-plan already exists: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(dict(plan), handle, sort_keys=False)
+    data = yaml.safe_dump(dict(plan), sort_keys=False).encode("utf-8")
+    try:
+        atomic_write_bytes(output_path, data, overwrite=False)
+    except FileExistsError as error:
+        raise BenchmarkManifestError(f"--out-plan already exists: {output_path}") from error
+
+
+def resolved_plan_file_sha256(path: str | Path) -> str:
+    """Return SHA-256 of the exact persisted resolved-plan bytes.
+
+    This is the only execution-plan identity: execution binds to the reviewed
+    YAML file byte-for-byte rather than to a re-serialized or semantic view.
+    """
+    plan_path = Path(path)
+    if not plan_path.is_file():
+        raise BenchmarkManifestError(f"resolved plan is not a file: {plan_path}")
+    return _sha256_file(plan_path)
 
 
 def _validate_manifest(manifest: Mapping[str, Any], manifest_path: Path) -> dict[str, Any]:
@@ -1457,6 +1490,41 @@ def _build_null_binding(
         "validation_level": NULL_BINDING_VALIDATION_LEVEL,
         "full_pair_validation": NULL_FULL_PAIR_VALIDATION,
         "execution_authorized": False,
+    }
+
+
+def _build_input_files(
+    validated: Mapping[str, Any], null_binding: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Record the raw-byte SHA-256 of every reviewed v2 input file.
+
+    ``input_files`` is file-byte integrity for the exact reviewed inputs, used
+    by Phase 12C3B2 execution to detect any input change after review. It is
+    intentionally distinct from:
+
+    - ``null_binding``, the scientific real/null relationship (the real and
+      null hashes deliberately overlap and are reused here, not recomputed);
+    - ``split_plan.membership_sha256``, the scientific split-membership
+      identity from ``split_plan_sha256()``; ``input_files.split_plan.sha256``
+      is the raw YAML file-byte hash and changes with formatting-only edits.
+    """
+    training = validated["training"]
+
+    def entry(path: Path, sha256: str | None = None) -> dict[str, str]:
+        return {"path": str(path), "sha256": sha256 or _sha256_file(path)}
+
+    return {
+        "preprocessed_data": entry(
+            validated["dataset"]["preprocessed_data_path"],
+            null_binding["source_artifact_sha256"],
+        ),
+        "null_artifact": entry(
+            Path(null_binding["null_artifact_path"]), null_binding["null_artifact_sha256"]
+        ),
+        "null_lineage_sidecar": entry(Path(null_binding["sidecar_path"])),
+        "split_plan": entry(training["split_plan_path"]),
+        "sex_map": (None if training["sex_map_path"] is None else entry(training["sex_map_path"])),
+        "pc_map": None if training["pc_map_path"] is None else entry(training["pc_map_path"]),
     }
 
 
