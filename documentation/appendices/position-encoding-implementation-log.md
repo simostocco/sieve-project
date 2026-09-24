@@ -4914,6 +4914,104 @@ Known limitations:
   `ruff`, `black --check`, `isort --check-only`, `py_compile`, and
   `git diff --check` are clean on the changed files.
 
+## Prerequisite fix before Phase 12C3C - Bootstrap sex-chromosome filter index alignment
+
+Goal: fix a pre-existing index-alignment bug in
+`scripts/bootstrap_null_calibration.py`, found during the Phase 12C3C
+audit, before any calibrated output is used for cross-strategy comparison.
+This is not Phase 12C3C implementation.
+
+Bug. With `--exclude-sex-chroms`, `_maybe_filter_real_df` returned
+`real_df.loc[mask].copy()`, which kept the original pandas index labels.
+`_compute_gene_statistics` then used `group.index.to_numpy(dtype=int)` as
+positional indices into the NumPy arrays `rank_real` and
+`real_to_null_index`, which are sized and ordered by the filtered rows.
+Whenever a sex-chromosome row came before or between autosomal rows, the
+labels no longer equalled positions: gene statistics read the wrong
+variants' ranks, or raised `IndexError` (always, for the gene that holds
+the last retained row). Variant-level outputs (`rank_real`,
+`median_rank_null_boot`, `delta_rank`, `p_rank_boot`, `fdr_rank_boot`) are
+computed positionally over whole arrays and were not affected;
+`gene_delta_rank` used `.loc` labels and was internally consistent but sat
+in the same failing function. The existing `test_exclude_sex_chroms`
+missed the bug because its catalogue places X/Y last, so the filtered
+labels happened to stay contiguous.
+
+Files changed:
+
+- `scripts/bootstrap_null_calibration.py`: `_maybe_filter_real_df` now
+  returns `real_df.loc[mask].copy().reset_index(drop=True)`, with a
+  docstring explaining why the contiguous index is required. The
+  unfiltered path (`exclude_sex_chroms=False`) still returns the input
+  frame itself.
+- `tests/test_bootstrap_null_calibration.py`: five focused tests (below).
+- this log.
+
+Decisions: index alignment only. Row order, `rankdata(method="average")`,
+real and null ranks, `delta_rank = q50 - rank_real`, `p_rank_boot`, BH FDR,
+bootstrap sampling and seeds, variant join keys, gene aggregation,
+Mann-Whitney, and the Hodges-Lehmann estimator are unchanged. The
+manifest, executor, and position comparison gate are untouched.
+
+Runtime and compatibility effects: runs without `--exclude-sex-chroms` are
+unchanged. Runs with it now produce correct gene statistics instead of
+wrong values or an `IndexError`; variant-level output bytes are unchanged
+for inputs that previously completed. Previously written gene-stats files
+from runs with `--exclude-sex-chroms` and interleaved sex-chromosome rows
+should be treated as unreliable. No production benchmark has run.
+
+Tests added:
+
+- `test_sex_chrom_filter_resets_to_contiguous_index`: X/Y rows before and
+  between autosomes; exactly the autosomal rows remain, in order, with index
+  `0..n-1`.
+- `test_sex_chrom_filter_is_identity_when_disabled`: the disabled path
+  returns the same object and removes 0 rows.
+- `test_gene_statistics_use_retained_rows_after_sex_chrom_filter`: after
+  filtering, per-gene `n_variants_real`, `median_rank_real`,
+  `median_rank_null`, and `gene_delta_rank` (`max` and `mean`) equal values
+  computed by hand from the retained rows.
+- `test_exclude_sex_chroms_interleaved_matches_prefiltered_input`: an
+  end-to-end `main()` run on interleaved input with exclusion equals a run on
+  the same input filtered and reset by hand: autosomal `delta_rank` and
+  `rank_real` are exactly equal, the variant CSV and gene stats are
+  frame-equal, and the summary is equal except
+  `n_real_variants_removed_sex_chroms` (60 vs 0).
+- `test_include_sex_chroms_interleaved_keeps_all_rows`: without exclusion,
+  interleaved input keeps every row in order and gene counts cover all rows.
+
+Mutation check: with the fix reverted, the three exclusion tests fail
+(`IndexError: index 6 is out of bounds for axis 0 with size 5`, and
+`index 240 is out of bounds for axis 0 with size 240`); the two
+disabled-path tests pass.
+
+Checks run (environment `sieve-posenc`):
+
+- `tests/test_bootstrap_null_calibration.py`: 25 passed (20 existing + 5
+  new), 6 warnings. At HEAD it was 20 passed, 5 warnings; the extra warning
+  is the pre-existing scipy `ks_2samp` "Exact calculation unsuccessful"
+  RuntimeWarning, now also raised by the new disabled-path end-to-end test.
+- `tests/test_position_benchmark_execution.py` (exercises calibration
+  stages with a fake bootstrap producer): 240 passed.
+- `tests/test_position_benchmark_*.py`, `tests/test_compare_ablation_rankings.py`,
+  and `tests/test_bootstrap_null_calibration.py` together: 769 passed,
+  6 warnings.
+- Full suite: 2289 passed, 0 failed, 0 skipped, 7 warnings, in 434.73s
+  (previous log: 2284 passed, 6 warnings; +5 new tests, +1 known scipy
+  warning).
+- `git diff --check` and `py_compile` pass. Relative to HEAD `9a162ca`,
+  the change adds 0 Ruff findings, 0 isort findings, and 0 Black diff
+  lines. Both changed Python files already fail whole-file `ruff check`,
+  `black --check`, and `isort --check-only` at HEAD (Ruff 23 and 1
+  findings; Black 80 and 48 diff lines; isort one blank-line fix each), and
+  those findings are identical after the change. They were deliberately
+  left alone: no whole-file reformat and no repository-wide cleanup.
+
+Known limitations: the bootstrap script's pre-existing lint and format
+debt is left as is. The fake bootstrap producer in the execution tests
+does not run the real script, so the end-to-end regression lives in the
+bootstrap test file.
+
 ## Next planned phase
 
 Phase 12C3C - calibrated positional comparison gate: decide and implement

@@ -398,6 +398,170 @@ def test_exclude_sex_chroms(
     assert summary["n_null_rows_removed_sex_chroms"] > 0
 
 
+# ---------------------------------------------------------------------------
+# Sex-chromosome filtering index alignment
+# ---------------------------------------------------------------------------
+
+
+def _interleave_sex_rows(real_df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder rows so sex-chromosome rows come first and between autosomes.
+
+    The catalogue normally places X/Y at the end, where filtering happens to
+    leave a contiguous index. This layout guarantees non-contiguous labels
+    after filtering, which is the case the index reset must handle.
+    """
+    is_sex = real_df["chromosome"].isin(["X", "Y"]).to_numpy()
+    sex_rows = np.flatnonzero(is_sex)
+    auto_rows = np.flatnonzero(~is_sex)
+    half = len(auto_rows) // 2
+    order = np.concatenate([sex_rows[:20], auto_rows[:half], sex_rows[20:], auto_rows[half:]])
+    return real_df.iloc[order].reset_index(drop=True)
+
+
+def _small_interleaved_df() -> pd.DataFrame:
+    """Return a small frame with X/Y rows before and between two autosomal genes."""
+    return pd.DataFrame(
+        {
+            "chromosome": ["X", "1", "1", "Y", "2", "X", "2", "2"],
+            "position": [10, 20, 30, 40, 50, 60, 70, 80],
+            "gene_name": ["GX", "GA", "GA", "GY", "GB", "GX", "GB", "GB"],
+            "mean_attribution": [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            "delta_rank": [0.0, 5.0, -1.0, 0.0, 2.0, 0.0, 9.0, -3.0],
+        }
+    )
+
+
+def test_sex_chrom_filter_resets_to_contiguous_index() -> None:
+    """Filtered rows keep their order but get a contiguous positional index."""
+    build = calibration.get_genome_build("GRCh37")
+    real_df = _small_interleaved_df()
+
+    filtered, removed = calibration._maybe_filter_real_df(real_df, True, build)
+
+    assert removed == 3
+    assert filtered.index.tolist() == list(range(5))
+    assert filtered["position"].tolist() == [20, 30, 50, 70, 80]
+    assert not filtered["chromosome"].isin(["X", "Y"]).any()
+
+
+def test_sex_chrom_filter_is_identity_when_disabled() -> None:
+    """exclude_sex_chroms=False returns the input frame untouched."""
+    build = calibration.get_genome_build("GRCh37")
+    real_df = _small_interleaved_df()
+
+    filtered, removed = calibration._maybe_filter_real_df(real_df, False, build)
+
+    assert filtered is real_df
+    assert removed == 0
+
+
+def test_gene_statistics_use_retained_rows_after_sex_chrom_filter() -> None:
+    """Gene stats must read the ranks and delta_rank of the retained rows only.
+
+    Before the index reset, the retained labels (1, 2, 4, 6, 7) were used as
+    positions into five-element arrays, so gene GB raised IndexError.
+    """
+    build = calibration.get_genome_build("GRCh37")
+    filtered, _ = calibration._maybe_filter_real_df(_small_interleaved_df(), True, build)
+    rank_real = np.array([11.0, 12.0, 13.0, 14.0, 15.0])
+    rank_null_full = np.array([21.0, 22.0, 23.0, 24.0, 25.0])
+
+    def gene_stats(aggregation: str) -> pd.DataFrame:
+        return calibration._compute_gene_statistics(
+            real_df=filtered,
+            rank_real=rank_real,
+            rank_null_full=rank_null_full,
+            real_to_null_index=np.arange(5, dtype=np.int64),
+            min_variants_per_gene=1,
+            delta_rank_aggregation=aggregation,
+        ).set_index("gene_name")
+
+    max_df = gene_stats("max")
+    assert sorted(max_df.index) == ["GA", "GB"]
+    assert max_df.loc["GA", "n_variants_real"] == 2
+    assert max_df.loc["GB", "n_variants_real"] == 3
+    assert max_df.loc["GA", "median_rank_real"] == pytest.approx(11.5)
+    assert max_df.loc["GB", "median_rank_real"] == pytest.approx(14.0)
+    assert max_df.loc["GA", "median_rank_null"] == pytest.approx(21.5)
+    assert max_df.loc["GB", "median_rank_null"] == pytest.approx(24.0)
+    assert max_df.loc["GA", "gene_delta_rank"] == pytest.approx(5.0)
+    assert max_df.loc["GB", "gene_delta_rank"] == pytest.approx(9.0)
+
+    mean_df = gene_stats("mean")
+    assert mean_df.loc["GA", "gene_delta_rank"] == pytest.approx(2.0)
+    assert mean_df.loc["GB", "gene_delta_rank"] == pytest.approx(8.0 / 3.0)
+
+
+def test_exclude_sex_chroms_interleaved_matches_prefiltered_input(
+    tmp_path: Path,
+    synthetic_null_dataset: dict[str, object],
+) -> None:
+    """Interleaved sex rows filtered in-script equal a manually pre-filtered input."""
+    interleaved = _interleave_sex_rows(
+        _build_real_rankings(
+            synthetic_null_dataset["catalog"],
+            synthetic_null_dataset["null_means"],
+            boost_indices=list(range(20)),
+        )
+    )
+    is_autosomal = ~interleaved["chromosome"].isin(["X", "Y"])
+    prefiltered = interleaved.loc[is_autosomal].reset_index(drop=True)
+
+    out_df, gene_df, summary = _run_bootstrap(
+        tmp_path / "interleaved",
+        real_df=interleaved,
+        null_path=synthetic_null_dataset["null_path"],
+        n_bootstrap=50,
+        exclude_sex_chroms=True,
+    )
+    ref_out, ref_gene, ref_summary = _run_bootstrap(
+        tmp_path / "prefiltered",
+        real_df=prefiltered,
+        null_path=synthetic_null_dataset["null_path"],
+        n_bootstrap=50,
+        exclude_sex_chroms=True,
+    )
+
+    assert out_df["position"].tolist() == prefiltered["position"].tolist()
+    assert not out_df["chromosome"].astype(str).isin(["X", "Y"]).any()
+    # Variant-level calibration must be unchanged by the index reset.
+    np.testing.assert_array_equal(out_df["delta_rank"], ref_out["delta_rank"])
+    np.testing.assert_array_equal(out_df["rank_real"], ref_out["rank_real"])
+    pd.testing.assert_frame_equal(out_df, ref_out)
+    pd.testing.assert_frame_equal(gene_df, ref_gene)
+    assert summary["n_real_variants_removed_sex_chroms"] == 60
+    assert ref_summary["n_real_variants_removed_sex_chroms"] == 0
+    summary.pop("n_real_variants_removed_sex_chroms")
+    ref_summary.pop("n_real_variants_removed_sex_chroms")
+    assert summary == ref_summary
+
+
+def test_include_sex_chroms_interleaved_keeps_all_rows(
+    tmp_path: Path,
+    synthetic_null_dataset: dict[str, object],
+) -> None:
+    """Without exclusion, interleaved input keeps every row in its original order."""
+    interleaved = _interleave_sex_rows(
+        _build_real_rankings(
+            synthetic_null_dataset["catalog"],
+            synthetic_null_dataset["null_means"],
+        )
+    )
+
+    out_df, gene_df, summary = _run_bootstrap(
+        tmp_path / "include_sex",
+        real_df=interleaved,
+        null_path=synthetic_null_dataset["null_path"],
+        n_bootstrap=50,
+        exclude_sex_chroms=False,
+    )
+
+    assert out_df["position"].tolist() == interleaved["position"].tolist()
+    assert summary["excluded_sex_chroms"] is False
+    assert summary["n_real_variants_removed_sex_chroms"] == 0
+    assert gene_df["n_variants_real"].sum() == len(interleaved)
+
+
 def test_missing_variant_in_null(
     tmp_path: Path,
     synthetic_null_dataset: dict[str, object],

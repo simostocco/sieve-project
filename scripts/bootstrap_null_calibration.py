@@ -268,14 +268,22 @@ def _maybe_filter_real_df(
     exclude_sex_chroms: bool,
     chrom_build: Any,
 ) -> tuple[pd.DataFrame, int]:
-    """Optionally remove sex chromosomes from the real dataframe."""
+    """Optionally remove sex chromosomes from the real dataframe.
+
+    The filtered frame is re-indexed to a contiguous ``0..n-1`` index because
+    downstream code (``_compute_gene_statistics``) uses pandas index labels as
+    positional indices into NumPy arrays (``rank_real``, ``real_to_null_index``)
+    built from the filtered rows. Without the reset, sex-chromosome rows that
+    precede or sit between autosomal rows leave gaps in the labels, which
+    selects the wrong ranks or raises ``IndexError``. Row order is unchanged.
+    """
     if not exclude_sex_chroms:
         return real_df, 0
     mask = ~real_df["chromosome"].map(
         lambda chrom: is_sex_chrom(str(chrom), chrom_build)
     )
     removed = int((~mask).sum())
-    return real_df.loc[mask].copy(), removed
+    return real_df.loc[mask].copy().reset_index(drop=True), removed
 
 
 def _load_nearby_analysis_metadata(reference_path: Path) -> dict[str, Any]:
