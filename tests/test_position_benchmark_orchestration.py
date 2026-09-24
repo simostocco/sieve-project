@@ -484,3 +484,174 @@ def test_cli_help_has_no_benchmark_side_effects(tmp_path, capsys):
     assert error.value.code == 0
     assert "dry-run" in capsys.readouterr().out
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 12C3B2B public execution CLI
+# ---------------------------------------------------------------------------
+
+
+def _paired_plan(tmp_path: Path) -> tuple[Path, Path]:
+    from tests.test_position_benchmark_paired_manifest import _paired_manifest
+
+    manifest_path, _ = _paired_manifest(tmp_path)
+    plan_path = tmp_path / "plans" / "plan.yaml"
+    assert (
+        run_position_benchmark.main(
+            [
+                str(manifest_path),
+                "--dry-run",
+                "--out-plan",
+                str(plan_path),
+                "--python",
+                sys.executable,
+                "--device",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    return manifest_path, plan_path
+
+
+def _fake_result() -> dict:
+    summary = {
+        "resolved_plan_sha256": "a" * 64,
+        "repository_revision": "b" * 40,
+        "n_runs": 2,
+        "n_stages": 17,
+        "completed_stages": 17,
+        "real_training_completed": 2,
+        "null_training_completed": 2,
+        "real_explanations_completed": 2,
+        "null_explanations_completed": 2,
+        "pair_validations_completed": 2,
+        "calibrations_completed": 2,
+        "shared_null_validation": "passed",
+        "raw_comparisons_completed": ["performance", "raw_rankings", "raw_attributions"],
+    }
+    return {
+        "summary": summary,
+        "summary_path": "/x/summary.yaml",
+        "executed": ["s"] * 17,
+        "reused": [],
+    }
+
+
+def test_execute_plan_invokes_executor_with_exact_arguments(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake_execute(plan_path, *, manifest_path, resume):
+        calls.append((plan_path, manifest_path, resume))
+        return _fake_result()
+
+    monkeypatch.setattr(run_position_benchmark, "execute_benchmark_plan", fake_execute)
+    manifest = tmp_path / "manifest.yaml"
+    plan = tmp_path / "plan.yaml"
+    assert run_position_benchmark.main([str(manifest), "--execute-plan", str(plan)]) == 0
+    assert (
+        run_position_benchmark.main([str(manifest), "--execute-plan", str(plan), "--resume"]) == 0
+    )
+    assert calls == [(plan, manifest, False), (plan, manifest, True)]
+    out = capsys.readouterr().out
+    assert "POSITION BENCHMARK EXECUTION COMPLETE" in out
+    assert "Calibrated cross-strategy ranking comparison: NOT executed" in out
+    assert "calibrated cross-strategy ranking complete" not in out.lower()
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--dry-run"], "mutually exclusive"),
+        (["--python", sys.executable], "--python cannot be combined"),
+        (["--device", "cpu"], "--device cannot be combined"),
+        (["--allow-existing-outputs"], "--allow-existing-outputs cannot be combined"),
+        (["--out-plan", "p.yaml"], "--out-plan cannot be combined"),
+    ],
+)
+def test_execute_plan_rejects_planning_options(tmp_path, capsys, monkeypatch, extra, message):
+    monkeypatch.setattr(
+        run_position_benchmark,
+        "execute_benchmark_plan",
+        lambda *a, **k: pytest.fail("executor must not run"),
+    )
+    argv = [str(tmp_path / "m.yaml"), "--execute-plan", str(tmp_path / "plan.yaml"), *extra]
+    assert run_position_benchmark.main(argv) == 2
+    err = capsys.readouterr().err
+    assert message in err and "Traceback" not in err
+
+
+def test_resume_requires_execute_plan(tmp_path, capsys):
+    assert run_position_benchmark.main([str(tmp_path / "m.yaml"), "--dry-run", "--resume"]) == 2
+    assert "--resume requires --execute-plan" in capsys.readouterr().err
+    assert run_position_benchmark.main([str(tmp_path / "m.yaml"), "--resume"]) == 2
+
+
+def test_execute_plan_rejects_schema_v1_plan_without_traceback(tmp_path, capsys):
+    manifest_path, _ = _base_manifest(tmp_path)
+    plan_path = tmp_path / "plans" / "v1.yaml"
+    assert (
+        run_position_benchmark.main(
+            [
+                str(manifest_path),
+                "--dry-run",
+                "--out-plan",
+                str(plan_path),
+                "--python",
+                sys.executable,
+                "--device",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert run_position_benchmark.main([str(manifest_path), "--execute-plan", str(plan_path)]) == 2
+    err = capsys.readouterr().err
+    assert "only schema_version 2" in err and "Traceback" not in err
+    assert not (tmp_path / "outputs").exists()
+
+
+def test_execute_plan_rejects_manifest_mismatch_without_traceback(tmp_path, capsys):
+    _, plan_path = _paired_plan(tmp_path)
+    other = tmp_path / "other_manifest.yaml"
+    other.write_text("schema_version: 2\n", encoding="utf-8")
+    capsys.readouterr()
+    assert run_position_benchmark.main([str(other), "--execute-plan", str(plan_path)]) == 2
+    err = capsys.readouterr().err
+    assert "is not the plan's manifest" in err and "Traceback" not in err
+    plan = yaml.safe_load(plan_path.read_text(encoding="utf-8"))
+    assert not (
+        Path(plan["runs"][0]["directories"]["run_root"]).parent.parent / "execution"
+    ).exists()
+
+
+def test_execute_plan_ordinary_execution_error_is_concise(tmp_path, capsys, monkeypatch):
+    from scripts.position_benchmark_execution import RepositoryGateError
+
+    def dirty(*args, **kwargs):
+        raise RepositoryGateError("worktree, index, or untracked state is not clean (1 entries)")
+
+    monkeypatch.setattr(run_position_benchmark, "execute_benchmark_plan", dirty)
+    assert (
+        run_position_benchmark.main(
+            [str(tmp_path / "m.yaml"), "--execute-plan", str(tmp_path / "p.yaml")]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert err.startswith("error: worktree") and "Traceback" not in err
+
+
+def test_execute_plan_keyboard_interrupt_returns_130(tmp_path, capsys, monkeypatch):
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(run_position_benchmark, "execute_benchmark_plan", interrupted)
+    assert (
+        run_position_benchmark.main(
+            [str(tmp_path / "m.yaml"), "--execute-plan", str(tmp_path / "p.yaml")]
+        )
+        == 130
+    )
+    assert "interrupted" in capsys.readouterr().err

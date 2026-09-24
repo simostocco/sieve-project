@@ -4527,3 +4527,397 @@ validation, calibration input hash gate and post-checks, raw B1/B2/B3
 comparisons), stage post-validation, explicit `--resume`, and the public
 `--execute-plan` CLI. Phase 12C3C - calibrated positional comparison gate -
 follows.
+
+## Phase 12C3B2B - Paired Benchmark Execution and Safe Resume
+
+Goal:
+
+- Wire the 12C3B2A execution substrate into the complete paired benchmark
+  DAG and expose it publicly. For every positional strategy `m`, in manifest
+  order: REAL `Train(X, y, S, strategy_m, protocol)` -> explain, NULL
+  `Train(X, y_perm, S, strategy_m, protocol)` -> explain, pair validation,
+  and bootstrap calibration; then the benchmark-level shared-null stage and
+  the real-only raw B1/B2/B3 comparisons.
+- Scientific mathematics are unchanged: positional runtime, attention,
+  Integrated Gradients, `VariantRanker`, bootstrap calibration, `delta_rank`,
+  and B1/B2/B3 metrics are untouched. `DEFERRED_CALIBRATED_SCORE_COLUMNS`
+  is unchanged and the calibrated cross-strategy ranking comparison is NOT
+  executed (Phase 12C3C).
+
+Files changed:
+
+- `scripts/run_position_benchmark.py`
+- `scripts/position_benchmark_execution.py`
+- `tests/test_position_benchmark_execution.py`
+- `tests/test_position_benchmark_orchestration.py`
+- `documentation/appendices/position-encoding-implementation-log.md`
+
+`position_benchmark_records.py`, `position_benchmark_manifest.py`,
+`position_benchmark_pairing.py`, `position_benchmark_metadata.py`,
+`train.py`, `explain.py`, `bootstrap_null_calibration.py`,
+`compare_ablation_rankings.py`, `compare_position_attributions.py`,
+`ablation_compare.py`, and every model/runtime/IG/ranking module are
+untouched. The executor reuses (imports) the existing helpers of several of
+them, but no hard dependency required editing one.
+
+Public CLI (`run_position_benchmark.py`):
+
+- `MANIFEST --dry-run [--out-plan PLAN] [--python ...] [--device ...]
+  [--allow-existing-outputs]` is unchanged in behavior and output.
+- `MANIFEST --execute-plan PLAN [--resume]` executes one reviewed plan.
+  `--dry-run` and `--execute-plan` are mutually exclusive; `--python`,
+  `--device`, `--allow-existing-outputs`, and `--out-plan` are rejected with
+  `--execute-plan` (the reviewed plan is the only execution authority);
+  `--resume` requires `--execute-plan`; neither mode is a usage error. The
+  positional manifest must resolve to `plan.manifest_path`; schema-v1 plans
+  are rejected. All of these return exit 2 with a concise `error:` line and
+  no traceback. Ordinary execution errors (`ExecutionFoundationError` and
+  subclasses, `StageRecordError`, `BenchmarkManifestError`) also return 2;
+  `KeyboardInterrupt` returns 130. Programmer errors are not swallowed.
+- The 12C3B2A test that asserted "execution is not implemented yet" was
+  replaced by one that asserts the new bare-invocation usage error.
+
+Execution authority (`execute_benchmark_plan`), in order:
+`verify_plan_rebuild(PLAN, manifest_path=MANIFEST)` -> `require_repository_gate`
+-> `require_execution_locations_safe` -> `ExecutionLock` (held for the whole
+execution) -> `bind_benchmark_plan` -> `probe_execution_environment` -> full
+`run_null_preflight` -> stage-state scan -> DAG. No B2A gate logic is
+duplicated, and no benchmark subprocess starts before the full null
+preflight passed. Git runner, probe runner, null validator, and `Popen` are
+injectable for tests only.
+
+Production plan rule: `repository_revision` is execution-bound, so a
+production plan must be generated at the exact B2B executor commit. Plans
+generated at `863a669` or earlier are development fixtures only and fail the
+repository gate. After this phase is committed, the production dry-run plan
+must be regenerated from that final commit before any GPU execution.
+
+Stage DAG (deterministic, strategy-major, stop on first failure, no
+`--keep-going`):
+
+```text
+benchmark/null_validation                    in_process  src.data.null_lineage.validate_null_pair
+runs/<id>/real_training                      subprocess  run.train_argv
+runs/<id>/real_explanation                   subprocess  run.explain_argv
+runs/<id>/null_training                      subprocess  run.null_train_argv
+runs/<id>/null_explanation                   subprocess  run.null_explain_argv
+runs/<id>/pair_validation                    in_process  scripts.position_benchmark_pairing.require_compatible_real_null_pair
+runs/<id>/calibration                        subprocess  run.calibration.argv
+benchmark/shared_null                        in_process  scripts.position_benchmark_pairing.require_shared_null_across_pairs
+comparisons/performance                      subprocess  comparisons.performance.argv
+comparisons/raw_rankings                     subprocess  comparisons.raw_rankings.argv
+comparisons/raw_attributions                 subprocess  comparisons.raw_attributions.argv
+```
+
+- Every subprocess stage runs the exact planned argv through
+  `execute_subprocess_stage` with `cwd = plan.repository_root`; nothing is
+  rebuilt. In-process stages record `execution.kind: in_process` with the
+  callable string above, never a fake argv.
+- Dependencies (bound by `dependency_reference` record SHA-256s): training
+  -> null_validation; explanation -> its training + null_validation; pair
+  validation -> both trainings, both explanations, null_validation, and every
+  earlier strategy's pair validation (so the cumulative shared-null check is
+  bound to their exact reports); calibration -> pair validation +
+  null_validation; shared_null -> all pair validations + null_validation;
+  performance -> all real trainings; raw rankings/attributions -> all real
+  trainings and real explanations. Before each stage every dependency record
+  must still hash to the value it was accepted at in this invocation.
+- The repository gate runs before every stage and again after the
+  subprocess/validator and before completed publication; a HEAD or worktree
+  change during a stage publishes a `failed` record (`repository_gate_failed`)
+  and no completed record.
+
+Stage records, fingerprints, logs, manifests:
+
+- Completed records are published only after post-validation, output
+  hashing, and the second repository gate. Inputs include every plan-bound
+  file (with its bytes additionally required to equal `plan.input_files`)
+  and the bound `execution/resolved_plan.yaml`.
+- Training inputs: side dataset (real `preprocessed_data` or
+  `null_artifact`), raw split-plan file, sex/PC maps if present, resolved
+  plan. Explanation inputs: training `config.yaml`, selected checkpoint, side
+  dataset, PC map if present, resolved plan. Pair-validation inputs: real and
+  null `config.yaml`, `analysis_metadata.yaml`, `attributions.npz`, real
+  `sieve_variant_rankings.csv`, both selected checkpoints,
+  `null_validation.yaml`, resolved plan. Calibration inputs: real rankings
+  CSV, real analysis metadata, null `attributions.npz`,
+  `paired_compatibility.yaml`, resolved plan. Comparison inputs: every
+  benchmark path token of the planned argv (named `argv[<index>]`; directory
+  tokens such as B1 `--run-dir` and B3 `attributions_per_sample` as full
+  directory manifests), excluding the comparison's own outputs.
+- Outputs: training records hash `config.yaml`, `dataset_mappings.json`,
+  `split_plan.yaml`, `cv_results.yaml`/`results.yaml`, every fold's
+  `config.yaml`/`fold_info.yaml`/`best_model.pt` (or single-split
+  `best_model.pt`), `selected_checkpoint`, and `output_tree`; explanation
+  records hash `analysis_metadata.yaml`, `attributions.npz`,
+  `sieve_variant_rankings.csv`, `sieve_gene_rankings.csv`, and
+  `output_tree` (including `attributions_per_sample/`); pair validation
+  hashes `paired_compatibility.yaml`; calibration hashes its three bootstrap
+  outputs; comparisons hash their expected outputs plus `output_tree`.
+- `output_tree` is a `sieve.directory_manifest.v1` fingerprint whose JSONL
+  is persisted at `execution/manifests/<stage_id>.outputs.jsonl`; subprocess
+  logs are at `execution/logs/<stage_id>.{stdout,stderr}.log` and hashed in
+  the record's execution block. Both live outside every scientific output
+  directory, so the executor's bookkeeping never enters a fingerprinted tree
+  and writing a manifest cannot change the tree it describes.
+- Owned outputs: training `runs/<id>/<side>/training/`, explanation
+  `runs/<id>/<side>/explanation/`, pair validation only
+  `runs/<id>/calibration/paired_compatibility.yaml`, calibration only the
+  three bootstrap files (so `paired_compatibility.yaml` in the same directory
+  is not contamination), comparisons their planned directories,
+  null_validation `null_binding/null_validation.yaml`, shared_null
+  `null_binding/shared_null_validation.yaml`.
+
+Post-validation (exit code 0 is never enough):
+
+- Null validation: `null_validation.yaml` must equal the report rebuilt from
+  this invocation's full preflight (only `validated_at` is taken from the
+  file); resume therefore re-runs the full preflight and re-verifies it.
+- Training: all required files (CV: root `config.yaml`,
+  `dataset_mappings.json`, `split_plan.yaml`, `cv_results.yaml`, and
+  `fold_k/config.yaml`, `fold_k/fold_info.yaml`, `fold_k/best_model.pt` for
+  every planned fold; single split: `results.yaml`, `best_model.pt`). The
+  planned argv is parsed with `train.py`'s own parser and every CLI value
+  must equal the saved config (except `split_plan`, which train.py replaces
+  with split metadata), which covers seed, architecture, optimizer, chunking,
+  covariates, and device. Explicit checks: level, plan training seed,
+  `class_weighting == "off"`, `class_weighting_applied` (null for CV root,
+  false otherwise); `dataset_provenance.schema_version == 1`,
+  `is_null_baseline` per side, `preprocessed_data_sha256` equal to the
+  binding's source (real) or null artifact (null) hash, `sample_ids_sha256`,
+  null `null_lineage.lineage_sha256`/`source_artifact_sha256`, real
+  `null_lineage is None`; `config.split_plan.source == "replayed"`,
+  `sha256 == input_sha256 == plan.split_plan.membership_sha256`,
+  `sample_ids_sha256`, `input_path`, and `path`; the saved
+  `split_plan.yaml` re-hashes to the planned membership; every fold's
+  config (index, seed, level, class weighting, parent config, position
+  encoding, dataset provenance) and `fold_info.yaml` (index, fold count,
+  seed, train/val sample indices equal to the replayed plan). Position
+  metadata must be authoritative (`require_authoritative_position_metadata`,
+  `position_strategy_identity`), the saved `position_encoding` re-resolved
+  by `resolved_position_encoding_from_dict` must equal the planned intent
+  resolved by train.py's own `prepare_training_position_encoding`, and
+  `position_encoding_execution` must equal train.py's
+  `build_position_encoding_execution_metadata`; no strategy normalization is
+  duplicated.
+- Explanation: required files, non-empty `attributions_per_sample/`, no
+  lingering `_tmp_attributions/`; `load_pair_side` proves config and
+  checkpoint path/bytes binding; the recorded config and checkpoint SHAs
+  must equal the training completed record's outputs; the planned argv is
+  parsed with explain.py's parser; selection mode
+  (`cv_explicit_fold`/`selected_fold 0`, or `single_run_best_model`), null
+  flag per side, `n_samples == null_binding.n_samples`, level, genome build,
+  experiment dir, `skip_ig false`, aggregation, `max_variants_per_sample`,
+  `n_integration_steps`/`integrated_gradients.n_steps`,
+  `resolved_ig_mode content`, `executed true`, and `dataset_provenance`
+  equal to the training config. `integrated_gradients.max_variants` is
+  explain.py's IG chunk width (`min(--max-variants, 2000)`), not the planned
+  value, so it is not compared to the plan here (real/null IG blocks are
+  compared in full by pair validation). Real/null compatibility is left to
+  pair validation.
+
+Pair validation, calibration gate, shared null:
+
+- Pair validation loads both sides with `load_pair_side` (repository
+  revision taken from the explanation completed records) and calls
+  `require_compatible_real_null_pair(..., expected_fold_index=0 for CV else
+  None)`, then `require_shared_null_across_pairs(reports_so_far)` so a
+  divergent null binding fails before that strategy is calibrated. The pure
+  deterministic report is written atomically to
+  `runs/<id>/calibration/paired_compatibility.yaml` (no timestamps, file
+  hashes, or environment; those are in the stage record) and must equal a
+  recomputation on post-validation and resume. No pairing rule is
+  duplicated.
+- Calibration input hash gate (`calibration_input_gate`): immediately before
+  launch the SHA-256 of the real rankings CSV, real analysis metadata, null
+  `attributions.npz`, and `paired_compatibility.yaml` must equal the
+  pair-validation completed record, whose own bytes must be unchanged since
+  acceptance; the planned `--real-rankings`/`--null-attributions` must name
+  exactly those files and the report must be `compatible: true`. A mismatch
+  raises `CalibrationInputGateError` before any record or launch.
+- Calibration runs the exact planned `calibration.argv`;
+  `bootstrap_null_calibration.py` is unchanged. Post-validation uses the
+  summary's actual keys: `n_bootstrap`, `n_null_samples ==
+  null_binding.n_samples`, `excluded_sex_chroms`,
+  `per_gene.gene_delta_rank_aggregation`, `genome_build`,
+  `n_real_variants > 0`, and `n_real_variants_missing_from_null == 0` (fail
+  closed). Seed, top-k, and min-variants-per-gene remain bound by the
+  recorded argv. Calibrated outputs are hashed but not fed into any
+  cross-strategy comparison.
+- `benchmark/shared_null` calls `require_shared_null_across_pairs` over all
+  pair reports, additionally requires the shared binding to equal the plan
+  `null_binding` identity, and writes the deterministic report to
+  `<benchmark_root>/null_binding/shared_null_validation.yaml`.
+
+Raw comparisons: the exact planned B1/B2/B3 argv run after the shared-null
+stage. `require_real_only_comparison` refuses any argv token under the
+benchmark root that is not a real training/explanation path or the
+comparison's own output directory, and any calibrated output name. The B2
+position-mode calibrated-column gate remains active.
+
+Failure, interrupt, logs:
+
+- Non-zero child: the B2A primitive publishes `failed`
+  (`subprocess_failed`); the executor re-raises `StageFailure` naming the
+  stage and its stderr log. Ctrl-C: B2A process-group SIGINT/TERM/KILL,
+  `failed` (`interrupted`), exit 130. Post-validation, validator, or gate
+  failure after the running record: `failed`
+  (`post_validation_failed`/`validator_failed`/`repository_gate_failed`),
+  wrapped in the new `StagePostValidationError`; unexpected exceptions
+  publish `unexpected_error` and propagate unchanged. Partial outputs are
+  always retained. New narrowly scoped errors: `StagePostValidationError`,
+  `CompletedStageMismatchError(StageStateError)`, and
+  `CalibrationInputGateError(CompletedStageMismatchError)`; all others are
+  the B2A classes.
+
+Resume and reuse rules (`scan_benchmark_state`,
+`_revalidate_completed_stage`):
+
+- Without `--resume`, any stage record, any non-empty owned output, or any
+  existing `execution/stages|logs|manifests` bookkeeping fails closed:
+  completed work is never silently accepted.
+- With `--resume`, any `running` or `failed` record always fails (there is
+  no `--retry-failed`); completed records must form a prefix of the DAG and
+  no later stage may have any record. Each completed record in the prefix is
+  fully revalidated: schema and canonical location; stage id/type/side/run;
+  resolved-plan SHA, repository revision, and manifest SHA; exact argv, cwd,
+  and exit code (or in-process callable); log hashes; dependency ids, record
+  paths, and record SHAs; recomputed inputs; recomputed outputs, with output
+  trees diffed against the persisted JSONL manifest (added, removed, and
+  changed files are named) and the persisted manifest itself re-hashed;
+  a re-run of post-validation (plus the calibration gate and real-only guard
+  where applicable); and the repository gate. Any mismatch aborts with
+  `CompletedStageMismatchError` naming it; the record is never rewritten and
+  an invalid stage is never re-run automatically. Remaining stages then run
+  fresh.
+- Manual recovery (documented in the module): inspect logs and outputs, then
+  deliberately archive or remove the stage's record, logs, output manifest,
+  and partial outputs before starting again. Nothing deletes scientific
+  outputs automatically.
+
+Execution summary: on success a deterministic
+`execution/benchmark_execution_summary.yaml` (plan SHA, revision, run and
+stage counts, real/null training and explanation counts, pair validations,
+calibrations, shared-null status, raw comparisons, and
+`calibrated_cross_strategy_comparison:
+not_executed_gate_closed_until_phase_12c3c`) is written once and must be
+byte-identical on later successful resumes; the CLI prints the same facts
+plus executed/reused counts. It never claims a calibrated cross-strategy
+ranking result.
+
+Runtime and compatibility effects:
+
+- Dry-run behavior, v1/v2 plan bytes, and human summaries are unchanged.
+  The only public change is the new execution interface. `train.py`,
+  `explain.py`, bootstrap, and comparison scripts receive exactly the argv
+  they would have received from the reviewed plan.
+- The executor imports `train.py`/`explain.py` (and therefore torch) lazily
+  for post-validation only, to reuse their parsers and metadata builders.
+
+Tests and checks actually run:
+
+- New executor tests in `tests/test_position_benchmark_execution.py`
+  (132 -> 227 collected) use a fake `Popen` that records exact argv and
+  writes small deterministic outputs with train.py/explain.py's own metadata
+  helpers over the existing 8-sample strict-null fixture; the real
+  `validate_null_pair` and 12C3B1 pair rules run unmodified. No GPU, no real
+  training, no synthetic cohort. Coverage: exact DAG order, ids, and argv;
+  full CV and single-split runs; null-validation record; preflight failure
+  running nothing; stop on first failure at three DAG points; repository
+  change mid-stage; interrupt during post-validation; every training and
+  explanation rejection listed in the task prompt; pair failure yielding zero
+  calibration calls; the calibration hash gate for each of the four files
+  and the pair record; each calibration summary mismatch; pre-existing
+  calibration outputs; shared null pass and each of four divergent binding
+  fields; shared-null failure blocking comparisons; real-only comparison
+  argv and guard; `DEFERRED_CALIBRATED_SCORE_COLUMNS` unchanged; manifest and
+  log locations; resume reuse, partial resume, and rejection for running and
+  failed records, changed/added/removed outputs, changed inputs (stage and
+  planned), argv, revision, dependency record, corrupted record,
+  post-validation, and tampered persisted manifests; the no-resume policy;
+  the lock being held during stages.
+- New CLI tests in `tests/test_position_benchmark_orchestration.py`
+  (32 -> 43 collected): exact executor arguments, every rejected option
+  combination, `--resume` without `--execute-plan`, v1 plan rejection,
+  manifest mismatch, concise ordinary errors, and exit 130.
+- Mutation spot-checks (each restored afterwards): removing the calibration
+  gate (5 failures), the cumulative shared-null check (4), resume output
+  verification (5), the argv-vs-config check (1), the resume prefix rule
+  (1), and a forced failure after completed publication (2).
+- Execution + records + orchestration files: 317 passed.
+- Focused regression (all `test_position_benchmark_*`, null lineage, dataset
+  provenance, split plan, train split plan/config metadata/position CLI,
+  explain IG mode/position, compare ablation rankings, bootstrap null
+  calibration): 1072 passed, 5 warnings.
+- Full suite: `python -m pytest -q` passed 2271 tests, 0 failed, 0 skipped,
+  6 warnings (pre-existing), in 262.45s (2165 before this phase + 106 new).
+- `ruff check`, `black --check`, `isort --check-only`, and `py_compile` are
+  clean on the four changed Python files; `git diff --check` is clean.
+  (Black prints its pre-existing "Python 3.10 cannot parse code formatted
+  for Python 3.11" target-version warning.)
+- No manual smoke run was performed: no GPU benchmark, no real `train.py`
+  or `explain.py` invocation, and no new data were created. An early draft
+  CLI test that went through the real repository gate was removed because on
+  a clean committed checkout it would have launched real training.
+
+Known limitations:
+
+- End-to-end coverage uses a fake `Popen`; the real scripts' outputs are
+  matched by reusing their own metadata helpers, but a real CPU/GPU run has
+  not yet exercised the executor. The first production run should start
+  from a plan regenerated at the committed B2B revision.
+- Resume revalidation rehashes every input and output of every completed
+  stage (datasets, all fold checkpoints, full output trees), which is exact
+  but can be slow for large cohorts.
+- If a stage fails after its output manifest was written (for example at
+  the second repository gate), manual recovery must also remove
+  `execution/manifests/<stage_id>.outputs.jsonl`; the start check refuses a
+  pre-existing manifest.
+- The execution environment recorded per stage is provenance only and is
+  not compared on resume (resuming on another host is allowed if every
+  byte-level invariant still holds).
+- `integrated_gradients.max_variants` is not compared to the plan (see
+  above); `max_variants_per_sample` carries the planned value.
+
+### Review correction (class-weighting producer contract)
+
+- A review finding claimed real CV `train.py` output lacks root
+  `class_weighting_applied`. Re-reading `scripts/train.py` at `863a669`
+  showed the CV branch does call `_update_saved_config(config_path,
+  class_weighting_applied=None, class_weighting_pos_weight=None)` (lines
+  1229-1233, from commit `c16b5e12`); the finding was withdrawn and the
+  existing CV-root check was kept. `train.py` was not modified.
+- Strengthened to the real producer schema: CV root
+  `class_weighting_pos_weight is None` (with `class_weighting_applied is
+  None`); every CV fold config `class_weighting_pos_weight is None` (with
+  `class_weighting_applied == False`); single-split root
+  `class_weighting_pos_weight is None` (with `class_weighting_applied ==
+  False`) and `results.yaml` `class_weighting_pos_weight is None` (with
+  `class_weighting_applied == False`). `class_weighting == "off"` remains
+  required. No other B2B behavior changed.
+- The fake training producer now writes class-weighting metadata only
+  through train.py's own `_update_saved_config`, `_resolve_pos_weight`, and
+  `save_fold_config`, so it cannot be more convenient than the real
+  producer.
+- New tests: CV and single-split contract tests (keys present with the
+  real values, post-validation passes), five CV mutations and five
+  single-split mutations (each rejects), and a static producer-contract test
+  that builds root and fold class-weighting artifacts with the real
+  train.py helpers (no training) and applies the executor's check
+  primitive to them. Mutation spot-checks: deleting the new root/results
+  pos-weight checks makes 2 and 1 tests fail respectively.
+  `tests/test_position_benchmark_execution.py`: 227 -> 240 collected.
+- Counts after the correction: execution + records + orchestration files
+  330 passed; focused regression (the earlier set plus
+  `test_class_weighting.py`) 1093 passed, 5 warnings; full suite 2284
+  passed, 0 failed, 0 skipped, 6 warnings (pre-existing), in 265.37s.
+  `ruff`, `black --check`, `isort --check-only`, `py_compile`, and
+  `git diff --check` are clean on the changed files.
+
+## Next planned phase
+
+Phase 12C3C - calibrated positional comparison gate: decide and implement
+whether and how the calibrated per-strategy outputs (hashed here, bound to
+passing pair validations and the shared-null stage) may enter a
+cross-strategy calibrated ranking comparison, opening
+`DEFERRED_CALIBRATED_SCORE_COLUMNS` only under that phase's contract.
