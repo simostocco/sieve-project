@@ -20,6 +20,9 @@ exact executor revision that will run it; plans from earlier revisions are
 development fixtures and fail the repository gate. Schema-v1 plans are never
 executable. Exit codes: 0 success, 2 ordinary planning/execution error
 (concise message, no traceback), 130 interrupted.
+
+Phase 12C3C makes the provenance-gated calibrated position ranking comparison
+(``delta_rank``) the final executed stage of a schema-v2 plan.
 """
 
 from __future__ import annotations
@@ -132,7 +135,10 @@ def format_execution_summary(result: dict) -> str:
     summary = result["summary"]
     return "\n".join(
         [
-            "POSITION BENCHMARK EXECUTION COMPLETE (raw paired benchmark)",
+            (
+                "POSITION BENCHMARK EXECUTION COMPLETE (paired benchmark with "
+                "provenance-gated calibrated position ranking comparison)"
+            ),
             f"Resolved plan SHA256: {summary['resolved_plan_sha256']}",
             f"Repository revision: {summary['repository_revision']}",
             f"Runs: {summary['n_runs']}",
@@ -154,8 +160,9 @@ def format_execution_summary(result: dict) -> str:
             f"Shared-null validation: {summary['shared_null_validation']}",
             "Raw comparisons completed: " + ", ".join(summary["raw_comparisons_completed"]),
             (
-                "Calibrated cross-strategy ranking comparison: NOT executed "
-                "(gate closed until Phase 12C3C)"
+                "Calibrated position ranking comparison "
+                f"({summary['calibrated_score_column']}): "
+                f"{summary['calibrated_position_ranking_comparison']}"
             ),
             f"Summary: {result['summary_path']}",
         ]

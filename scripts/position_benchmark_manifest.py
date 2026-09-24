@@ -19,6 +19,13 @@ SHA-256 of every reviewed input file, atomic ``--out-plan`` publication, and
 ``resolved_plan_file_sha256``: the exact persisted plan bytes are the only
 execution-plan identity (there is deliberately no second, semantic plan hash).
 v1 plans are byte-identical to Phase 12C2B and remain dry-run only.
+
+Phase 12C3C adds, for schema v2 only, the ``comparisons.calibrated_rankings``
+command: the provenance-gated cross-strategy comparison of calibrated
+``delta_rank`` rankings (``compare_ablation_rankings.py
+--position-calibrated-benchmark <benchmark_root>``). It replaces the former
+``reserved_comparisons`` placeholder for the same directory, so the normal
+existing-output and collision checks now apply to it.
 """
 
 from __future__ import annotations
@@ -154,7 +161,13 @@ CALIBRATION_RANKINGS_NAME = "bootstrap_calibrated_variant_rankings.csv"
 CALIBRATION_GENE_STATS_NAME = "bootstrap_calibrated_variant_rankings_gene_stats.csv"
 CALIBRATION_SUMMARY_NAME = "bootstrap_calibrated_variant_rankings_summary.yaml"
 PAIRED_COMPATIBILITY_NAME = "paired_compatibility.yaml"
-RESERVED_CALIBRATED_COMPARISON = "calibrated_rankings"
+CALIBRATED_RANKINGS_COMPARISON = "calibrated_rankings"
+CALIBRATED_SCORE_COLUMN = "delta_rank"
+CALIBRATED_COMPARISON_OUTPUT_NAMES = (
+    "position_calibrated_ranking_comparison.yaml",
+    "position_calibrated_ranking_jaccard.tsv",
+    "position_calibrated_strategy_specific_variants.tsv",
+)
 NULL_BINDING_VALIDATION_LEVEL = "sidecar_schema_and_file_sha256_only"
 NULL_FULL_PAIR_VALIDATION = "deferred_to_phase_12c3b2_preflight_validate_null_pair"
 SIDECAR_SAMPLE_BINDING = "bound_via_null_lineage_sidecar_sample_ids_sha256"
@@ -214,6 +227,12 @@ def build_resolved_plan(
     comparisons = _build_comparisons(
         runs, runtime=runtime, repo_root=repo_root, benchmark_root=benchmark_root
     )
+    if paired:
+        # Added before existing-output and collision inspection so the
+        # calibrated comparison directory gets the same planner safety.
+        comparisons[CALIBRATED_RANKINGS_COMPARISON] = _build_calibrated_comparison(
+            runtime=runtime, repo_root=repo_root, benchmark_root=benchmark_root
+        )
     warnings = _inspect_existing_outputs(
         runs,
         comparisons,
@@ -260,14 +279,6 @@ def build_resolved_plan(
             "runtime": runtime,
             "runs": runs,
             "comparisons": comparisons,
-            "reserved_comparisons": {
-                RESERVED_CALIBRATED_COMPARISON: {
-                    "directory": str(
-                        benchmark_root / "comparisons" / RESERVED_CALIBRATED_COMPARISON
-                    ),
-                    "status": "reserved_for_phase_12c3c",
-                }
-            },
             "warnings": warnings,
             "null_execution": {
                 "status": "planned_not_executed",
@@ -353,13 +364,16 @@ def build_human_summary(plan: Mapping[str, Any]) -> str:
             f"  performance: {_display_argv(plan['comparisons']['performance']['argv'])}",
             f"  raw_rankings: {_display_argv(plan['comparisons']['raw_rankings']['argv'])}",
             f"  raw_attributions: {_display_argv(plan['comparisons']['raw_attributions']['argv'])}",
-            (
-                "NULL EXECUTION: planned only; not authorized until the Phase 12C3B2 "
-                "validate_null_pair preflight"
-                if paired
-                else "NULL EXECUTION: deferred to Phase 12C3"
-            ),
         ]
+    )
+    if paired:
+        calibrated = plan["comparisons"][CALIBRATED_RANKINGS_COMPARISON]["argv"]
+        lines.append(f"  calibrated_rankings: {_display_argv(calibrated)}")
+    lines.append(
+        "NULL EXECUTION: planned only; not authorized until the Phase 12C3B2 "
+        "validate_null_pair preflight"
+        if paired
+        else "NULL EXECUTION: deferred to Phase 12C3"
     )
     if plan["warnings"]:
         lines.append("Warnings:")
@@ -1662,6 +1676,43 @@ def _build_comparisons(
                 str(attributions_dir / "position_attribution_comparison.yaml"),
             ],
         },
+    }
+
+
+def _build_calibrated_comparison(
+    *, runtime: Mapping[str, Any], repo_root: Path, benchmark_root: Path
+) -> dict[str, Any]:
+    """Plan the schema-v2 provenance-gated calibrated ranking comparison.
+
+    The comparator receives only the benchmark root; it resolves every run,
+    calibrated ranking CSV, and real config/analysis metadata from the bound
+    plan and completed stage records, never from paths on this command line.
+    No ``--top-k`` / threshold flags are emitted, so the comparator's defaults
+    apply exactly as for the raw position ranking comparison.
+    """
+    directory = benchmark_root / "comparisons" / CALIBRATED_RANKINGS_COMPARISON
+    outputs = [directory / name for name in CALIBRATED_COMPARISON_OUTPUT_NAMES]
+    argv = [
+        runtime["python"],
+        str(repo_root / "scripts" / "compare_ablation_rankings.py"),
+        "--comparison-axis",
+        "position",
+        "--position-calibrated-benchmark",
+        str(benchmark_root),
+        "--score-column",
+        CALIBRATED_SCORE_COLUMN,
+        "--out-comparison",
+        str(outputs[0]),
+        "--out-jaccard",
+        str(outputs[1]),
+        "--out-level-specific",
+        str(outputs[2]),
+    ]
+    return {
+        "directory": str(directory),
+        "score_column": CALIBRATED_SCORE_COLUMN,
+        "argv": argv,
+        "expected_outputs": [str(path) for path in outputs],
     }
 
 

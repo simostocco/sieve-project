@@ -9,6 +9,7 @@ fixture shared with the 12C3B1 paired-manifest tests.
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 import os
@@ -95,6 +96,7 @@ from scripts.position_benchmark_records import (
 from src.data import null_lineage
 from src.data.dataset_provenance import build_dataset_provenance
 from src.encoding import AnnotationLevel
+from src.encoding.position_config import resolved_position_encoding_from_dict
 from src.training.split_plan import ordered_sample_ids
 from tests.test_position_benchmark_manifest import _base_manifest, _write_yaml
 from tests.test_position_benchmark_paired_manifest import _build, _paired_manifest
@@ -1623,6 +1625,8 @@ def _stage_id_for_argv(argv) -> str:
         return f"runs/{out.parent.parent.name}/{out.parent.name}_explanation"
     if script == "bootstrap_null_calibration.py":
         return f"runs/{Path(_argv_value(argv, '--output')).parent.parent.name}/calibration"
+    if script == "compare_ablation_rankings.py" and "--position-calibrated-benchmark" in argv:
+        return "comparisons/calibrated_rankings"
     return {
         "ablation_compare.py": "comparisons/performance",
         "compare_ablation_rankings.py": "comparisons/raw_rankings",
@@ -1759,11 +1763,14 @@ def _fake_explain(argv) -> None:
         }
         np.savez(per_sample / f"sample_{index}.npz", variant_scores=scores[index])
     np.savez(output_dir / "attributions.npz", variant_scores=scores, metadata=metadata)
-    (output_dir / "sieve_variant_rankings.csv").write_text(
-        "chromosome,position,gene_name,mean_attribution\n1,100,GENE1,0.5\n", encoding="utf-8"
-    )
+    _write_fake_variant_rankings(output_dir / "sieve_variant_rankings.csv", output_dir)
     (output_dir / "sieve_gene_rankings.csv").write_text(
         "gene_name,gene_score\nGENE1,0.5\n", encoding="utf-8"
+    )
+    # Position metadata exactly as explain.py's _read_position_strategy_metadata
+    # derives it from the reconstructed resolved configuration.
+    resolved = resolved_position_encoding_from_dict(
+        config["position_encoding"], latent_dim=config["latent_dim"], num_heads=config["num_heads"]
     )
     integrated_gradients = {
         "executed": True,
@@ -1774,6 +1781,10 @@ def _fake_explain(argv) -> None:
         "attribution_width": config["content_dim"],
         "content_dim": config["content_dim"],
         "input_dim": config["input_dim"],
+        "absolute_position_encoding": resolved.absolute.encoding.value,
+        "relative_position_encoding": resolved.relative.encoding.value,
+        "chromosome_encoding": resolved.chromosome.encoding.value,
+        "position_encoding_metadata_source": "reconstructed_resolved_config",
         "variant_score_aggregation": explain.VARIANT_SCORE_AGGREGATION,
         "baseline_policy": CONTENT_BASELINE_POLICY,
         "n_steps": ns.n_steps,
@@ -1807,16 +1818,96 @@ def _fake_explain(argv) -> None:
     )
 
 
+FAKE_N_VARIANTS = 6
+
+
+def _write_fake_variant_rankings(path: Path, output_dir: Path) -> None:
+    """Write a variant ranking CSV with explain.py's real columns.
+
+    ``mean_attribution`` is a deterministic permutation keyed on the output
+    directory, so different strategies (and real vs null) rank differently.
+    Provenance columns carry the same content-IG values explain.py annotates.
+    """
+    digest = hashlib.sha256(str(output_dir).encode()).digest()
+    order = sorted(range(FAKE_N_VARIANTS), key=lambda index: (digest[index], index))
+    fieldnames = [
+        "chromosome",
+        "position",
+        "gene_name",
+        "gene_id",
+        "mean_attribution",
+        "max_attribution",
+        "resolved_ig_mode",
+        "attribution_feature_space",
+        "variant_score_aggregation",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, index in enumerate(order):
+            score = round(1.0 - 0.1 * rank, 3)
+            writer.writerow(
+                {
+                    "chromosome": "1",
+                    "position": 100 * (index + 1),
+                    "gene_name": "GENE1",
+                    "gene_id": 0,
+                    "mean_attribution": score,
+                    "max_attribution": score,
+                    "resolved_ig_mode": "content",
+                    "attribution_feature_space": "content",
+                    "variant_score_aggregation": explain.VARIANT_SCORE_AGGREGATION,
+                }
+            )
+
+
 def _fake_bootstrap(argv) -> None:
-    """Write bootstrap_null_calibration.py-shaped outputs with its actual summary keys."""
+    """Write bootstrap_null_calibration.py-shaped outputs with its actual summary keys.
+
+    Like the real script, the calibrated CSV starts from a copy of the real
+    ranking rows (so raw provenance columns are preserved) and appends the
+    calibration columns; values are deterministic stand-ins, not statistics.
+    """
     with np.load(_argv_value(argv, "--null-attributions"), allow_pickle=True) as data:
         n_null = len(data["metadata"])
-    Path(_argv_value(argv, "--output")).write_text("variant,delta_rank\nv,1\n", encoding="utf-8")
+    with Path(_argv_value(argv, "--real-rankings")).open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+    ranked = sorted(rows, key=lambda row: -float(row["mean_attribution"]))
+    median_null = (len(rows) + 1) / 2
+    calibrated = []
+    for rank_real, row in enumerate(ranked, start=1):
+        calibrated.append(
+            {
+                **row,
+                "rank_real": float(rank_real),
+                "median_rank_null_boot": median_null,
+                "iqr_rank_null_boot": 1.0,
+                "delta_rank": median_null - rank_real,
+                "p_rank_boot": rank_real / (len(rows) + 1),
+                "fdr_rank_boot": min(1.0, rank_real / len(rows)),
+                "at_resolution_floor": rank_real == 1,
+            }
+        )
+    columns = fieldnames + [
+        "rank_real",
+        "median_rank_null_boot",
+        "iqr_rank_null_boot",
+        "delta_rank",
+        "p_rank_boot",
+        "fdr_rank_boot",
+        "at_resolution_floor",
+    ]
+    with Path(_argv_value(argv, "--output")).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(calibrated)
     Path(_argv_value(argv, "--output-gene-stats")).write_text("gene\nGENE1\n", encoding="utf-8")
     summary = {
         "n_bootstrap": int(_argv_value(argv, "--n-bootstrap")),
         "genome_build": _argv_value(argv, "--genome-build"),
-        "n_real_variants": 1,
+        "n_real_variants": len(calibrated),
         "n_null_samples": n_null,
         "n_unique_null_variants": 8,
         "excluded_sex_chroms": "--exclude-sex-chroms" in argv,
@@ -1841,12 +1932,24 @@ def _fake_comparison(argv) -> None:
             path.write_text(f"{Path(argv[1]).name} output\n", encoding="utf-8")
 
 
+def _ranking_comparison(argv) -> int | None:
+    """Raw ranking comparison stays faked; the calibrated one runs the REAL comparator.
+
+    The calibrated stage therefore exercises the full provenance gate against
+    the records this executor just wrote, and its real exit code is returned.
+    """
+    if "--position-calibrated-benchmark" in argv:
+        return compare_ablation_rankings.main(list(argv[2:]))
+    _fake_comparison(argv)
+    return None
+
+
 _FAKE_SCRIPTS = {
     "train.py": _fake_train,
     "explain.py": _fake_explain,
     "bootstrap_null_calibration.py": _fake_bootstrap,
     "ablation_compare.py": _fake_comparison,
-    "compare_ablation_rankings.py": _fake_comparison,
+    "compare_ablation_rankings.py": _ranking_comparison,
     "compare_position_attributions.py": _fake_comparison,
 }
 
@@ -1885,7 +1988,8 @@ class FakeBenchmarkWorld:
             self.before[stage_id](argv)
         code = self.exit_codes.get(stage_id, 0)
         if code == 0:
-            _FAKE_SCRIPTS[Path(argv[1]).name](argv)
+            code = _FAKE_SCRIPTS[Path(argv[1]).name](argv) or 0
+        if code == 0:
             if stage_id in self.after:
                 self.after[stage_id](argv)
         return _FinishedProcess(code)
@@ -1973,6 +2077,7 @@ EXPECTED_ORDER = [
     "comparisons/performance",
     "comparisons/raw_rankings",
     "comparisons/raw_attributions",
+    "comparisons/calibrated_rankings",
 ]
 SUBPROCESS_ORDER = [
     stage_id
@@ -2034,12 +2139,18 @@ def test_full_dag_executes_exact_argv_in_order_and_completes(bench):
         "raw_rankings",
         "raw_attributions",
     ]
-    assert summary["calibrated_cross_strategy_comparison"] == (
-        "not_executed_gate_closed_until_phase_12c3c"
+    assert summary["schema_version"] == 2
+    assert summary["status"] == (
+        "paired_benchmark_complete_with_provenance_gated_calibrated_position_ranking_comparison"
     )
-    assert "calibrated_rankings" not in {
-        path.name for path in (bench.root / "comparisons").iterdir()
-    }
+    assert summary["calibrated_position_ranking_comparison"] == "completed"
+    assert summary["calibrated_score_column"] == "delta_rank"
+    calibrated = bench.root / "comparisons" / "calibrated_rankings"
+    assert sorted(path.name for path in calibrated.iterdir()) == [
+        "position_calibrated_ranking_comparison.yaml",
+        "position_calibrated_ranking_jaccard.tsv",
+        "position_calibrated_strategy_specific_variants.tsv",
+    ]
     # Every record binds the exact plan bytes and revision.
     plan_sha = resolved_plan_file_sha256(bench.plan_path)
     for stage_id in EXPECTED_ORDER:
@@ -2833,6 +2944,238 @@ def test_real_only_guard_rejects_null_or_calibrated_paths(bench, token):
         require_real_only_comparison(bench.plan, tainted)
 
 
+# --- calibrated comparison (Phase 12C3C) ------------------------------------
+
+CALIBRATED_STAGE_ID = "comparisons/calibrated_rankings"
+
+
+def _calibrated_stage(bench):
+    return next(stage for stage in bench.stages if stage.stage_id == CALIBRATED_STAGE_ID)
+
+
+def test_calibrated_stage_is_final_with_exact_dependencies_and_argv(bench):
+    stage = bench.stages[-1]
+    planned = bench.plan["comparisons"]["calibrated_rankings"]
+    assert stage.stage_id == CALIBRATED_STAGE_ID
+    assert (stage.stage_type, stage.side, stage.run_id) == ("comparison", "comparison", None)
+    assert stage.dependency_ids == (
+        SHARED_NULL_STAGE_ID,
+        "runs/legacy/calibration",
+        "runs/no_position/calibration",
+    )
+    assert stage.argv == tuple(planned["argv"])
+    assert stage.owned_paths == (Path(planned["directory"]),)
+    position_benchmark_execution.require_calibrated_comparison_argv(bench.plan, stage)
+
+
+def _swap(flag, value):
+    def tamper(argv, bench):
+        argv[argv.index(flag) + 1] = value(bench) if callable(value) else value
+        return argv
+
+    return tamper
+
+
+def _extend(*tokens):
+    def tamper(argv, bench):
+        return [*argv, *(token(bench) if callable(token) else token for token in tokens)]
+
+    return tamper
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        _extend(
+            "--position-run",
+            "legacy",
+            lambda b: str(b.root / "runs/legacy/real/training/config.yaml"),
+            lambda b: str(b.root / "runs/legacy/real/explanation/sieve_variant_rankings.csv"),
+            lambda b: str(b.root / "runs/legacy/real/explanation/analysis_metadata.yaml"),
+        ),
+        _extend(lambda b: str(b.root / "runs/legacy/null/explanation/attributions.npz")),
+        _extend("--top-k", "5"),
+        _swap("--score-column", "mean_attribution"),
+        _swap("--position-calibrated-benchmark", lambda b: str(b.root.parent / "other" / "L3")),
+        _swap("--position-calibrated-benchmark", lambda b: str(b.execution)),
+        _swap(
+            "--out-jaccard",
+            lambda b: str(b.root / "comparisons/raw_rankings/position_ranking_jaccard.tsv"),
+        ),
+    ],
+)
+def test_calibrated_argv_guard_rejects(bench, tamper):
+    import dataclasses
+
+    stage = _calibrated_stage(bench)
+    tainted = dataclasses.replace(stage, argv=tuple(tamper(list(stage.argv), bench)))
+    with pytest.raises(StageStateError, match="calibrated comparison argv"):
+        position_benchmark_execution.require_calibrated_comparison_argv(bench.plan, tainted)
+
+
+def test_calibrated_stage_binds_named_inputs_only(bench):
+    _run(bench)
+    record = _completed_record(bench, CALIBRATED_STAGE_ID)
+    expected_names = ["plan_binding.yaml", "shared_null_validation.yaml"]
+    for run_id in RUN_IDS:
+        expected_names += [
+            f"{run_id}/bootstrap_calibrated_variant_rankings.csv",
+            f"{run_id}/bootstrap_calibrated_variant_rankings_gene_stats.csv",
+            f"{run_id}/bootstrap_calibrated_variant_rankings_summary.yaml",
+            f"{run_id}/real/config.yaml",
+            f"{run_id}/real/analysis_metadata.yaml",
+            f"{run_id}/paired_compatibility.yaml",
+        ]
+    assert list(record["inputs"]) == [*expected_names, "resolved_plan"]
+    allowed_execution_files = {
+        str(bench.execution / "resolved_plan.yaml"),
+        str(bench.execution / "plan_binding.yaml"),
+    }
+    for fingerprint in record["inputs"].values():
+        path = Path(fingerprint["path"])
+        assert fingerprint["kind"] == "file"
+        assert path != bench.root
+        if bench.execution in path.parents:
+            assert str(path) in allowed_execution_files
+        assert sha256_file(path) == fingerprint["sha256"]
+    dependencies = record["dependencies"]
+    assert [dep["stage_id"] for dep in dependencies] == list(
+        _calibrated_stage(bench).dependency_ids
+    )
+    for dependency in dependencies:
+        assert dependency["record_sha256"] == sha256_file(dependency["record_path"])
+    assert list(record["outputs"]) == [
+        "position_calibrated_ranking_comparison.yaml",
+        "position_calibrated_ranking_jaccard.tsv",
+        "position_calibrated_strategy_specific_variants.tsv",
+        "output_tree",
+    ]
+    checks = record["post_validation"]["checks"]
+    assert "execution_provenance" in checks
+    assert "runs.legacy.calibration_record_sha256" in checks
+    assert "runs.no_position.pair_validation_record_sha256" in checks
+    comparison = yaml.safe_load(
+        (
+            bench.root
+            / "comparisons/calibrated_rankings/position_calibrated_ranking_comparison.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    for run in comparison["runs"]:
+        calibration = stage_record_path(
+            bench.execution, f"runs/{run['run_id']}/calibration", "completed"
+        )
+        assert run["calibration_record_sha256"] == sha256_file(calibration)
+
+
+def _comparison_yaml_edit(mutate):
+    def hook(argv):
+        _edit_yaml(Path(_argv_value(argv, "--out-comparison")), mutate)
+
+    return hook
+
+
+def _run_entry_edit(key, value):
+    def mutate(data):
+        data["runs"][0][key] = value
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (_set("comparison_mode", "raw"), "comparison_mode"),
+        (_set("score.column", "mean_attribution"), "score.column"),
+        (_set("score.sort_order", "ascending"), "score.sort_order"),
+        (_set("execution_provenance.shared_null_record_sha256", "0" * 64), "execution_provenance"),
+        (_set("execution_provenance.plan_binding_sha256", "0" * 64), "execution_provenance"),
+        (_set("execution_provenance.null_binding.n_samples", 9), "execution_provenance"),
+        (_run_entry_edit("calibration_record_sha256", "0" * 64), "calibration_record_sha256"),
+        (
+            _run_entry_edit("pair_validation_record_sha256", "0" * 64),
+            "pair_validation_record_sha256",
+        ),
+        (_run_entry_edit("calibrated_ranking_sha256", "0" * 64), "calibrated_ranking_sha256"),
+        (lambda data: data["runs"].pop(), "planned runs"),
+    ],
+)
+def test_calibrated_post_validation_rejects_mismatched_identities(bench, mutate, message):
+    bench.world.after[CALIBRATED_STAGE_ID] = _comparison_yaml_edit(mutate)
+    with pytest.raises(StagePostValidationError, match=message):
+        _run(bench)
+    assert _record_kinds(bench)[CALIBRATED_STAGE_ID] == ["failed"]
+    assert not (bench.execution / "benchmark_execution_summary.yaml").exists()
+
+
+def test_calibrated_comparison_failure_stops_completion(bench):
+    bench.world.exit_codes[CALIBRATED_STAGE_ID] = 1
+    with pytest.raises(StageFailure):
+        _run(bench)
+    assert _record_kinds(bench)[CALIBRATED_STAGE_ID] == ["failed"]
+    assert not (bench.execution / "benchmark_execution_summary.yaml").exists()
+
+
+def test_calibrated_comparator_provenance_gate_failure_stops_stage(bench):
+    # Changed after the executor fingerprinted the stage inputs but before the
+    # real comparator ran: the comparator's own provenance gate refuses it.
+    calibrated = (
+        _run_dir(bench, "legacy") / "calibration" / "bootstrap_calibrated_variant_rankings.csv"
+    )
+    bench.world.before[CALIBRATED_STAGE_ID] = lambda argv: _append(calibrated, "\n")
+    with pytest.raises(StageFailure):
+        _run(bench)
+    assert _record_kinds(bench)[CALIBRATED_STAGE_ID] == ["failed"]
+    stderr = bench.execution / "logs" / "comparisons" / "calibrated_rankings.stderr.log"
+    assert stderr.is_file()
+    assert not (bench.execution / "benchmark_execution_summary.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("stage_id", "message"),
+    [
+        (
+            "runs/legacy/calibration",
+            "comparisons/calibrated_rankings cannot be resumed: dependency record "
+            "runs/legacy/calibration changed",
+        ),
+        (
+            "runs/legacy/pair_validation",
+            "dependency record runs/legacy/pair_validation changed",
+        ),
+        (
+            SHARED_NULL_STAGE_ID,
+            "comparisons/calibrated_rankings cannot be resumed: dependency record "
+            "benchmark/shared_null changed",
+        ),
+    ],
+)
+def test_resume_rejects_tampered_upstream_record_of_calibrated_comparison(bench, stage_id, message):
+    _run(bench)
+    _edit_record(bench, stage_id, _set("environment.hostname", "elsewhere"))
+    _resume_rejects(bench, message)
+
+
+def test_resume_rejects_changed_calibrated_output(bench):
+    _run(bench)
+    _append(
+        bench.root / "comparisons/calibrated_rankings/position_calibrated_ranking_jaccard.tsv",
+        "x\n",
+    )
+    _resume_rejects(bench, "output position_calibrated_ranking_jaccard.tsv changed")
+
+
+def test_resume_reruns_calibrated_post_validation(bench, monkeypatch):
+    _run(bench)
+
+    def now_fails(ctx, stage):
+        raise StagePostValidationError("calibrated identities no longer match")
+
+    monkeypatch.setattr(
+        position_benchmark_execution, "_validate_calibrated_comparison_outputs", now_fails
+    )
+    _resume_rejects(bench, "calibrated identities no longer match")
+
+
 # --- directory manifests and logs -------------------------------------------
 
 
@@ -2894,13 +3237,17 @@ def _manual_recover(bench, stage_id: str, output: Path) -> None:
 
 def test_resume_revalidates_prefix_and_executes_remaining_stages(bench):
     _run(bench)
-    for name in ("raw_attributions", "raw_rankings"):
+    for name in ("calibrated_rankings", "raw_attributions", "raw_rankings"):
         _manual_recover(bench, f"comparisons/{name}", bench.root / "comparisons" / name)
     (bench.execution / "benchmark_execution_summary.yaml").unlink()
     bench.world.calls.clear()
     result = _run(bench, resume=True)
-    assert bench.world.stage_ids() == ["comparisons/raw_rankings", "comparisons/raw_attributions"]
-    assert result["reused"] == EXPECTED_ORDER[:-2]
+    assert bench.world.stage_ids() == [
+        "comparisons/raw_rankings",
+        "comparisons/raw_attributions",
+        "comparisons/calibrated_rankings",
+    ]
+    assert result["reused"] == EXPECTED_ORDER[:-3]
 
 
 @pytest.mark.parametrize("kind", ["failed", "running"])

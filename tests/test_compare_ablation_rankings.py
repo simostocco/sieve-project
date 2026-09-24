@@ -667,3 +667,222 @@ def test_level_mode_one_file_warning_is_preserved(
     assert ablation.main() == 0
 
     assert "Need at least 2 levels" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Phase 12C3C: raw position gate and level mode stay unchanged
+# ---------------------------------------------------------------------------
+
+
+def _raw_position_runs(tmp_path: Path) -> list[tuple[str, Path, Path, Path]]:
+    from tests.test_position_benchmark_rankings import _config, _make_run, _ranking_rows
+
+    promoted = _ranking_rows()
+    promoted[1] = {**promoted[1], "mean_attribution": 9.5}
+    return [
+        _make_run(tmp_path, "a", _config("none"), _ranking_rows()),
+        _make_run(tmp_path, "b", _config("alibi_fixed"), promoted),
+    ]
+
+
+def _raw_position_argv(tmp_path: Path, runs, score_column: str, *extra: str) -> list[str]:
+    argv = [
+        "--comparison-axis",
+        "position",
+        "--score-column",
+        score_column,
+        "--top-k",
+        "1,2",
+        "--high-rank-threshold",
+        "1",
+        "--low-rank-threshold",
+        "1",
+        "--out-comparison",
+        str(tmp_path / "out" / "comparison.yaml"),
+        "--out-jaccard",
+        str(tmp_path / "out" / "jaccard.tsv"),
+        "--out-level-specific",
+        str(tmp_path / "out" / "specific.tsv"),
+        *extra,
+    ]
+    for run_id, config_path, ranking_path, analysis_path in runs:
+        argv += ["--position-run", run_id, str(config_path), str(ranking_path), str(analysis_path)]
+    return argv
+
+
+def test_deferred_calibrated_score_columns_are_unchanged() -> None:
+    assert ablation.DEFERRED_CALIBRATED_SCORE_COLUMNS == {
+        "delta_rank",
+        "z_attribution",
+        "p_rank_boot",
+        "rank_real",
+        "median_rank_null_boot",
+        "corrected_rank",
+    }
+    assert ablation.POSITION_SCORE_COLUMNS == {
+        "rank": "ascending",
+        "mean_attribution": "descending",
+        "max_attribution": "descending",
+    }
+    assert ablation.CALIBRATED_POSITION_SCORE_COLUMNS == {"delta_rank": "descending"}
+
+
+def test_raw_position_delta_rank_points_to_calibrated_mode(tmp_path: Path, capsys) -> None:
+    runs = _raw_position_runs(tmp_path)
+    assert ablation.main(_raw_position_argv(tmp_path, runs, "delta_rank")) == 1
+    err = capsys.readouterr().err
+    assert "--position-calibrated-benchmark" in err and "--position-run" in err
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "score_column", ["z_attribution", "p_rank_boot", "fdr_rank_boot", "iqr_rank_null_boot"]
+)
+def test_raw_position_other_calibration_columns_still_reject(
+    tmp_path: Path, capsys, score_column: str
+) -> None:
+    runs = _raw_position_runs(tmp_path)
+    assert ablation.main(_raw_position_argv(tmp_path, runs, score_column)) == 1
+    err = capsys.readouterr().err
+    assert score_column in err or "must be one of: max_attribution, mean_attribution, rank" in err
+
+
+def test_raw_default_resolver_still_rejects_delta_rank(tmp_path: Path) -> None:
+    path = tmp_path / "r.csv"
+    path.write_text("variant_id,delta_rank\nv1,1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="--position-calibrated-benchmark"):
+        ablation.load_position_rankings(path, run_id="r", score_column="delta_rank")
+
+
+def test_raw_position_rejects_calibrated_benchmark_flag_combination(tmp_path: Path, capsys) -> None:
+    runs = _raw_position_runs(tmp_path)
+    argv = _raw_position_argv(
+        tmp_path, runs, "delta_rank", "--position-calibrated-benchmark", str(tmp_path)
+    )
+    assert ablation.main(argv) == 1
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_raw_position_output_schema_and_math_unchanged(tmp_path: Path) -> None:
+    runs = _raw_position_runs(tmp_path)
+    assert ablation.main(_raw_position_argv(tmp_path, runs, "mean_attribution")) == 0
+    summary = yaml.safe_load((tmp_path / "out" / "comparison.yaml").read_text(encoding="utf-8"))
+    assert list(summary) == [
+        "comparison_axis",
+        "score",
+        "compatibility",
+        "runs",
+        "top_k_values",
+        "variant_universe",
+        "jaccard_matrices",
+        "strategy_specific_variant_counts",
+        "thresholds",
+    ]
+    assert list(summary["runs"][0]) == [
+        "run_id",
+        "position_strategy_id",
+        "position_strategy_name",
+        "position_strategy_hash",
+        "position_strategy",
+        "config_path",
+        "ranking_path",
+        "analysis_metadata_path",
+        "n_variants",
+    ]
+    loaded = [
+        ablation._load_position_run(
+            ablation.PositionRunSpec(run_id, config, ranking, analysis),
+            score_column="mean_attribution",
+        )
+        for run_id, config, ranking, analysis in runs
+    ]
+    matrices = ablation.compute_position_jaccard_matrices(
+        loaded, [1, 2], score_column="mean_attribution", score_sort_order="descending"
+    )
+    jaccard_lines = (tmp_path / "out" / "jaccard.tsv").read_text(encoding="utf-8").splitlines()
+    assert jaccard_lines[0].split("\t") == [
+        "top_k",
+        "run_id_a",
+        "run_id_b",
+        "position_strategy_id_a",
+        "position_strategy_id_b",
+        "jaccard",
+        "overlap",
+        "size_a",
+        "size_b",
+        "union",
+        "score_column",
+        "score_sort_order",
+    ]
+    assert [line.split("\t")[5] for line in jaccard_lines[1:]] == [
+        str(row["jaccard"]) for k in (1, 2) for row in matrices[k]
+    ]
+    assert [row["jaccard"] for k in (1, 2) for row in matrices[k]] == [0.0, 1.0]
+    specific = ablation.find_strategy_specific_variants(loaded, 1, 1)
+    specific_lines = (tmp_path / "out" / "specific.tsv").read_text(encoding="utf-8").splitlines()
+    assert specific_lines[0].split("\t") == [
+        "variant_id",
+        "gene",
+        "chrom",
+        "pos",
+        "specific_to_run_id",
+        "specific_to_position_strategy_id",
+        "rank_at_specific_strategy",
+        "score_at_specific_strategy",
+        "other_run_id",
+        "other_position_strategy_id",
+        "rank_at_other_strategy",
+    ]
+    assert len(specific_lines) - 1 == len(specific) == 2
+    assert [row["variant_id"] for row in specific] == ["v1", "v2"]
+
+
+def test_level_mode_rejects_calibrated_benchmark_flag(tmp_path: Path, capsys) -> None:
+    write_variant_rankings(
+        tmp_path / "L0_sieve_variant_rankings.csv",
+        [{"variant_id": "1:100_1", "chromosome": "1", "position": 100, "delta_rank": 1.0}],
+    )
+    argv = [
+        "--ranking-dir",
+        str(tmp_path),
+        "--score-column",
+        "delta_rank",
+        "--position-calibrated-benchmark",
+        str(tmp_path),
+        "--out-comparison",
+        str(tmp_path / "c.yaml"),
+    ]
+    assert ablation.main(argv) == 1
+    assert "level comparison rejects --position-calibrated-benchmark" in capsys.readouterr().err
+    assert not (tmp_path / "c.yaml").exists()
+
+
+def test_level_mode_delta_rank_still_descending_through_main(tmp_path: Path) -> None:
+    for level, values in (("L0", (5.0, 1.0)), ("L1", (1.0, 5.0))):
+        write_variant_rankings(
+            tmp_path / f"{level}_sieve_variant_rankings.csv",
+            [
+                {"variant_id": "a", "chromosome": "1", "position": 1, "delta_rank": values[0]},
+                {"variant_id": "b", "chromosome": "1", "position": 2, "delta_rank": values[1]},
+            ],
+        )
+    argv = [
+        "--ranking-dir",
+        str(tmp_path),
+        "--score-column",
+        "delta_rank",
+        "--top-k",
+        "1",
+        "--out-comparison",
+        str(tmp_path / "c.yaml"),
+        "--out-jaccard",
+        str(tmp_path / "j.tsv"),
+        "--out-level-specific",
+        str(tmp_path / "s.tsv"),
+    ]
+    assert ablation.main(argv) == 0
+    summary = yaml.safe_load((tmp_path / "c.yaml").read_text(encoding="utf-8"))
+    assert summary["score_column"] == "delta_rank"
+    assert summary["score_sort_order"] == "descending"
+    assert summary["jaccard_matrices"]["top_1"]["L0_vs_L1"]["jaccard"] == 0.0
+    assert "comparison_mode" not in summary and "execution_provenance" not in summary

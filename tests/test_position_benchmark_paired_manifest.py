@@ -439,10 +439,91 @@ def test_paired_directories_follow_real_null_calibration_layout(tmp_path):
         assert run["expected_artifacts"]["null_training"][-1] == str(
             root / "null" / "training" / "fold_0" / "best_model.pt"
         )
-    assert plan["reserved_comparisons"]["calibrated_rankings"]["status"] == (
-        "reserved_for_phase_12c3c"
+    # Phase 12C3C: the former reserved placeholder is now a planned comparison.
+    assert "reserved_comparisons" not in plan
+    assert list(plan["comparisons"]) == [
+        "performance",
+        "raw_rankings",
+        "raw_attributions",
+        "calibrated_rankings",
+    ]
+
+
+def test_v2_plan_contains_calibrated_rankings_comparison(tmp_path):
+    manifest_path, _ = _paired_manifest(tmp_path)
+    plan = _build(manifest_path)
+    root = Path(plan["runs"][0]["directories"]["run_root"]).parent.parent
+    directory = root / "comparisons" / "calibrated_rankings"
+    outputs = [
+        directory / "position_calibrated_ranking_comparison.yaml",
+        directory / "position_calibrated_ranking_jaccard.tsv",
+        directory / "position_calibrated_strategy_specific_variants.tsv",
+    ]
+
+    assert plan["comparisons"]["calibrated_rankings"] == {
+        "directory": str(directory),
+        "score_column": "delta_rank",
+        "argv": [
+            plan["runtime"]["python"],
+            str(Path(plan["repository_root"]) / "scripts" / "compare_ablation_rankings.py"),
+            "--comparison-axis",
+            "position",
+            "--position-calibrated-benchmark",
+            str(root),
+            "--score-column",
+            "delta_rank",
+            "--out-comparison",
+            str(outputs[0]),
+            "--out-jaccard",
+            str(outputs[1]),
+            "--out-level-specific",
+            str(outputs[2]),
+        ],
+        "expected_outputs": [str(path) for path in outputs],
+    }
+    argv = plan["comparisons"]["calibrated_rankings"]["argv"]
+    # Same comparator defaults as the raw ranking comparison: no threshold flags.
+    raw = plan["comparisons"]["raw_rankings"]["argv"]
+    for flag in ("--top-k", "--high-rank-threshold", "--low-rank-threshold"):
+        assert flag not in argv and flag not in raw
+    assert "--position-run" not in argv
+
+
+def test_non_empty_calibrated_comparison_directory_fails_or_warns(tmp_path):
+    manifest_path, _ = _paired_manifest(tmp_path)
+    directory = Path(_build(manifest_path)["comparisons"]["calibrated_rankings"]["directory"])
+    directory.mkdir(parents=True)
+    (directory / "stale.tsv").write_text("x", encoding="utf-8")
+
+    with pytest.raises(BenchmarkManifestError, match="non-empty"):
+        _build(manifest_path)
+    warnings = _build(manifest_path, allow_existing_outputs=True)["warnings"]
+    assert warnings == [f"planned output directory is non-empty: {directory}"]
+
+
+def test_calibrated_comparison_directory_that_is_a_file_rejects(tmp_path):
+    manifest_path, _ = _paired_manifest(tmp_path)
+    directory = Path(_build(manifest_path)["comparisons"]["calibrated_rankings"]["directory"])
+    directory.parent.mkdir(parents=True)
+    directory.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(BenchmarkManifestError, match="existing file"):
+        _build(manifest_path, allow_existing_outputs=True)
+
+
+def test_null_artifact_inside_calibrated_comparison_directory_rejects(tmp_path):
+    manifest_path, manifest = _paired_manifest(tmp_path)
+    leaf = Path(_build(manifest_path)["comparisons"]["calibrated_rankings"]["directory"])
+    leaf.mkdir(parents=True)
+    for name in ("cohort.null.pt", "cohort.null.pt.null-lineage.yaml"):
+        (leaf / name).write_bytes((tmp_path / "data" / name).read_bytes())
+    relative = leaf.relative_to(tmp_path) / "cohort.null.pt"
+    _rewrite(
+        manifest_path, manifest, lambda m: m["null_baseline"].update({"artifact": str(relative)})
     )
-    assert set(plan["comparisons"]) == {"performance", "raw_rankings", "raw_attributions"}
+
+    with pytest.raises(BenchmarkManifestError, match="null_baseline.artifact path collides"):
+        _build(manifest_path, allow_existing_outputs=True)
 
 
 def test_calibration_argv_is_explicit_and_deterministic(tmp_path):
@@ -561,7 +642,9 @@ def test_v2_real_side_and_raw_comparisons_match_equivalent_v1_plan(tmp_path):
     paired = _build(manifest_path)
     real_only = _build(v1_path)
 
-    assert paired["comparisons"] == real_only["comparisons"]
+    raw_names = ["performance", "raw_rankings", "raw_attributions"]
+    assert list(real_only["comparisons"]) == raw_names
+    assert {name: paired["comparisons"][name] for name in raw_names} == real_only["comparisons"]
     assert "null_binding" not in real_only
     for paired_run, real_run in zip(paired["runs"], real_only["runs"], strict=True):
         assert paired_run["train_argv"] == real_run["train_argv"]
@@ -680,6 +763,8 @@ def test_dry_run_cli_prints_paired_plan_without_creating_outputs(tmp_path, capsy
     assert "Null lineage SHA256:" in output
     assert "null train:" in output
     assert "calibration:" in output
+    assert "  calibrated_rankings: " in output
+    assert "--position-calibrated-benchmark" in output
     assert "not authorized until the Phase 12C3B2" in output
     assert not (tmp_path / "outputs").exists()
 

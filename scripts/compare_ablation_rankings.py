@@ -41,6 +41,17 @@ Usage:
         --score-column z_attribution \\
         --out-comparison ablation_ranking_comparison.yaml
 
+Position axis (positional-encoding benchmark):
+
+- ``--position-run RUN_ID CONFIG RANKING ANALYSIS_METADATA`` (repeated) compares
+  raw explanation scores only (``rank``, ``mean_attribution``,
+  ``max_attribution``); calibrated scores are always rejected there.
+- ``--position-calibrated-benchmark BENCHMARK_ROOT --score-column delta_rank``
+  (Phase 12C3C) compares bootstrap-calibrated ``delta_rank`` rankings of a
+  completed paired benchmark. Every input is resolved from the benchmark's
+  bound plan and completed stage records and validated by
+  ``position_benchmark_calibrated``; ``delta_rank`` is the only accepted score.
+
 Author: Francesco Lescai
 """
 from __future__ import annotations
@@ -53,6 +64,7 @@ import pathlib
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -101,6 +113,18 @@ DEFERRED_CALIBRATED_SCORE_COLUMNS = {
     "median_rank_null_boot",
     "corrected_rank",
 }
+# Phase 12C3C opens exactly one calibrated score for cross-strategy position
+# comparison, and only through the provenance-gated
+# --position-calibrated-benchmark mode. delta_rank (median_rank_null_boot -
+# rank_real) is scale-free; higher means the real model promoted the variant
+# more strongly relative to its bootstrap-null rank distribution. All other
+# calibration columns stay diagnostic and are never accepted as position
+# comparison scores. The raw --position-run gate above is deliberately
+# unchanged and still rejects delta_rank.
+CALIBRATED_POSITION_SCORE_COLUMNS = {
+    "delta_rank": "descending",
+}
+CALIBRATED_KEY_RULE = "explicit_variant_id_else_chromosome_position_gene_id"
 
 # ---------------------------------------------------------------------------
 # YAML output helper
@@ -369,14 +393,21 @@ def _resolve_position_score_column(headers: list[str], score_column: str | None)
         raise ValueError("position comparison requires explicit --score-column")
 
     requested = score_column.lower()
+    if requested in CALIBRATED_POSITION_SCORE_COLUMNS:
+        raise ValueError(
+            f"calibrated position score {requested!r} is not accepted with --position-run; "
+            "since Phase 12C3C it requires the provenance-gated "
+            "--position-calibrated-benchmark BENCHMARK_ROOT mode"
+        )
     if (
         requested in DEFERRED_CALIBRATED_SCORE_COLUMNS
         or requested.startswith("empirical_p")
         or requested.startswith("fdr")
     ):
         raise ValueError(
-            "calibrated/null-derived ranking comparison is deferred until "
-            "provenance can be validated in Phase 12C"
+            f"calibrated/null-derived score {requested!r} is not a position comparison "
+            "score; Phase 12C3C opens only delta_rank, via "
+            "--position-calibrated-benchmark BENCHMARK_ROOT"
         )
     if requested not in POSITION_SCORE_COLUMNS:
         allowed = ", ".join(sorted(POSITION_SCORE_COLUMNS))
@@ -388,6 +419,28 @@ def _resolve_position_score_column(headers: list[str], score_column: str | None)
     if requested not in lower_headers:
         raise ValueError(f"--score-column '{score_column}' not found in headers: {headers}")
     return lower_headers[requested]
+
+
+def _resolve_calibrated_position_score_column(headers: list[str], score_column: str | None) -> str:
+    """Resolve the calibrated score column; only exact ``delta_rank`` is accepted.
+
+    Distinct from the raw resolver on purpose: calibrated scores must never
+    leak into the raw ``--position-run`` path, and the raw columns are not
+    calibrated scores.
+    """
+    if score_column is None:
+        raise ValueError(
+            "calibrated position comparison requires explicit --score-column delta_rank"
+        )
+    if score_column not in CALIBRATED_POSITION_SCORE_COLUMNS:
+        allowed = ", ".join(sorted(CALIBRATED_POSITION_SCORE_COLUMNS))
+        raise ValueError(
+            f"calibrated position comparison --score-column must be one of: {allowed}; "
+            f"got {score_column!r}"
+        )
+    if score_column not in headers:
+        raise ValueError(f"calibrated ranking CSV has no {score_column!r} column: {headers}")
+    return score_column
 
 
 def _build_position_variant_id(
@@ -452,13 +505,22 @@ def load_position_rankings(
     *,
     run_id: str,
     score_column: str,
+    resolve_score_column: Callable[[list[str], str | None], str] = _resolve_position_score_column,
+    sort_orders: Mapping[str, str] = POSITION_SCORE_COLUMNS,
 ) -> tuple[list[dict[str, Any]], str, str]:
-    """Load a strict raw explanation ranking CSV for position-mode comparison."""
+    """Load a strict ranking CSV for position-mode comparison.
+
+    The defaults are the raw explanation-score gate. Calibrated comparison
+    passes :func:`_resolve_calibrated_position_score_column` and
+    :data:`CALIBRATED_POSITION_SCORE_COLUMNS`; variant keys, duplicate
+    rejection, strict finite scores, and the ``(score, variant_id)`` tie-break
+    are identical in both modes.
+    """
     with csv_path.open("r", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         headers = reader.fieldnames or []
-        resolved_col = _resolve_position_score_column(headers, score_column)
-        sort_order = POSITION_SCORE_COLUMNS[resolved_col.lower()]
+        resolved_col = resolve_score_column(headers, score_column)
+        sort_order = sort_orders[resolved_col.lower()]
         rows: list[dict[str, Any]] = []
         for row_number, row in enumerate(reader, start=2):
             vid = _build_position_variant_id(
@@ -873,8 +935,8 @@ def find_strategy_specific_variants(
 # ---------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (``sys.argv[1:]`` when *argv* is None)."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -912,6 +974,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Position-mode run specification. Repeat once per strategy. "
             "Strategy identity is read from CONFIG_YAML."
+        ),
+    )
+    parser.add_argument(
+        "--position-calibrated-benchmark",
+        default=None,
+        metavar="BENCHMARK_ROOT",
+        help=(
+            "Position-mode calibrated comparison of a completed paired benchmark "
+            "(<output_root>/<benchmark_id>/<level>). Run set, calibrated rankings, "
+            "and strategy metadata are taken only from its bound plan and completed "
+            "stage records. Requires --score-column delta_rank; mutually exclusive "
+            "with --position-run."
         ),
     )
     parser.add_argument(
@@ -962,7 +1036,7 @@ def parse_args() -> argparse.Namespace:
             "ranked descending."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _parse_rankings_arg(rankings: List[str]) -> Dict[str, pathlib.Path]:
@@ -1180,8 +1254,14 @@ def _validate_position_ranking_provenance(
         )
 
 
-def _load_position_run(spec: PositionRunSpec, *, score_column: str) -> PositionRankingRun:
-    """Load and validate one position-mode run."""
+def _load_position_run(
+    spec: PositionRunSpec,
+    *,
+    score_column: str,
+    resolve_score_column: Callable[[list[str], str | None], str] = _resolve_position_score_column,
+    sort_orders: Mapping[str, str] = POSITION_SCORE_COLUMNS,
+) -> PositionRankingRun:
+    """Load and validate one position-mode run (raw score gate by default)."""
     config = load_yaml(spec.config_path)
     analysis_metadata = load_yaml(spec.analysis_metadata_path)
     identity = position_strategy_identity(config)
@@ -1199,6 +1279,8 @@ def _load_position_run(spec: PositionRunSpec, *, score_column: str) -> PositionR
         spec.ranking_path,
         run_id=spec.run_id,
         score_column=score_column,
+        resolve_score_column=resolve_score_column,
+        sort_orders=sort_orders,
     )
     return PositionRankingRun(
         spec=spec,
@@ -1316,22 +1398,7 @@ def _run_position_comparison(args: argparse.Namespace) -> int:
         strategy_specific,
     )
 
-    strategy_specific_counts = []
-    for run in sorted(runs, key=lambda item: item.spec.run_id):
-        count = len(
-            {
-                row["variant_id"]
-                for row in strategy_specific
-                if row["specific_to_run_id"] == run.spec.run_id
-            }
-        )
-        strategy_specific_counts.append(
-            {
-                "run_id": run.spec.run_id,
-                "position_strategy_id": run.identity.strategy_id,
-                "count": count,
-            }
-        )
+    strategy_specific_counts = _strategy_specific_counts(runs, strategy_specific)
 
     yaml_summary: dict[str, Any] = {
         "comparison_axis": "position",
@@ -1386,10 +1453,181 @@ def _run_position_comparison(args: argparse.Namespace) -> int:
     return 0
 
 
+def _strategy_specific_counts(
+    runs: list[PositionRankingRun], strategy_specific: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Count distinct strategy-specific variants per run (sorted by run ID)."""
+    counts = []
+    for run in sorted(runs, key=lambda item: item.spec.run_id):
+        count = len(
+            {
+                row["variant_id"]
+                for row in strategy_specific
+                if row["specific_to_run_id"] == run.spec.run_id
+            }
+        )
+        counts.append(
+            {
+                "run_id": run.spec.run_id,
+                "position_strategy_id": run.identity.strategy_id,
+                "count": count,
+            }
+        )
+    return counts
+
+
+def _run_calibrated_position_comparison(args: argparse.Namespace) -> int:
+    """Run the provenance-gated calibrated (``delta_rank``) position comparison.
+
+    The run set, calibrated ranking CSVs, and REAL config/analysis metadata
+    come only from the benchmark's bound plan and completed stage records
+    (see ``position_benchmark_calibrated``); no arbitrary CSV path is ever
+    accepted. Validated rankings feed the unchanged pure comparison
+    functions, so Jaccard and strategy-specific mathematics are identical to
+    the raw mode.
+    """
+    # Imported here so raw and level modes keep their historical import set.
+    if __package__ in {None, ""}:
+        from position_benchmark_calibrated import (
+            load_calibrated_position_benchmark,
+            require_unchanged,
+        )
+    else:
+        from .position_benchmark_calibrated import (
+            load_calibrated_position_benchmark,
+            require_unchanged,
+        )
+
+    try:
+        if args.ranking_dir or args.rankings:
+            raise ValueError("position comparison rejects --ranking-dir and --rankings")
+        if args.position_run:
+            raise ValueError(
+                "--position-calibrated-benchmark and --position-run are mutually exclusive"
+            )
+        _resolve_calibrated_position_score_column(
+            list(CALIBRATED_POSITION_SCORE_COLUMNS), args.score_column
+        )
+        score_column = args.score_column
+        top_k_values = _parse_top_k_values(args.top_k, require_positive=True)
+        benchmark = load_calibrated_position_benchmark(args.position_calibrated_benchmark)
+        if len(benchmark.runs) < 2:
+            raise ValueError("calibrated position comparison requires at least two planned runs")
+        provenance_by_run = {run.run_id: run for run in benchmark.runs}
+        specs = [
+            PositionRunSpec(
+                run_id=run.run_id,
+                config_path=run.config_path,
+                ranking_path=run.calibrated_ranking_path,
+                analysis_metadata_path=run.analysis_metadata_path,
+            )
+            for run in benchmark.runs
+        ]
+        runs = [
+            _load_position_run(
+                spec,
+                score_column=score_column,
+                resolve_score_column=_resolve_calibrated_position_score_column,
+                sort_orders=CALIBRATED_POSITION_SCORE_COLUMNS,
+            )
+            for spec in specs
+        ]
+        for run in runs:
+            expected = provenance_by_run[run.spec.run_id].n_calibrated_variants
+            if len(run.rankings) != expected:
+                raise ValueError(
+                    f"run {run.spec.run_id!r} calibrated rankings have {len(run.rankings)} "
+                    f"variants but the calibrated CSV has {expected} rows"
+                )
+        training_report = require_compatible_contexts([run.training_context for run in runs])
+        explanation_report = require_compatible_explanation_contexts(
+            [run.explanation_context for run in runs]
+        )
+        variant_universe = _validate_position_universe(runs)
+        score_sort_order = CALIBRATED_POSITION_SCORE_COLUMNS[score_column]
+        # Every file parsed above was hashed by the gate; prove none changed
+        # before any output is written.
+        require_unchanged(benchmark)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    jaccard_matrices = compute_position_jaccard_matrices(
+        runs,
+        top_k_values,
+        score_column=score_column,
+        score_sort_order=score_sort_order,
+    )
+    strategy_specific = find_strategy_specific_variants(
+        runs,
+        args.high_rank_threshold,
+        args.low_rank_threshold,
+    )
+    _write_position_jaccard_tsv(pathlib.Path(args.out_jaccard), jaccard_matrices, top_k_values)
+    _write_strategy_specific_tsv(pathlib.Path(args.out_level_specific), strategy_specific)
+
+    yaml_summary: dict[str, Any] = {
+        "comparison_axis": "position",
+        "comparison_mode": "calibrated",
+        "score": {
+            "column": score_column,
+            "sort_order": score_sort_order,
+        },
+        "execution_provenance": benchmark.execution_provenance(),
+        "compatibility": {
+            "training_context": training_report.to_dict(),
+            "explanation_context": explanation_report.to_dict(),
+        },
+        "runs": [
+            {
+                "run_id": run.spec.run_id,
+                "position_strategy_id": run.identity.strategy_id,
+                "position_strategy_name": run.identity.name,
+                "position_strategy_hash": run.identity.hash,
+                "position_strategy": run.identity.payload,
+                **provenance_by_run[run.spec.run_id].provenance_dict(),
+                "n_variants": len(run.rankings),
+            }
+            for run in sorted(runs, key=lambda item: item.spec.run_id)
+        ],
+        "top_k_values": top_k_values,
+        "variant_universe": {
+            "n_variants": len(variant_universe),
+            "key_rule": CALIBRATED_KEY_RULE,
+        },
+        "jaccard_matrices": {
+            f"top_{top_k}": jaccard_matrices.get(top_k, []) for top_k in top_k_values
+        },
+        "strategy_specific_variant_counts": _strategy_specific_counts(runs, strategy_specific),
+        "thresholds": {
+            "high_rank_threshold": args.high_rank_threshold,
+            "low_rank_threshold": args.low_rank_threshold,
+        },
+    }
+    comparison_path = pathlib.Path(args.out_comparison)
+    comparison_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_yaml(yaml_summary, comparison_path)
+
+    print(f"Calibrated Jaccard matrix written to {args.out_jaccard}", file=sys.stderr)
+    print(
+        f"Calibrated strategy-specific variants written to {args.out_level_specific} "
+        f"({len(strategy_specific)} rows)",
+        file=sys.stderr,
+    )
+    print(f"Calibrated comparison summary written to {args.out_comparison}", file=sys.stderr)
+    return 0
+
+
 def _run_level_comparison(args: argparse.Namespace) -> int:
     """Run the historical annotation-level ranking comparison."""
     if args.position_run:
         print("ERROR: level comparison rejects --position-run", file=sys.stderr)
+        return 1
+    if args.position_calibrated_benchmark is not None:
+        print(
+            "ERROR: level comparison rejects --position-calibrated-benchmark",
+            file=sys.stderr,
+        )
         return 1
 
     score_column = args.score_column or "z_attribution"
@@ -1576,10 +1814,12 @@ def _run_level_comparison(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
-    """Entry point for ranking comparison."""
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for ranking comparison (``sys.argv[1:]`` when *argv* is None)."""
+    args = parse_args(argv)
     if args.comparison_axis == "position":
+        if args.position_calibrated_benchmark is not None:
+            return _run_calibrated_position_comparison(args)
         return _run_position_comparison(args)
     return _run_level_comparison(args)
 

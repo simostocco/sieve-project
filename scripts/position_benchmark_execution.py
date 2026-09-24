@@ -8,8 +8,10 @@ the paired benchmark stage DAG behind the public interface::
     python scripts/run_position_benchmark.py MANIFEST --execute-plan PLAN [--resume]
 
 See the "Phase 12C3B2B" section below for the DAG, post-validation, the
-calibration input hash gate, and the resume rules. The calibrated
-cross-strategy ranking comparison is NOT executed here (Phase 12C3C).
+calibration input hash gate, and the resume rules. Phase 12C3C appends one
+final stage, ``comparisons/calibrated_rankings``: the provenance-gated
+cross-strategy comparison of calibrated ``delta_rank`` rankings (see
+"Phase 12C3C" below).
 
 Execution authority
 -------------------
@@ -75,6 +77,9 @@ import yaml
 
 if __package__ in {None, ""}:
     from position_benchmark_manifest import (
+        CALIBRATED_COMPARISON_OUTPUT_NAMES,
+        CALIBRATED_RANKINGS_COMPARISON,
+        CALIBRATED_SCORE_COLUMN,
         CALIBRATION_RANKINGS_NAME,
         PAIRED_SCHEMA_VERSION,
         BenchmarkManifestError,
@@ -113,6 +118,9 @@ if __package__ in {None, ""}:
     )
 else:
     from .position_benchmark_manifest import (
+        CALIBRATED_COMPARISON_OUTPUT_NAMES,
+        CALIBRATED_RANKINGS_COMPARISON,
+        CALIBRATED_SCORE_COLUMN,
         CALIBRATION_RANKINGS_NAME,
         PAIRED_SCHEMA_VERSION,
         BenchmarkManifestError,
@@ -176,7 +184,12 @@ INPUT_FILE_KEYS = (
 )
 OPTIONAL_INPUT_FILE_KEYS = ("sex_map", "pc_map")
 RUN_ARGV_KEYS = ("train_argv", "explain_argv", "null_train_argv", "null_explain_argv")
+# Raw (real-only) comparisons. Kept under its historical name; the Phase
+# 12C3C calibrated comparison is added separately so raw bookkeeping (for
+# example the summary's raw_comparisons_completed) is unchanged.
 COMPARISON_KEYS = ("performance", "raw_rankings", "raw_attributions")
+CALIBRATED_COMPARISON_KEY = CALIBRATED_RANKINGS_COMPARISON
+PLAN_COMPARISON_KEYS = (*COMPARISON_KEYS, CALIBRATED_COMPARISON_KEY)
 INTERRUPT_GRACE_SECONDS = 30.0
 TERMINATE_GRACE_SECONDS = 10.0
 KILL_GRACE_SECONDS = 10.0
@@ -1457,9 +1470,9 @@ def _validate_plan_argv(plan: Mapping[str, Any]) -> None:
             )
         )
     comparisons = plan.get("comparisons")
-    if not isinstance(comparisons, Mapping) or set(comparisons) != set(COMPARISON_KEYS):
-        raise PlanAuthorityError(f"comparisons must have exactly {list(COMPARISON_KEYS)}")
-    for key in COMPARISON_KEYS:
+    if not isinstance(comparisons, Mapping) or set(comparisons) != set(PLAN_COMPARISON_KEYS):
+        raise PlanAuthorityError(f"comparisons must have exactly {list(PLAN_COMPARISON_KEYS)}")
+    for key in PLAN_COMPARISON_KEYS:
         argvs.append((f"comparisons.{key}.argv", comparisons[key].get("argv")))
     for name, argv in argvs:
         if (
@@ -1550,10 +1563,12 @@ def _path_sha(fingerprint: Mapping[str, Any]) -> dict[str, str]:
 #               null_explanation, pair_validation, calibration   (per run)
 #     benchmark/shared_null
 #     comparisons/performance, comparisons/raw_rankings, comparisons/raw_attributions
+#     comparisons/calibrated_rankings                             (Phase 12C3C)
 #
 # Execution stops at the first failure; there is no keep-going and no
-# retry-failed mode. B1/B2/B3 stay real-only raw comparisons; the calibrated
-# cross-strategy ranking comparison remains closed until Phase 12C3C.
+# retry-failed mode. B1/B2/B3 stay real-only raw comparisons. The final
+# calibrated comparison is the only stage that reads calibrated rankings
+# across strategies, and only through the provenance gate.
 #
 # Execution-provenance layout under ``<benchmark_root>/execution/``:
 #
@@ -1576,7 +1591,8 @@ NULL_VALIDATION_STAGE_ID = "benchmark/null_validation"
 SHARED_NULL_STAGE_ID = "benchmark/shared_null"
 SHARED_NULL_NAME = "shared_null_validation.yaml"
 EXECUTION_SUMMARY_NAME = "benchmark_execution_summary.yaml"
-EXECUTION_SUMMARY_SCHEMA_VERSION = 1
+# Version 2 (Phase 12C3C): the calibrated comparison became the final stage.
+EXECUTION_SUMMARY_SCHEMA_VERSION = 2
 MANIFESTS_DIRNAME = "manifests"
 LOGS_DIRNAME = "logs"
 STAGES_STATE_DIRNAMES = ("stages", LOGS_DIRNAME, MANIFESTS_DIRNAME)
@@ -1597,7 +1613,20 @@ RESOLVED_PLAN_INPUT = "resolved_plan"
 # block), so they are validated through that metadata instead.
 TRAIN_CONFIG_OVERRIDDEN_ARGS = ("split_plan",)
 PAIRED_CLASS_WEIGHTING_OFF = "off"
-CALIBRATED_GATE_STATUS = "not_executed_gate_closed_until_phase_12c3c"
+# Phase 12C3C. ``comparisons/calibrated_rankings`` runs
+# ``compare_ablation_rankings.py --position-calibrated-benchmark <root>
+# --score-column delta_rank``. It depends on ``benchmark/shared_null`` and every
+# ``runs/<id>/calibration`` record; its argv is held to the exact planned shape
+# (require_calibrated_comparison_argv); its inputs are named files only (never
+# the benchmark root or execution/ tree, which would be self-referential); and
+# post-validation requires the comparison YAML to report exactly the record
+# hashes this invocation accepted. Resume reuses the normal completed-stage
+# revalidation, so any calibration, pair, or shared-null record change
+# invalidates it through the dependency hashes.
+CALIBRATED_COMPARISON_STAGE_ID = f"comparisons/{CALIBRATED_COMPARISON_KEY}"
+EXECUTION_SUMMARY_STATUS = (
+    "paired_benchmark_complete_with_provenance_gated_calibrated_position_ranking_comparison"
+)
 _MISSING = "<missing>"
 
 
@@ -1709,6 +1738,7 @@ def build_benchmark_stages(plan: Mapping[str, Any]) -> list[BenchmarkStage]:
         )
     ]
     pair_ids: list[str] = []
+    calibration_ids: list[str] = []
     real_training_ids: list[str] = []
     real_ids: list[str] = []
     for run in plan["runs"]:
@@ -1790,6 +1820,7 @@ def build_benchmark_stages(plan: Mapping[str, Any]) -> list[BenchmarkStage]:
             ]
         )
         pair_ids.append(ids["pair_validation"])
+        calibration_ids.append(ids["calibration"])
         real_training_ids.append(ids["real_training"])
         real_ids.extend([ids["real_training"], ids["real_explanation"]])
     stages.append(
@@ -1808,8 +1839,12 @@ def build_benchmark_stages(plan: Mapping[str, Any]) -> list[BenchmarkStage]:
         "performance": tuple(real_training_ids),
         "raw_rankings": tuple(real_ids),
         "raw_attributions": tuple(real_ids),
+        # The calibrated comparison is the final scientific stage: it binds the
+        # shared-null record (which binds every pair record) and every
+        # calibration record, in plan order.
+        CALIBRATED_COMPARISON_KEY: (SHARED_NULL_STAGE_ID, *calibration_ids),
     }
-    for name in COMPARISON_KEYS:
+    for name in PLAN_COMPARISON_KEYS:
         comparison = plan["comparisons"][name]
         stages.append(
             BenchmarkStage(
@@ -1989,6 +2024,8 @@ def _input_specs(ctx: _ExecutionContext, stage: BenchmarkStage) -> list[IOSpec]:
         specs.append(("null_validation.yaml", null_validation_path(ctx.benchmark_root), "file"))
         return [*specs, resolved_plan]
     if stage.stage_type == "comparison":
+        if stage.stage_id == CALIBRATED_COMPARISON_STAGE_ID:
+            return [*_calibrated_comparison_input_specs(ctx), resolved_plan]
         return [*_comparison_input_specs(ctx, stage), resolved_plan]
     raise PlanAuthorityError(f"unknown stage type {stage.stage_type!r}")
 
@@ -2010,6 +2047,44 @@ def _comparison_input_specs(ctx: _ExecutionContext, stage: BenchmarkStage) -> li
         if _is_within(path, comparison_dir):
             continue
         specs.append((f"argv[{index}]", path, "directory" if path.is_dir() else "file"))
+    return specs
+
+
+def _calibrated_comparison_input_specs(ctx: _ExecutionContext) -> list[IOSpec]:
+    """Bind the named files the calibrated comparator reads, never a directory.
+
+    The calibrated argv names the benchmark root, which contains this stage's
+    own records, logs, and outputs, so the generic argv-token discovery would
+    fingerprint the executor's bookkeeping (self-reference). Instead every
+    consumed file is listed explicitly; the upstream completed records are
+    bound through dependency record hashes, not as inputs.
+    """
+    specs: list[IOSpec] = [
+        (PLAN_BINDING_NAME, ctx.execution_dir / PLAN_BINDING_NAME, "file"),
+        (SHARED_NULL_NAME, shared_null_validation_path(ctx.benchmark_root), "file"),
+    ]
+    for run in ctx.plan["runs"]:
+        run_id = run["run_id"]
+        real_training, real_explanation = _side_directories(run, "real")
+        specs.extend(
+            (f"{run_id}/{Path(path).name}", Path(path), "file")
+            for path in run["calibration"]["expected_outputs"]
+        )
+        specs.extend(
+            [
+                (f"{run_id}/real/config.yaml", real_training / "config.yaml", "file"),
+                (
+                    f"{run_id}/real/analysis_metadata.yaml",
+                    real_explanation / "analysis_metadata.yaml",
+                    "file",
+                ),
+                (
+                    f"{run_id}/{Path(run['calibration']['paired_compatibility']).name}",
+                    Path(run["calibration"]["paired_compatibility"]),
+                    "file",
+                ),
+            ]
+        )
     return specs
 
 
@@ -2748,6 +2823,82 @@ def _validate_comparison_stage(ctx: _ExecutionContext, stage: BenchmarkStage) ->
     for _, path, kind in _output_specs(ctx, stage):
         if kind == "file":
             _require_file(stage, path, checks)
+    if stage.stage_id == CALIBRATED_COMPARISON_STAGE_ID:
+        checks.extend(_validate_calibrated_comparison_outputs(ctx, stage))
+    return checks
+
+
+def _validate_calibrated_comparison_outputs(
+    ctx: _ExecutionContext, stage: BenchmarkStage
+) -> list[str]:
+    """Require the comparison YAML to report exactly the identities this executor accepted.
+
+    The comparator validated provenance on its own (it is also usable
+    standalone); this cross-check proves it validated the SAME plan binding,
+    shared-null record, calibration records, and pair-validation records that
+    this invocation accepted, so no substitute benchmark state can pass.
+    """
+    plan = ctx.plan
+    checks: list[str] = []
+    comparison_yaml = Path(plan["comparisons"][CALIBRATED_COMPARISON_KEY]["expected_outputs"][0])
+    summary = _load_stage_yaml(stage, comparison_yaml)
+    _check(stage, "comparison_mode", summary.get("comparison_mode", _MISSING), "calibrated", checks)
+    _check(stage, "score.column", _lookup(summary, "score.column"), CALIBRATED_SCORE_COLUMN, checks)
+    _check(stage, "score.sort_order", _lookup(summary, "score.sort_order"), "descending", checks)
+
+    shared = ctx.completed[SHARED_NULL_STAGE_ID]
+    plan_binding_path = ctx.execution_dir / PLAN_BINDING_NAME
+    expected_provenance = {
+        "benchmark_root": str(ctx.benchmark_root),
+        "resolved_plan_path": str(ctx.bound_plan_path),
+        "resolved_plan_sha256": ctx.verified.resolved_plan_sha256,
+        "plan_binding_path": str(plan_binding_path),
+        "plan_binding_sha256": sha256_file(plan_binding_path),
+        "repository_revision": plan["repository_revision"],
+        "manifest_file_sha256": plan["manifest_file_sha256"],
+        "shared_null_record_path": str(shared.record_path),
+        "shared_null_record_sha256": shared.record_sha256,
+        "shared_null_report_path": str(shared_null_validation_path(ctx.benchmark_root)),
+        "shared_null_report_sha256": shared.record["outputs"][SHARED_NULL_NAME]["sha256"],
+        "null_binding": _binding_identity(plan),
+    }
+    _check(
+        stage,
+        "execution_provenance",
+        summary.get("execution_provenance", _MISSING),
+        expected_provenance,
+        checks,
+    )
+
+    reported_runs = summary.get("runs")
+    planned_ids = sorted(run["run_id"] for run in plan["runs"])
+    if (
+        not isinstance(reported_runs, list)
+        or [run.get("run_id") if isinstance(run, Mapping) else None for run in reported_runs]
+        != planned_ids
+    ):
+        raise StagePostValidationError(
+            f"{stage.stage_id}: comparison runs do not equal the planned runs {planned_ids}"
+        )
+    for reported in reported_runs:
+        run_id = reported["run_id"]
+        calibration = ctx.completed[f"runs/{run_id}/calibration"]
+        pair = ctx.completed[f"runs/{run_id}/pair_validation"]
+        if sha256_file(pair.record_path) != pair.record_sha256:
+            raise StagePostValidationError(
+                f"{stage.stage_id}: pair-validation record changed after acceptance: "
+                f"{pair.record_path}"
+            )
+        rankings = calibration.record["outputs"][CALIBRATION_RANKINGS_NAME]
+        for label, expected in (
+            ("calibration_record_path", str(calibration.record_path)),
+            ("calibration_record_sha256", calibration.record_sha256),
+            ("pair_validation_record_path", str(pair.record_path)),
+            ("pair_validation_record_sha256", pair.record_sha256),
+            ("calibrated_ranking_path", rankings["path"]),
+            ("calibrated_ranking_sha256", rankings["sha256"]),
+        ):
+            _check(stage, f"runs.{run_id}.{label}", reported.get(label, _MISSING), expected, checks)
     return checks
 
 
@@ -2817,6 +2968,61 @@ def calibration_input_gate(ctx: _ExecutionContext, stage: BenchmarkStage) -> lis
             f"{stage.stage_id}: paired compatibility report is not passing"
         )
     return checks
+
+
+def require_calibrated_comparison_argv(plan: Mapping[str, Any], stage: BenchmarkStage) -> None:
+    """Require the calibrated comparison argv to be exactly its planned, narrow shape.
+
+    The only accepted command is ``compare_ablation_rankings.py
+    --comparison-axis position --position-calibrated-benchmark <this benchmark
+    root> --score-column delta_rank`` writing this stage's own three planned
+    outputs. Any ``--position-run``, null or raw-comparison path, other score
+    column, extra flag, or external benchmark root is refused.
+    """
+    root = benchmark_root_from_plan(plan)
+    comparison = plan["comparisons"][CALIBRATED_COMPARISON_KEY]
+    directory = Path(comparison["directory"])
+    outputs = [Path(path) for path in comparison["expected_outputs"]]
+    if (
+        directory != root / "comparisons" / CALIBRATED_COMPARISON_KEY
+        or [path.name for path in outputs] != list(CALIBRATED_COMPARISON_OUTPUT_NAMES)
+        or any(path.parent != directory for path in outputs)
+    ):
+        raise StageStateError(
+            f"{stage.stage_id}: planned calibrated comparison outputs are not its own directory"
+        )
+    argv = list(stage.argv or ())
+    if "--position-run" in argv:
+        raise StageStateError(f"{stage.stage_id}: calibrated comparison argv names --position-run")
+    expected = [
+        plan["runtime"]["python"],
+        str(Path(plan["repository_root"]) / "scripts" / "compare_ablation_rankings.py"),
+        "--comparison-axis",
+        "position",
+        "--position-calibrated-benchmark",
+        str(root),
+        "--score-column",
+        CALIBRATED_SCORE_COLUMN,
+        "--out-comparison",
+        str(outputs[0]),
+        "--out-jaccard",
+        str(outputs[1]),
+        "--out-level-specific",
+        str(outputs[2]),
+    ]
+    if argv != expected:
+        raise StageStateError(
+            f"{stage.stage_id}: calibrated comparison argv is not the exact planned shape "
+            f"(benchmark root {root}, score column {CALIBRATED_SCORE_COLUMN}, own outputs)"
+        )
+
+
+def _require_comparison_argv(plan: Mapping[str, Any], stage: BenchmarkStage) -> None:
+    """Apply the calibrated or the real-only argv guard to a comparison stage."""
+    if stage.stage_id == CALIBRATED_COMPARISON_STAGE_ID:
+        require_calibrated_comparison_argv(plan, stage)
+    else:
+        require_real_only_comparison(plan, stage)
 
 
 def require_real_only_comparison(plan: Mapping[str, Any], stage: BenchmarkStage) -> None:
@@ -2950,7 +3156,7 @@ def _execute_stage(ctx: _ExecutionContext, stage: BenchmarkStage) -> None:
     if stage.stage_type == "calibration":
         pre_checks = calibration_input_gate(ctx, stage)
     if stage.stage_type == "comparison":
-        require_real_only_comparison(ctx.plan, stage)
+        _require_comparison_argv(ctx.plan, stage)
     dependencies = _current_dependencies(ctx, stage)
     inputs = _compute_inputs(ctx, stage)
 
@@ -3103,7 +3309,7 @@ def _revalidate_completed_stage(ctx: _ExecutionContext, stage: BenchmarkStage) -
         if stage.stage_type == "calibration":
             calibration_input_gate(ctx, stage)
         if stage.stage_type == "comparison":
-            require_real_only_comparison(ctx.plan, stage)
+            _require_comparison_argv(ctx.plan, stage)
         _POST_VALIDATORS[stage.stage_type](ctx, stage)
     except _ORDINARY_STAGE_ERRORS as error:
         raise mismatch(f"post-validation no longer passes: {error}") from error
@@ -3251,7 +3457,11 @@ def build_execution_summary(
     stages: Sequence[BenchmarkStage],
     completed_ids: Sequence[str],
 ) -> dict[str, Any]:
-    """Return the deterministic benchmark execution summary (no timestamps)."""
+    """Return the deterministic benchmark execution summary (no timestamps).
+
+    It claims no more than the executed DAG: a paired benchmark whose final
+    stage was the provenance-gated calibrated position ranking comparison.
+    """
     done = set(completed_ids)
 
     def count(stage_type: str, side: str | None = None) -> int:
@@ -3265,7 +3475,7 @@ def build_execution_summary(
 
     return {
         "schema_version": EXECUTION_SUMMARY_SCHEMA_VERSION,
-        "status": "raw_paired_benchmark_complete",
+        "status": EXECUTION_SUMMARY_STATUS,
         "resolved_plan_sha256": resolved_plan_sha256,
         "repository_revision": ctx_plan["repository_revision"],
         "manifest_file_sha256": ctx_plan["manifest_file_sha256"],
@@ -3282,7 +3492,10 @@ def build_execution_summary(
         "raw_comparisons_completed": [
             name for name in COMPARISON_KEYS if f"comparisons/{name}" in done
         ],
-        "calibrated_cross_strategy_comparison": CALIBRATED_GATE_STATUS,
+        "calibrated_position_ranking_comparison": (
+            "completed" if CALIBRATED_COMPARISON_STAGE_ID in done else "not_run"
+        ),
+        "calibrated_score_column": CALIBRATED_SCORE_COLUMN,
     }
 
 

@@ -5019,3 +5019,401 @@ whether and how the calibrated per-strategy outputs (hashed here, bound to
 passing pair validations and the shared-null stage) may enter a
 cross-strategy calibrated ranking comparison, opening
 `DEFERRED_CALIBRATED_SCORE_COLUMNS` only under that phase's contract.
+
+## Phase 12C3C - Provenance-Gated Calibrated Positional Comparison
+
+Goal: open exactly one comparison gate - provenance-valid `delta_rank` ->
+cross-positional-strategy ranking comparison - without changing any ranking,
+Jaccard, bootstrap, or attribution mathematics. Starting point `3025dd9`.
+
+Scientific decision. Only `delta_rank` (`median_rank_null_boot -
+rank_real`, sorted descending; higher means the real model promoted the
+variant more strongly relative to its bootstrap-null rank distribution) is
+accepted as a calibrated cross-strategy score. `z_attribution`,
+`p_rank_boot`, `fdr_rank_boot`, `rank_real`, `median_rank_null_boot`,
+`iqr_rank_null_boot`, `corrected_rank`, `empirical_p*`, `fdr_*`, and
+`at_resolution_floor` stay diagnostic columns in the calibration outputs and
+are rejected as comparison scores. The `delta_rank` computation is untouched.
+
+Files changed:
+
+- NEW `scripts/position_benchmark_calibrated.py`: read-only provenance gate
+  (`load_calibrated_position_benchmark`, `require_unchanged`, the
+  `CalibratedBenchmark` / `CalibratedRunProvenance` results, and the B2B
+  dependency-ID helpers).
+- NEW `tests/test_position_benchmark_calibrated.py`.
+- `scripts/compare_ablation_rankings.py`: `--position-calibrated-benchmark`,
+  calibrated resolver and run path, updated raw `delta_rank` error, optional
+  `argv` for `parse_args`/`main`.
+- `scripts/position_benchmark_manifest.py`: v2 `comparisons.calibrated_rankings`
+  and one v2 human-summary line; the v2 `reserved_comparisons` placeholder is
+  removed.
+- `scripts/position_benchmark_execution.py`: final calibrated stage, named
+  input specs, argv guard, post-validation, summary schema 2.
+- `scripts/run_position_benchmark.py`: execution summary wording.
+- `tests/test_compare_ablation_rankings.py`,
+  `tests/test_position_benchmark_execution.py`,
+  `tests/test_position_benchmark_paired_manifest.py`,
+  `tests/test_position_benchmark_orchestration.py`: updated and new tests.
+- this log.
+
+Protected files not modified: `scripts/bootstrap_null_calibration.py`,
+`src/explain/variant_ranking.py`, positional runtimes, attention,
+Integrated Gradients, `scripts/train.py`, `scripts/explain.py`. The audit
+and contract documents are unchanged.
+
+### Raw gate stays closed
+
+`--position-run RUN_ID CONFIG RANKING ANALYSIS_METADATA` is unchanged: it
+accepts only `rank`, `mean_attribution`, and `max_attribution`.
+`DEFERRED_CALIBRATED_SCORE_COLUMNS` has exactly its previous contents and
+still contains `delta_rank`. The only raw-mode change is the error text:
+`--position-run ... --score-column delta_rank` now says that calibrated
+position scores need `--position-calibrated-benchmark BENCHMARK_ROOT`;
+other calibration columns say that only `delta_rank` is open, and only
+through that mode. Both messages keep the substring "Phase 12C" that the
+existing raw tests assert. The raw output schema, Jaccard TSV, and
+strategy-specific TSV are unchanged (the per-run count loop moved into the
+shared helper `_strategy_specific_counts`, which gives the same output).
+
+### New calibrated CLI
+
+```text
+compare_ablation_rankings.py --comparison-axis position \
+    --position-calibrated-benchmark <benchmark_root> --score-column delta_rank \
+    --out-comparison ... --out-jaccard ... --out-level-specific ...
+```
+
+- `BENCHMARK_ROOT` is `<output_root>/<benchmark_id>/<level>`, not `execution/`,
+  and must resolve exactly to the root derived from the bound plan.
+- `--score-column delta_rank` must be given explicitly; any other value
+  (including `DELTA_RANK` and a missing flag) rejects.
+- The flag is mutually exclusive with `--position-run`, and it rejects
+  `--ranking-dir` and `--rankings`. Level mode rejects it.
+- The run set comes only from `plan["runs"]`, in plan order. No calibrated
+  CSV path is ever taken from the command line.
+
+### Provenance chain (`position_benchmark_calibrated.py`)
+
+The module imports only the standard library, PyYAML,
+`position_benchmark_records`, and `position_benchmark_pairing` (which
+imports `position_benchmark_metadata` and numpy). It does not import the
+executor or planner, because their `src` imports load torch. A test runs the
+import in a subprocess and checks that neither torch nor the executor module
+was loaded. The stage-layout constants and the B2B dependency-ID rules it
+needs are copied into the module, and tests require them to equal the
+executor/planner constants and `build_benchmark_stages` output, for both CV
+and single-split plans.
+
+1. Plan authority. It reads `execution/resolved_plan.yaml` and computes the
+   SHA-256 of those exact bytes. It requires `schema_version == 2` and
+   requires `plan_binding.yaml` `schema_version` (1), `resolved_plan_path`,
+   `resolved_plan_sha256`, `repository_revision`, and `manifest_file_sha256`
+   to match. It also requires `planned_benchmark_root(plan)` (same rule as
+   `benchmark_root_from_plan`) to equal the resolved supplied root.
+2. Record policy. Every record goes through `require_completed_record`
+   (schema-valid, completed, canonical path). It must have no sibling
+   `running` or `failed` record, and its `stage_id`, `stage_type`, `side`,
+   `run_id`, plan SHA, revision, and manifest SHA must be exact. Dependency
+   IDs must match the B2B order exactly. Every dependency must name the
+   canonical record path and carry that record's current SHA; for records
+   this gate already accepted, it must be the SHA they were accepted at.
+3. `benchmark/null_validation`: in-process `validate_null_pair`. It is
+   accepted so that calibration and shared-null dependencies on it can be
+   checked by hash.
+4. Pair validation, per run: in-process
+   `require_compatible_real_null_pair`. Dependencies are real/null
+   training and explanation, `null_validation`, and every earlier pair.
+   The only output is `paired_compatibility.yaml` at the planned path, and
+   its current bytes must equal the recorded output. The report must have
+   `compatible: true`, the right `run_id`, and a null binding equal to the
+   plan's identity fields. The real `config.yaml` and
+   `analysis_metadata.yaml` must be the planned files, byte-identical to
+   the pair record's input fingerprints.
+5. Calibration, per run: `execution.kind` is subprocess, argv is exactly the
+   planned `calibration.argv`, `cwd == repository_root`, and `exit_code == 0`.
+   Dependencies are exactly `[pair_validation, null_validation]`. The inputs
+   `real/sieve_variant_rankings.csv`, `real/analysis_metadata.yaml`, and
+   `null/attributions.npz` must equal the pair record's input fingerprints,
+   and input `paired_compatibility.yaml` must equal the pair output (path,
+   SHA, size). Outputs must be the planned `expected_outputs`, in order and
+   at the same paths: calibrated CSV, gene stats, summary. Current bytes
+   must equal the recorded fingerprints, so an external CSV is never
+   accepted.
+6. Summary recheck, reading existing keys only and recomputing no
+   statistics: `n_bootstrap`, `n_null_samples`, `genome_build`,
+   `excluded_sex_chroms`, `per_gene.gene_delta_rank_aggregation`,
+   `n_real_variants_missing_from_null == 0`, and `n_real_variants` equal to
+   the calibrated CSV row count. Comparison is type-strict (`True` does not
+   equal `1`).
+7. Shared null: in-process `require_shared_null_across_pairs`.
+   Dependencies are exactly every planned pair validation in plan order,
+   then `benchmark/null_validation`, which is the B2B dependency list for
+   this stage. Each dependency SHA must equal the accepted pair record SHA.
+   Each `<run>/paired_compatibility.yaml` input must equal that pair's
+   output. `shared_null_validation.yaml` bytes must equal the recorded
+   output. Re-running `require_shared_null_across_pairs` on the current
+   pair reports must reproduce the saved report after YAML normalisation,
+   with a null binding equal to the plan identity and `run_ids` equal to the
+   planned order.
+8. Files re-hashed now: bound plan, `plan_binding.yaml`, every record used,
+   real `config.yaml` and `analysis_metadata.yaml`, `paired_compatibility.yaml`,
+   calibrated CSV, summary, gene stats, and `shared_null_validation.yaml`.
+   Checkpoints and `attributions.npz` are not re-hashed; their identities
+   are bound through the unchanged pair and calibration record bytes, and
+   full output revalidation stays with executor `--resume`.
+9. After parsing, the comparator calls `require_unchanged`, which re-hashes
+   every consumed file before any output is written. This closes the window
+   between hashing and parsing.
+
+### Comparator
+
+The comparator reuses `position_strategy_identity`,
+`_validate_position_analysis_metadata`, `_validate_position_ranking_provenance`
+(the calibrated CSV keeps the raw provenance columns because bootstrap starts
+from `real_df.copy()`), `extract_comparison_context`,
+`extract_explanation_context`, and the `require_compatible_*` checks,
+unchanged. The REAL config and explanation metadata remain the positional
+strategy authority.
+
+`load_position_rankings` and `_load_position_run` gained keyword parameters
+`resolve_score_column` and `sort_orders`. Their defaults are the raw gate, so
+existing calls behave as before. Calibrated mode passes
+`_resolve_calibrated_position_score_column`, which accepts only exact
+`delta_rank`, requires the column to exist, and relies on the existing
+strict parser to reject empty, non-numeric, NaN, and Inf values, plus
+`CALIBRATED_POSITION_SCORE_COLUMNS = {"delta_rank": "descending"}`. Variant
+keys (explicit `variant_id`, otherwise `chromosome:position_gene_id`),
+duplicate rejection, the `(-score, variant_id)` tie-break, exact
+variant-set equality across strategies (no intersection, no dropping), and
+the unchanged `compute_position_jaccard_matrices` /
+`find_strategy_specific_variants` / `compute_jaccard` all apply. Bootstrap
+chromosome normalisation is accepted as part of the calibrated artifacts,
+but calibrated runs must still agree exactly with each other.
+
+The calibrated YAML adds `comparison_mode: calibrated`, `score` (`delta_rank`,
+`descending`), and an `execution_provenance` block with the benchmark root,
+bound plan path and SHA, plan binding path and SHA, revision, manifest SHA,
+shared-null record path and SHA, shared-null report path and SHA, and the
+null binding identity. Each run records config, analysis metadata,
+calibrated ranking, calibration summary, calibration record, pair record,
+and paired report paths with SHAs, plus `n_variants`. Compatibility, top-k,
+universe, Jaccard, strategy-specific, and threshold sections are kept. There
+are no timestamps. The raw YAML is unchanged.
+
+### Planner
+
+For v2 only, `comparisons.calibrated_rankings` has a `directory`,
+`score_column: delta_rank`, and the exact argv
+`[python, compare_ablation_rankings.py, --comparison-axis, position,
+--position-calibrated-benchmark, <benchmark_root>, --score-column, delta_rank,
+--out-comparison, ..., --out-jaccard, ..., --out-level-specific, ...]`. It
+writes to `comparisons/calibrated_rankings/` the files
+`position_calibrated_ranking_comparison.yaml`,
+`position_calibrated_ranking_jaccard.tsv`, and
+`position_calibrated_strategy_specific_variants.tsv`. No top-k or
+threshold flags are passed, so the comparator defaults apply as they do for
+raw rankings. The entry is added before existing-output inspection and
+collision checks, so a non-empty directory fails (or warns with
+`--allow-existing-outputs`), a file at that path fails, and a null artifact
+inside it collides. The v2 `reserved_comparisons` placeholder for the same
+directory was removed. The v2 human summary gains one
+`calibrated_rankings:` command line.
+
+v1 unchanged: a check that imported the HEAD (`3025dd9`) planner beside the
+working-tree planner showed that v1 plan YAML bytes and v1 human-summary
+text are byte-identical for CV and single-split fixtures. Committed tests
+assert that v1 `comparisons` contains exactly the three raw keys. The same
+check showed that the only v2 plan differences are `comparisons`
+(added `calibrated_rankings`) and the removed `reserved_comparisons`, and
+that the v2 summary gains only the `calibrated_rankings:` line.
+
+### Executor
+
+- `COMPARISON_KEYS` still names the raw comparisons.
+  `PLAN_COMPARISON_KEYS` adds `calibrated_rankings`, and plan loading
+  requires exactly that set.
+- The final stage `comparisons/calibrated_rankings` (type `comparison`,
+  side `comparison`) comes after the raw comparisons. Its dependencies are
+  `benchmark/shared_null` followed by every `runs/<id>/calibration` in plan
+  order, which makes it the final scientific stage.
+- Inputs are named files only, with no argv-token discovery:
+  `plan_binding.yaml`, `shared_null_validation.yaml`, and, per run, the
+  three calibration outputs, real `config.yaml`, real
+  `analysis_metadata.yaml`, and `paired_compatibility.yaml`, plus the bound
+  plan. The benchmark root, `execution/`, `stages/`, `logs/`, and
+  `manifests/` are never fingerprinted as trees. Upstream records are bound
+  through dependency SHAs.
+- `require_calibrated_comparison_argv` requires the exact planned argv:
+  this benchmark root, `delta_rank`, and this stage's own three outputs in
+  its own directory. It rejects `--position-run`, null or raw-comparison
+  paths, other score columns, extra flags, `execution/`, and external
+  roots. Raw stages keep `require_real_only_comparison`.
+- Post-validation runs after exit 0 and after all planned outputs exist.
+  It requires `comparison_mode == calibrated`, `score.column == delta_rank`,
+  `score.sort_order == descending`, and `execution_provenance` exactly
+  equal to the identities this invocation accepted (plan, binding SHA,
+  revision, manifest, shared-null record and report SHAs, null binding).
+  The reported runs must equal the planned run IDs, and each run's
+  calibration record, pair record, and calibrated ranking path and SHA
+  must equal `ctx.completed`. The pair record is re-hashed against its
+  accepted SHA. Only then are outputs fingerprinted and the completed
+  record published.
+- Resume reuses the normal completed-stage revalidation. Any change to a
+  calibration, pair, or shared-null record fails through dependency SHAs,
+  and post-validation reruns.
+- Execution summary `schema_version` is now 2, with status
+  `paired_benchmark_complete_with_provenance_gated_calibrated_position_ranking_comparison`,
+  `calibrated_position_ranking_comparison: completed`, and
+  `calibrated_score_column: delta_rank`. The raw completion fields are
+  kept. The old `calibrated_cross_strategy_comparison` field and
+  `CALIBRATED_GATE_STATUS` were removed. The CLI prints a matching line.
+
+### Standalone mode
+
+Standalone calibrated comparison runs the same full record validation. It
+needs no live git checkout and takes no execution lock. It proves
+consistency with the saved execution provenance, meaning the files read now
+are the bytes the saved records describe and the records form the planned
+DAG. It does not cryptographically authenticate who wrote the records
+(unsigned YAML). The tests forge consistent records on purpose to isolate
+single defects, which shows this limit. The executor-run stage is the
+authoritative production result: it holds the lock, runs the repository
+gate, and cross-checks the reported record SHAs against the records it
+accepted itself.
+
+### Test fixtures
+
+- `_fake_explain` now writes a realistic ranking CSV (`chromosome`,
+  `position`, `gene_name`, `gene_id`, `mean_attribution`, `max_attribution`,
+  and the three provenance columns) with six variants in an order set by
+  the output directory, so strategies rank differently. The IG block now
+  includes `absolute_position_encoding`, `relative_position_encoding`,
+  `chromosome_encoding` (from `resolved_position_encoding_from_dict`, as
+  `explain.py` derives them), and `position_encoding_metadata_source:
+  reconstructed_resolved_config`.
+- `_fake_bootstrap` copies the real ranking rows and appends deterministic
+  `rank_real`, `median_rank_null_boot`, `iqr_rank_null_boot`, `delta_rank`,
+  `p_rank_boot`, `fdr_rank_boot`, and `at_resolution_floor`. Its summary
+  `n_real_variants` is the row count. It uses stand-in values, not
+  bootstrap statistics.
+- The fake world runs the REAL calibrated comparator in process for the
+  calibrated stage and returns its exit code. The executor DAG tests
+  therefore exercise the full provenance gate against records the executor
+  just wrote. Production bootstrap code is not touched.
+
+### Compatibility effects
+
+- Raw position mode, level mode (including historical `delta_rank`), and v1
+  planning are unchanged.
+- v2 plans now include `comparisons.calibrated_rankings` and no longer
+  include `reserved_comparisons`. Plans generated before this phase fail
+  `_validate_plan_argv` and the rebuild comparison, and their
+  `repository_revision` would not match anyway.
+- The production plan must be regenerated after the final Phase 12C3C
+  commit.
+- Execution summary schema 1 is now schema 2.
+
+### Tests and checks actually run (environment `sieve-posenc`)
+
+- New `tests/test_position_benchmark_calibrated.py`: 88 passed. It builds
+  one completed fake benchmark per module and restores every file's bytes
+  after each test. Coverage: mirrored constants, dependency IDs, and root
+  derivation equal the executor for CV and single split; the light-import
+  subprocess check; the valid benchmark passes with exact provenance; the
+  executor-run stage output equals a standalone rerun; Jaccard and
+  strategy-specific outputs equal the pure functions (and are
+  non-trivial); descending sort; `variant_id` tie-break; only `delta_rank`
+  accepted (12 rejected values); `--position-run` and level inputs
+  rejected; at least two runs; run set from the plan (a stray unplanned
+  calibration is ignored); universe mismatch, duplicates, a missing
+  `delta_rank` column, and non-numeric, empty, NaN, and plus/minus Inf
+  values rejected; change during comparison detected. Every item in the
+  provenance failure list rejects individually: missing or changed bound
+  plan, wrong binding SHA/revision/manifest, root mismatch, `execution/`
+  as root, extra planned run, missing planned calibration; shared-null
+  record missing, running/failed sibling, corrupt, incomplete deps, extra
+  dep, dependency hash, callable/type/plan changes, output fingerprint,
+  report bytes, wrong null binding, wrong run order; pair record missing,
+  changed (a cosmetic edit breaks dependency hashes), wrong callable,
+  incompatible report, wrong report null binding, changed paired report;
+  calibration record missing, running/failed sibling, changed inputs, pair
+  output link, argv, cwd, dependency order and hash, wrong or external
+  output path, changed CSV/summary/gene stats; wrong config and analysis
+  metadata bytes; eight summary mismatches including
+  `n_real_variants_missing_from_null != 0` and `n_bootstrap: true`; a
+  concise CLI error.
+- `tests/test_compare_ablation_rankings.py`: 17 -> 28 collected, all passed.
+  The new raw and level regressions cover: exact
+  `DEFERRED_CALIBRATED_SCORE_COLUMNS` and raw columns; raw `delta_rank`
+  pointing to calibrated mode; other calibration columns rejected; the
+  default resolver still rejects `delta_rank`; the raw plus calibrated flag
+  combination rejected; the exact raw YAML key schema and TSV headers with
+  Jaccard and strategy-specific values equal to the pure functions; level
+  mode rejecting the new flag; level `delta_rank` still descending through
+  `main`.
+- `tests/test_position_benchmark_execution.py`: 240 -> 266 collected, all
+  passed. The final DAG includes `comparisons/calibrated_rankings`, and
+  the calibrated stage runs the real comparator. New tests cover: exact
+  dependencies and argv; argv guard rejections (7 cases); named-input-only
+  binding with no `execution/` self-reference; 10 post-validation identity
+  mismatches, each leaving a failed record and no summary; stage exit
+  failure; the comparator provenance gate failing on a CSV changed after
+  input hashing; resume rejecting tampered calibration, pair, and
+  shared-null records and a changed calibrated output; resume rerunning
+  calibrated post-validation.
+- `tests/test_position_benchmark_paired_manifest.py`: 68 -> 72 collected,
+  all passed. Covered: the calibrated entry has exact directory,
+  `score_column`, argv, and outputs; no threshold flags; `reserved_comparisons`
+  removed; non-empty directory fails or warns; a file at the directory path
+  fails; a null artifact inside it collides; v2 summary line.
+- `tests/test_position_benchmark_orchestration.py`: 43 collected, all passed.
+  It now asserts that v1 has exactly the three raw comparisons and checks
+  the new execution summary lines.
+- Focused set (calibrated, compare_ablation_rankings, position_benchmark
+  rankings/paired_manifest/manifest/orchestration/execution/records/pairing/
+  performance/attributions/metadata, bootstrap_null_calibration, split_plan,
+  train_split_plan, dataset_provenance, null_lineage): 1090 passed,
+  6 warnings.
+- Full suite: 2418 passed, 0 failed, 0 skipped, 7 warnings, in 332.40s.
+  The previous log had 2289 passed and 7 warnings; the difference is +129
+  new tests (88 + 11 + 26 + 4). The warnings are the pre-existing ones.
+- v1 byte check against the HEAD planner (scratch script, not committed):
+  identical plan YAML and human summary for CV and single split.
+- `py_compile` passes on all changed Python files. `git diff --check` is
+  clean.
+- Lint and format. New files and files that were clean at HEAD
+  (`position_benchmark_calibrated.py`, its test,
+  `position_benchmark_manifest.py`, `position_benchmark_execution.py`,
+  `run_position_benchmark.py`, and the paired-manifest, execution, and
+  orchestration tests) pass `ruff check`, `black --check`, and
+  `isort --check-only`. `scripts/compare_ablation_rankings.py` and
+  `tests/test_compare_ablation_rankings.py` already failed at HEAD (Ruff
+  69 and 1 findings; Black 15 and 1 hunks; isort 0 and 1). Their Ruff rule
+  sets and Black diff lines are identical to HEAD after this change, so the
+  change adds 0 findings. Neither file was reformatted as a whole.
+
+### Known limitations
+
+- Standalone calibrated comparison proves consistency with unsigned records,
+  not authorship. A cosmetic edit to a leaf record that no other record
+  hashes (the calibration or shared-null record) changes no validated field,
+  so standalone mode cannot detect it. Its SHA is reported in the output
+  YAML, and executor `--resume` rejects it through the calibrated stage's
+  dependency hashes.
+- The stage-layout constants and B2B dependency rules are copied into the
+  lightweight module to avoid importing the training stack. Equality tests
+  lock them, so a future executor DAG change must update both places.
+- The fake bootstrap values are deterministic stand-ins. The executor tests
+  show the gate and comparator wiring, not calibration statistics (those
+  stay covered by `tests/test_bootstrap_null_calibration.py`).
+- No production plan was generated and no benchmark, training, explanation,
+  or bootstrap was run. The production plan must be regenerated after the
+  final Phase 12C3C commit.
+
+## Next planned phase
+
+Regenerate the production schema-v2 plan at the reviewed Phase 12C3C commit
+and, only under separate explicit authorization, execute the paired
+benchmark through `run_position_benchmark.py --execute-plan`. Downstream
+reconstruction and documentation follow the AGENTS.md commit sequence.

@@ -249,6 +249,8 @@ def test_b1_b2_b3_commands_preserve_manifest_order_and_output_paths(tmp_path):
     b2 = comparisons["raw_rankings"]["argv"]
     assert _argv_after(b2, "--score-column") == POSITION_SCORE_COLUMN
     assert "delta_rank" not in b2
+    # Phase 12C3C adds the calibrated comparison to schema-v2 plans only.
+    assert list(comparisons) == ["performance", "raw_rankings", "raw_attributions"]
     assert "position_ranking_jaccard.tsv" in b2[-3]
     b3 = comparisons["raw_attributions"]["argv"]
     assert b3.count("--position-run") == 2
@@ -519,8 +521,8 @@ def _fake_result() -> dict:
         "resolved_plan_sha256": "a" * 64,
         "repository_revision": "b" * 40,
         "n_runs": 2,
-        "n_stages": 17,
-        "completed_stages": 17,
+        "n_stages": 18,
+        "completed_stages": 18,
         "real_training_completed": 2,
         "null_training_completed": 2,
         "real_explanations_completed": 2,
@@ -529,11 +531,13 @@ def _fake_result() -> dict:
         "calibrations_completed": 2,
         "shared_null_validation": "passed",
         "raw_comparisons_completed": ["performance", "raw_rankings", "raw_attributions"],
+        "calibrated_position_ranking_comparison": "completed",
+        "calibrated_score_column": "delta_rank",
     }
     return {
         "summary": summary,
         "summary_path": "/x/summary.yaml",
-        "executed": ["s"] * 17,
+        "executed": ["s"] * 18,
         "reused": [],
     }
 
@@ -554,9 +558,12 @@ def test_execute_plan_invokes_executor_with_exact_arguments(tmp_path, capsys, mo
     )
     assert calls == [(plan, manifest, False), (plan, manifest, True)]
     out = capsys.readouterr().out
-    assert "POSITION BENCHMARK EXECUTION COMPLETE" in out
-    assert "Calibrated cross-strategy ranking comparison: NOT executed" in out
-    assert "calibrated cross-strategy ranking complete" not in out.lower()
+    assert (
+        "POSITION BENCHMARK EXECUTION COMPLETE (paired benchmark with provenance-gated "
+        "calibrated position ranking comparison)"
+    ) in out
+    assert "Raw comparisons completed: performance, raw_rankings, raw_attributions" in out
+    assert "Calibrated position ranking comparison (delta_rank): completed" in out
 
 
 @pytest.mark.parametrize(
