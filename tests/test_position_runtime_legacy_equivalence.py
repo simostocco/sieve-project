@@ -1,10 +1,15 @@
 import copy
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn as nn
+import yaml
 
+from scripts import explain, train
 from src.encoding import relative_position_bucket
+from src.encoding.chunked_dataset import collate_chunks
+from src.encoding.levels import AnnotationLevel
 from src.models.attention import PositionAwareSparseAttention
 from src.models.feature_composition import compose_legacy_variant_features_torch
 from src.models.position_runtime import (
@@ -682,3 +687,113 @@ def test_legacy_checkpoint_upgrade_preserves_overlapping_position_bias_rows():
         if key.endswith("position_bias.weight"):
             assert torch.equal(loaded_state[key][:32], tensor)
             assert torch.equal(loaded_state[key][32], destination_before[key][32])
+
+
+# ---------------------------------------------------------------------------
+# Thesis RQ1.1: backward compatibility against upstream dev on test_data/small.
+#
+# Reference logits were produced once by upstream/dev @ 2366b59 (its own
+# scripts/train.py::create_model and scripts/explain.py loading path) on all
+# 20 samples of test_data/small, one 3000-variant chunk per sample, rounded to
+# 6 decimals.
+# ---------------------------------------------------------------------------
+
+L3_RUN_DIR = Path(__file__).parent.parent / "test_data" / "small" / "test_model" / "L3_run"
+
+# Configuration G, no positional flags, torch.manual_seed(0) before construction.
+DEV_CONFIG_G_INIT_LOGITS = [
+    -0.158881, -0.144935, -0.280305, -0.382656, -0.199138, -0.12525, -0.363697,
+    0.100238, -0.215147, -0.166547, -0.169657, -0.29638, -0.129942, -0.087818,
+    -0.219023, -0.150283, -0.228002, -0.174881, -0.294601, -0.29265,
+]
+# L3_run/fold_0/best_model.pt, the only L3_run checkpoint in the current key layout.
+DEV_L3_FOLD0_BEST_LOGITS = [
+    -7.724607, -7.433724, -5.739541, -7.755433, -3.979452, -7.729094, -4.753631,
+    -8.13548, -7.656786, -4.255435, -8.664274, -8.062607, -10.173481, -10.213806,
+    -7.66269, -8.016027, -8.322154, -8.940463, -8.499332, -7.539481,
+]
+# The other three L3_run files predate d74d4b5 (Feb 2026), whose classifier
+# lost its leading Flatten, so their classifier keys are .1/.4 instead of .0/.3.
+# Only fold_0/best_model.pt was remapped (588d208). Upstream dev "loads" them
+# with strict=False, silently leaving the classifier randomly initialised; this
+# branch rejects them. They are reported, not modified.
+_PRE_REMAP_CLASSIFIER_KEYS = pytest.mark.xfail(
+    raises=ValueError,
+    strict=True,
+    reason=(
+        "historical checkpoint uses the pre-d74d4b5 classifier keys "
+        "(classifier.classifier.1/.4); strict reconstruction rejects it"
+    ),
+)
+
+
+def _small_data_logits(model, dataset) -> torch.Tensor:
+    batch = collate_chunks([dataset[i] for i in range(len(dataset))])
+    model.eval()
+    with torch.no_grad():
+        logits, _ = model(
+            batch["features"],
+            batch["positions"],
+            batch["gene_ids"],
+            batch["mask"],
+            chrom_ids=batch["chrom_ids"],
+        )
+    return logits.flatten()
+
+
+def test_rq1_1_training_model_without_position_config_matches_upstream_dev(
+    small_dataset, config_g_args
+):
+    args = train.parse_args(["--level", "L3", *config_g_args])
+    config = train.prepare_training_position_encoding(
+        args, AnnotationLevel.L3, num_chromosomes=small_dataset.num_chromosomes
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        model = train.create_training_model(
+            args=args,
+            resolved_position_encoding=config,
+            num_genes=small_dataset.num_genes,
+            num_chromosomes=small_dataset.num_chromosomes,
+            num_covariates=0,
+        )
+
+    assert args.position_preset == "legacy"
+    torch.testing.assert_close(
+        _small_data_logits(model.base_model, small_dataset),
+        torch.tensor(DEV_CONFIG_G_INIT_LOGITS),
+    )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "dev_logits"),
+    [
+        pytest.param("fold_0/best_model.pt", DEV_L3_FOLD0_BEST_LOGITS, id="fold_0-best"),
+        pytest.param(
+            "fold_0/last_model.pt", None, marks=_PRE_REMAP_CLASSIFIER_KEYS, id="fold_0-last"
+        ),
+        pytest.param(
+            "fold_1/best_model.pt", None, marks=_PRE_REMAP_CLASSIFIER_KEYS, id="fold_1-best"
+        ),
+        pytest.param(
+            "fold_1/last_model.pt", None, marks=_PRE_REMAP_CLASSIFIER_KEYS, id="fold_1-last"
+        ),
+    ],
+)
+def test_rq1_1_historical_l3_checkpoint_loads_and_infers_like_upstream_dev(
+    small_dataset, checkpoint_name, dev_logits
+):
+    config = yaml.safe_load((L3_RUN_DIR / "config.yaml").read_text())
+    checkpoint = torch.load(
+        L3_RUN_DIR / checkpoint_name, weights_only=False, map_location="cpu"
+    )
+
+    reconstruction = explain._reconstruct_model_for_explanation(
+        config, checkpoint, small_dataset
+    )
+
+    assert reconstruction.is_new_schema is False
+    torch.testing.assert_close(
+        _small_data_logits(reconstruction.base_model, small_dataset),
+        torch.tensor(dev_logits),
+    )
