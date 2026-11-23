@@ -22,6 +22,7 @@ from src.encoding.position_config import (
     ResolvedIGMode,
 )
 from src.explain.gradients import ContentSIEVEWrapper
+from src.models.chunked_sieve import build_sample_covariates
 from src.models.position_runtime import (
     NoAbsolutePositionRuntime,
     NoRelativePositionRuntime,
@@ -600,6 +601,32 @@ THESIS_STRATEGIES = {
 }
 
 
+def _active_num_covariates(args) -> int:
+    """Active covariates counted as train.py does: sex only with --sex-map, PCs only with --pc-map."""
+    return (1 if args.sex_map is not None else 0) + (
+        args.num_pcs if args.pc_map is not None else 0
+    )
+
+
+def _collate_active_inputs(num_covariates: int):
+    """``collate_chunks`` restricted to the inputs the model actually uses.
+
+    ``collate_chunks`` always adds ``sex`` metadata, which ``attribute_batch()``
+    rejects for a model without covariates; training and explain.py simply
+    ignore it in that case. Only that unused ``sex`` key is dropped from the
+    in-memory batch. An explicit ``covariates`` tensor is never dropped, so an
+    incompatible configuration still fails ``attribute_batch()`` validation.
+    """
+
+    def collate(batch):
+        collated = collate_chunks(batch)
+        if num_covariates == 0:
+            del collated["sex"]
+        return collated
+
+    return collate
+
+
 def _config_g_training_model(dataset, config_g_args, axes):
     """Resolve, serialise and build the chunked model through the train.py steps."""
     args = _custom_args(**axes, extra=config_g_args)
@@ -623,7 +650,7 @@ def _config_g_training_model(dataset, config_g_args, axes):
         resolved_position_encoding=config,
         num_genes=dataset.num_genes,
         num_chromosomes=dataset.num_chromosomes,
-        num_covariates=0,
+        num_covariates=_active_num_covariates(args),
         learned_binned_position_layout=layout,
     )
     return args, config, metadata, layout, model
@@ -857,7 +884,12 @@ def test_rq3_ig_completeness_and_fixed_context_in_explain_and_attribute_batch(
     )
     indices = [0, 1]
     batch_attributions, _, batch_metadata = explainer.attribute_batch(
-        DataLoader(Subset(small_dataset, indices), batch_size=1, collate_fn=collate_chunks)
+        DataLoader(
+            Subset(small_dataset, indices),
+            batch_size=1,
+            collate_fn=_collate_active_inputs(model.num_covariates),
+        ),
+        num_covariates=model.num_covariates,
     )
     wrapper = ContentSIEVEWrapper(model)
 
@@ -865,8 +897,20 @@ def test_rq3_ig_completeness_and_fixed_context_in_explain_and_attribute_batch(
         indices, batch_attributions, batch_metadata, strict=True
     ):
         chunk = small_dataset[index]
+        # Observed covariates as attribute_batch() builds them; None without covariates.
+        covariates = build_sample_covariates(
+            torch.tensor([float(chunk["sex"])]),
+            model.num_covariates,
+            1,
+            torch.device("cpu"),
+            batch_covariates=chunk["covariates"].unsqueeze(0) if "covariates" in chunk else None,
+        )
         attributions, _, _, mask, _ = explain._attribute_chunk_for_ig(
-            explainer=explainer, chunk=chunk, resolved_ig_mode=ig_mode, device="cpu"
+            explainer=explainer,
+            chunk=chunk,
+            resolved_ig_mode=ig_mode,
+            device="cpu",
+            chunk_covariates=covariates,
         )
         attributions = attributions.detach()[0][mask[0]]
 
@@ -892,6 +936,7 @@ def test_rq3_ig_completeness_and_fixed_context_in_explain_and_attribute_batch(
                 "chrom_ids",
             )
         }
+        inputs["covariates"] = covariates  # fixed in both evaluations
         baseline = inputs["content_features"].clone()
         if ig_mode is ResolvedIGMode.DOSAGE:
             baseline[..., 0] = 0
