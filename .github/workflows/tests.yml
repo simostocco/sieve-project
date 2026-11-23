@@ -6,12 +6,16 @@ on:
       - dev
       - main
       - thesis/positional-encoding
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
 
 jobs:
   test:
+    if: >-
+      (github.base_ref != 'thesis/positional-encoding' && github.event.action != 'ready_for_review') ||
+      (github.base_ref == 'thesis/positional-encoding' && github.event.action == 'ready_for_review')
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
@@ -74,6 +78,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
 
   docs-drift:
+    if: >-
+      (github.base_ref != 'thesis/positional-encoding' && github.event.action != 'ready_for_review') ||
+      (github.base_ref == 'thesis/positional-encoding' && github.event.action == 'ready_for_review')
     name: Docs Drift
     runs-on: ubuntu-latest
 
