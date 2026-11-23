@@ -871,16 +871,20 @@ def test_rq3_ig_completeness_and_fixed_context_in_explain_and_attribute_batch(
 ):
     """RQ3.1 completeness and RQ3.2 fixed context through both production IG paths.
 
-    The base model is what explain.py attributes. Completeness is checked
-    against the content wrapper with absolute position, positions,
-    chromosomes, genes and mask held at their observed values.
+    The base model is what explain.py attributes. Completeness follows
+    ``TestIGCompleteness._check_completeness`` in test_ig_covariates.py
+    (100 steps, absolute tolerance 5e-3), evaluated through the content
+    wrapper with absolute position, positions, chromosomes, genes, mask and
+    covariates held at their observed values.
     """
-    *_, chunked_model = _config_g_training_model(
-        small_dataset, config_g_args, THESIS_STRATEGIES[strategy][0]
-    )
+    with torch.random.fork_rng():
+        torch.manual_seed(0)
+        *_, chunked_model = _config_g_training_model(
+            small_dataset, config_g_args, THESIS_STRATEGIES[strategy][0]
+        )
     model = chunked_model.base_model.eval()
     explainer = explain._create_integrated_gradients_explainer(
-        model=model, device="cpu", n_steps=64, max_variants=3000, resolved_ig_mode=ig_mode
+        model=model, device="cpu", n_steps=100, max_variants=3000, resolved_ig_mode=ig_mode
     )
     indices = [0, 1]
     batch_attributions, _, batch_metadata = explainer.attribute_batch(
@@ -943,14 +947,20 @@ def test_rq3_ig_completeness_and_fixed_context_in_explain_and_attribute_batch(
             assert torch.count_nonzero(attributions[:, 1:]) == 0
         else:
             baseline.zero_()
+        # f(input) - f(baseline) using the wrapper so the same function is called
         with torch.no_grad():
-            delta = (
-                wrapper(**inputs) - wrapper(**{**inputs, "content_features": baseline})
-            ).item()
-        residual = abs(attributions.sum().item() - delta)
-        # Provisional tolerance; residuals are printed for the thesis record (-rP).
+            f_input = wrapper(**inputs)
+            f_base = wrapper(**{**inputs, "content_features": baseline})
+
+        delta = (f_input - f_base).item()
+        attr_sum = attributions.sum().item()
+        # Residuals are printed for the thesis record (-rP).
         print(
-            f"{strategy} {ig_mode.value} sample {index}: f(x)-f(baseline)={delta:.6e} "
-            f"abs_residual={residual:.3e} rel_residual={residual / max(abs(delta), 1e-12):.3e}"
+            f"{strategy} {ig_mode.value} sample {index}: sum(attr)={attr_sum:.6e} "
+            f"f(x)-f(x0)={delta:.6e} abs_residual={abs(attr_sum - delta):.3e} "
+            f"rel_residual={abs(attr_sum - delta) / max(abs(delta), 1e-12):.3e}"
         )
-        assert residual <= max(1e-3, 1e-2 * abs(delta))
+        assert abs(attr_sum - delta) < 5e-3, (
+            f"IG completeness violated: sum(attr)={attr_sum:.6f}, "
+            f"f(x)-f(x0)={delta:.6f}, diff={abs(attr_sum - delta):.6f}"
+        )
